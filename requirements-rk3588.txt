@@ -1,0 +1,5 @@
+numpy
+opencv-python
+requests
+# Install rknn-toolkit-lite2 from the Rockchip/RK3588 board package matching
+# your firmware instead of PyPI when available.

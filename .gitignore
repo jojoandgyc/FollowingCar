@@ -1,0 +1,58 @@
+.test*/
+.test*
+logs/
+*.log
+*.rc
+.cache/
+run_request_0428_modular_logs/
+sh_logs/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+*.bak
+*.bak.*
+*.bak_*
+
+yolov8-track/build_board_libs/
+yolov8-track/sys_sdk_lib_full/
+person_follow_runtime/
+
+# Legacy HD05075A/CVI model/runtime artifacts are not part of the RK3588 path.
+yolov8-track/
+*.cvimodel
+yolov8-track/sample_personv8_track
+yolov8-track/sample_personv8_track_diag
+yolov8-track/reid_runtime_diag
+yolov8-track/official_reid_diag/sample_vi_object_tracking_reid_diag
+
+# Generated/downloaded model artifacts.
+models/*.rknn
+models/source/*.onnx
+models/source/*.pt
+models/source/*.pth
+models/source/*.txt
+check*_*.onnx
+
+# Extracted RKNN SDK/runtime binaries from local vendor packages.
+third_party/rknpu2/runtime/
+third_party/rknpu2/packages/
+
+# Local reference snapshots copied from the RK3588 board or external examples.
+third_party/followme_reference/
+
+# Board-local runtime libraries are installed separately and are not source.
+librknnrt.so
+
+# Local maintenance backups and temporary synchronization directories.
+.codex_backups/
+.sync_backups/
+.sync_upload_tmp/
+__sync_tmp__/
+tmp_*/
+
+# Finder/AppleDouble metadata and editor-local settings.
+._*
+.DS_Store
+.vscode/

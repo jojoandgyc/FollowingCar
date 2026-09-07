@@ -47,10 +47,16 @@ librknnrt.so
 
 # Local maintenance backups and temporary synchronization directories.
 .codex_backups/
+.codex_backup_*/
 .sync_backups/
 .sync_upload_tmp/
 __sync_tmp__/
 tmp_*/
+
+# Local experiment snapshots and calibration captures are not project source.
+backups/
+calibration/
+*.before_*
 
 # Finder/AppleDouble metadata and editor-local settings.
 ._*

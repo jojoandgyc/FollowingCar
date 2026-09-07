@@ -9,7 +9,12 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 
-from rk_vision.yolo11 import LetterboxInfo, YOLO11Config, postprocess_yolo11_outputs
+from rk_vision.yolo11 import (
+    LetterboxInfo,
+    YOLO11Config,
+    _decode_yolo11_outputs,
+    postprocess_yolo11_outputs,
+)
 
 
 def main() -> int:
@@ -26,6 +31,10 @@ def main() -> int:
     pred[0, :4, 0] = [320.0, 320.0, 100.0, 80.0]
     pred[0, 4, 0] = 0.10
     pred[0, 5, 0] = 0.90
+
+    decoded = _decode_yolo11_outputs([pred], cfg, letterbox)
+    if len(decoded) != 1:
+        raise AssertionError(f"expected one decoded detection, got {len(decoded)}")
 
     detections = postprocess_yolo11_outputs([pred], cfg, letterbox)
     print("detections", detections)

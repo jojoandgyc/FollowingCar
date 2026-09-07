@@ -103,6 +103,8 @@ def main() -> int:
             imu_log_enable=True,
             imu_log_every_sec=0.01,
             side_ir_blocks_rotation=True,
+            side_ir_confirm_sec=0.0,
+            side_ir_release_sec=0.0,
         )
     )
     runtime.start()
@@ -118,6 +120,8 @@ def main() -> int:
         imu_log_enable=True,
         imu_log_every_sec=0.01,
         side_ir_blocks_rotation=False,
+        side_ir_confirm_sec=0.0,
+        side_ir_release_sec=0.0,
     )
     obstacles = runtime.get_obstacle_status()
     if not (obstacles.front and obstacles.left and not obstacles.right):

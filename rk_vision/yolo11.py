@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from .frames import numpy_from_frame
@@ -25,6 +25,8 @@ class YOLO11Config:
     model_path: str
     input_size: int = 640
     conf_threshold: float = 0.25
+    search_diagnostic_conf_threshold: float = 0.10
+    search_diagnostic_class_id: int = 0
     nms_threshold: float = 0.45
     num_classes: int = 80
     input_format: str = "RGB"
@@ -50,9 +52,13 @@ class YOLO11RKNNDetector:
         self.last_timing_ms = {
             "preprocess": 0.0,
             "inference": 0.0,
+            "decode": 0.0,
+            "nms": 0.0,
             "postprocess": 0.0,
             "total": 0.0,
         }
+        self.search_diagnostic_active = False
+        self.last_search_diagnostic_detections: List[Detection] = []
         self.session = RKNNInferenceSession(
             config.model_path,
             target=config.target,
@@ -67,15 +73,46 @@ class YOLO11RKNNDetector:
         infer_start = time.perf_counter()
         outputs = self.session.inference([tensor], data_format=["nhwc"])
         post_start = time.perf_counter()
-        detections = postprocess_yolo11_outputs(outputs, self.config, letterbox)
+        diagnostic_threshold = max(
+            0.01,
+            min(float(self.config.conf_threshold), float(self.config.search_diagnostic_conf_threshold)),
+        )
+        decode_config = self.config
+        if self.search_diagnostic_active and diagnostic_threshold < float(self.config.conf_threshold):
+            decode_config = replace(self.config, conf_threshold=diagnostic_threshold)
+        decoded_detections = _decode_yolo11_outputs(outputs, decode_config, letterbox)
+        if self.search_diagnostic_active:
+            self.last_search_diagnostic_detections = [
+                detection
+                for detection in decoded_detections
+                if int(detection.class_id) == int(self.config.search_diagnostic_class_id)
+            ]
+        else:
+            self.last_search_diagnostic_detections = []
+        # The low-threshold search probe is diagnostic only. The production
+        # detector, tracker, ReID, and motor control keep the configured gate.
+        raw_detections = [
+            detection
+            for detection in decoded_detections
+            if float(detection.score) >= float(self.config.conf_threshold)
+        ]
+        nms_start = time.perf_counter()
+        detections = _nms(raw_detections, self.config.nms_threshold)
         end = time.perf_counter()
         self.last_timing_ms = {
             "preprocess": _elapsed_ms(prep_start, infer_start),
             "inference": _elapsed_ms(infer_start, post_start),
+            "decode": _elapsed_ms(post_start, nms_start),
+            "nms": _elapsed_ms(nms_start, end),
             "postprocess": _elapsed_ms(post_start, end),
             "total": _elapsed_ms(start, end),
         }
         return detections
+
+    def set_search_diagnostic_active(self, active: bool) -> None:
+        self.search_diagnostic_active = bool(active)
+        if not self.search_diagnostic_active:
+            self.last_search_diagnostic_detections = []
 
     def load(self) -> None:
         self.session.load()
@@ -103,6 +140,16 @@ def postprocess_yolo11_outputs(
     config: YOLO11Config,
     letterbox: LetterboxInfo,
 ) -> List[Detection]:
+    raw = _decode_yolo11_outputs(outputs, config, letterbox)
+    return _nms(raw, config.nms_threshold)
+
+
+def _decode_yolo11_outputs(
+    outputs: Sequence[Any],
+    config: YOLO11Config,
+    letterbox: LetterboxInfo,
+) -> List[Detection]:
+    """Decode RKNN outputs without NMS so detector timing can measure both stages."""
     np = _np()
     if not outputs:
         return []
@@ -110,7 +157,7 @@ def postprocess_yolo11_outputs(
     raw = _postprocess_feature_outputs(arrays, config, letterbox)
     if raw is None:
         raw = _postprocess_single_output(arrays[0], config, letterbox)
-    return _nms(raw, config.nms_threshold)
+    return raw
 
 
 def _postprocess_feature_outputs(

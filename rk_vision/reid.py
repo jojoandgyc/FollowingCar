@@ -22,6 +22,10 @@ class OSNetConfig:
     target: str = "rk3588"
     core_mask: str = "auto"
     backend: str = "auto"
+    # A cheap color cue complements OSNet when two people have similar body
+    # shapes. It is computed from the crop and adds no RKNN inference.
+    color_fusion_enable: bool = True
+    color_fusion_weight: float = 0.35
 
 
 class OSNetRKNNExtractor:
@@ -77,6 +81,14 @@ class OSNetRKNNExtractor:
             norm = float(np.linalg.norm(feat))
             if norm > 1e-12:
                 feat = feat / norm
+            if self.config.color_fusion_enable:
+                color = _color_signature(crop)
+                if color is not None:
+                    feat = _fuse_appearance_features(
+                        feat,
+                        color,
+                        self.config.color_fusion_weight,
+                    )
             postprocess_ms += _elapsed_ms(post_start, time.perf_counter())
             features.append(feat)
         end = time.perf_counter()
@@ -166,6 +178,54 @@ def _resize(img: Any, width: int, height: int):
         except Exception as exc:  # pragma: no cover - environment dependent
             raise RuntimeError("OpenCV or Pillow is required for OSNet crop resizing") from exc
         return np.asarray(Image.fromarray(img).resize((width, height), Image.BILINEAR))
+
+
+def _color_signature(crop: Any):
+    """Return a compact HSV appearance descriptor for the torso crop.
+
+    The descriptor is intentionally small and normalized so it is useful as a
+    secondary cue without overpowering the OSNet embedding. Background pixels
+    are reduced by using the central 70% of the person crop vertically.
+    """
+    np = _np()
+    arr = np.asarray(crop)
+    if arr.ndim != 3 or arr.shape[0] < 4 or arr.shape[1] < 4:
+        return None
+    height = int(arr.shape[0])
+    top = int(round(height * 0.15))
+    bottom = max(top + 1, int(round(height * 0.85)))
+    torso = arr[top:bottom]
+    try:
+        import cv2
+
+        hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+        h = hsv[:, :, 0].reshape(-1)
+        s = hsv[:, :, 1].reshape(-1)
+        v = hsv[:, :, 2].reshape(-1)
+        # Hue is only meaningful for sufficiently saturated pixels.
+        h_hist, _ = np.histogram(h[s >= 24], bins=8, range=(0, 180))
+        s_hist, _ = np.histogram(s, bins=4, range=(0, 256))
+        v_hist, _ = np.histogram(v, bins=4, range=(0, 256))
+        descriptor = np.concatenate((h_hist, s_hist, v_hist)).astype("float32")
+    except Exception:
+        # Keep the fallback dependency-free for unit tests and non-OpenCV hosts.
+        descriptor = np.concatenate(
+            (np.mean(torso, axis=(0, 1)), np.std(torso, axis=(0, 1)))
+        ).astype("float32")
+    descriptor /= max(float(np.linalg.norm(descriptor)), 1e-12)
+    return descriptor
+
+
+def _fuse_appearance_features(osnet_feature: Any, color_feature: Any, weight: float):
+    np = _np()
+    base = np.asarray(osnet_feature, dtype="float32").reshape(-1)
+    color = np.asarray(color_feature, dtype="float32").reshape(-1)
+    base /= max(float(np.linalg.norm(base)), 1e-12)
+    color /= max(float(np.linalg.norm(color)), 1e-12)
+    fusion_weight = max(0.0, min(1.0, float(weight)))
+    fused = np.concatenate((base, color * fusion_weight)).astype("float32")
+    fused /= max(float(np.linalg.norm(fused)), 1e-12)
+    return fused
 
 
 def _elapsed_ms(start: float, end: float) -> float:

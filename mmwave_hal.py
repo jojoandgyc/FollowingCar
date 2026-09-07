@@ -4,6 +4,7 @@ import math
 import os
 import select
 import struct
+import subprocess
 import termios
 import time
 from ctypes import Structure, c_char_p, c_float, c_int, c_int16, c_uint8, c_uint64
@@ -21,12 +22,28 @@ MMWAVE_AT2410_PORT = os.environ.get(
 MMWAVE_AT2410_BAUDRATE = int(os.environ.get("MMWAVE_AT2410_BAUDRATE", "9600"))
 MMWAVE_AT2410_READ_TIMEOUT_SEC = max(0.0, float(os.environ.get("MMWAVE_AT2410_READ_TIMEOUT_SEC", "0.04")))
 MMWAVE_AT2410_READ_SIZE = max(1, int(os.environ.get("MMWAVE_AT2410_READ_SIZE", "256")))
+MMWAVE_AT2410_VERIFY_TIMEOUT_SEC = max(
+    MMWAVE_AT2410_READ_TIMEOUT_SEC,
+    float(os.environ.get("MMWAVE_AT2410_VERIFY_TIMEOUT_SEC", "20.0")),
+)
 MMWAVE_AT2410_VERIFY_ON_INIT = os.environ.get("MMWAVE_AT2410_VERIFY_ON_INIT", "0").strip().lower() in {
     "1",
     "true",
     "yes",
     "on",
 }
+MMWAVE_AT2410_USB_RESET_ON_INIT = os.environ.get("MMWAVE_AT2410_USB_RESET_ON_INIT", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MMWAVE_AT2410_USB_RESET_ATTEMPTS = max(1, int(os.environ.get("MMWAVE_AT2410_USB_RESET_ATTEMPTS", "3")))
+MMWAVE_AT2410_USB_ID = os.environ.get("MMWAVE_AT2410_USB_ID", "359f:3101").strip()
+MMWAVE_AT2410_USB_RECONNECT_TIMEOUT_SEC = max(
+    1.0,
+    float(os.environ.get("MMWAVE_AT2410_USB_RECONNECT_TIMEOUT_SEC", "8.0")),
+)
 
 # Legacy ctypes/C HAL backend.
 MMWAVE_RADAR_IDX = int(os.environ.get("MMWAVE_RADAR_IDX", "0"))
@@ -235,6 +252,25 @@ def _close_at2410() -> None:
     _at2410_buffer.clear()
 
 
+def _reset_at2410_usb() -> None:
+    _close_at2410()
+    command = ["sudo", "-n", "usbreset", MMWAVE_AT2410_USB_ID]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+    message = (result.stdout + result.stderr).strip()
+    if message:
+        print(message, flush=True)
+    if result.returncode != 0:
+        raise RuntimeError("SIPEED UARTx4 USB reset failed; run sudo -v before startup")
+
+    deadline = time.monotonic() + MMWAVE_AT2410_USB_RECONNECT_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        if os.path.exists(MMWAVE_AT2410_PORT):
+            time.sleep(0.5)
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"AT2410 serial port did not return after USB reset: {MMWAVE_AT2410_PORT}")
+
+
 def _read_at2410_frames(timeout_sec: float) -> List[List[Dict[str, Any]]]:
     fd = _open_at2410()
     frames: List[List[Dict[str, Any]]] = []
@@ -372,16 +408,52 @@ def _get_at2410_targets() -> List[Dict[str, Any]]:
 
 class MmWaveRadar:
     @staticmethod
+    def wait_for_valid_frame(timeout_sec: float = MMWAVE_AT2410_VERIFY_TIMEOUT_SEC) -> bool:
+        """Wait for one checksum-valid AT2410 target-report frame."""
+        global _last_targets, _last_targets_ts
+
+        if MMWAVE_BACKEND not in {"at2410", "uart", "serial"}:
+            return True
+        try:
+            frames = _read_at2410_frames(max(0.0, float(timeout_sec)))
+            if not frames:
+                return False
+            _last_targets = list(frames[-1])
+            _last_targets_ts = time.monotonic()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def init():
         try:
             if MMWAVE_BACKEND in {"at2410", "uart", "serial"}:
-                _open_at2410()
-                if MMWAVE_AT2410_VERIFY_ON_INIT:
-                    _read_at2410_frames(MMWAVE_AT2410_READ_TIMEOUT_SEC)
-                return 0
+                attempts = MMWAVE_AT2410_USB_RESET_ATTEMPTS if MMWAVE_AT2410_VERIFY_ON_INIT else 1
+                for attempt in range(1, attempts + 1):
+                    try:
+                        _close_at2410()
+                        if MMWAVE_AT2410_USB_RESET_ON_INIT:
+                            print(f"AT2410启动初始化: USB软复位并立即打开串口，第{attempt}/{attempts}次", flush=True)
+                            _reset_at2410_usb()
+                        _open_at2410()
+                        if not MMWAVE_AT2410_VERIFY_ON_INIT:
+                            return 0
+                        print(
+                            f"AT2410启动初始化: 保持同一串口句柄等待合法帧，超时={MMWAVE_AT2410_VERIFY_TIMEOUT_SEC:.1f}秒",
+                            flush=True,
+                        )
+                        if MmWaveRadar.wait_for_valid_frame():
+                            print("AT2410启动初始化通过: 已收到合法帧，继续保持当前串口句柄", flush=True)
+                            return 0
+                        print(f"AT2410启动初始化失败: 第{attempt}/{attempts}次未收到合法帧", flush=True)
+                    except Exception as exc:
+                        print(f"AT2410启动初始化异常: 第{attempt}/{attempts}次: {exc}", flush=True)
+                _close_at2410()
+                return -1
             lib = _load_radar_lib()
             return lib.radar_init(MMWAVE_RADAR_IDX, MMWAVE_RADAR_DEV_PATH.encode("utf-8"))
-        except Exception:
+        except Exception as exc:
+            print(f"毫米波雷达初始化异常: {exc}", flush=True)
             return -1
 
     @staticmethod

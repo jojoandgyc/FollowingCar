@@ -3,12 +3,20 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, replace
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from .frames import FramePacket, numpy_from_frame
 from .reid import OSNetConfig, OSNetRKNNExtractor
 from .tracker import DeepSortTracker, DeepSortTrackerConfig, TrackRecord
 from .yolo11 import Detection, YOLO11Config, YOLO11RKNNDetector
+
+
+@dataclass(frozen=True)
+class SearchCandidateEvidence:
+    """Read-only detector evidence; it carries no target or motion decision."""
+
+    formal_persons: Tuple[Detection, ...] = ()
+    probe_persons: Tuple[Detection, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -18,6 +26,7 @@ class RKNNVisionConfig:
     reid_enable: bool = True
     person_class_id: int = 0
     conf_threshold: float = 0.25
+    search_diagnostic_conf_threshold: float = 0.10
     nms_threshold: float = 0.45
     yolo_input_size: int = 640
     yolo_num_classes: int = 80
@@ -29,6 +38,8 @@ class RKNNVisionConfig:
     reid_input_dtype: str = "float32"
     reid_input_layout: str = "NCHW"
     reid_normalize: str = "imagenet"
+    reid_color_fusion_enable: bool = True
+    reid_color_fusion_weight: float = 0.35
     frame_width: int = 1920
     frame_height: int = 1080
     hfov_deg: float = 90.0
@@ -49,8 +60,21 @@ class RKNNVisionConfig:
     identity_update_threshold: float = 0.30
     identity_update_interval: int = 5
     identity_max_features: int = 20
+    identity_max_weak_features: int = 8
+    identity_diversity_min_distance: float = 0.02
+    identity_diversity_replace_margin: float = 0.01
+    identity_weak_update_threshold: float = 0.42
+    identity_weak_update_interval: int = 3
+    identity_weak_match_penalty: float = 0.10
+    identity_weak_reacquire_threshold: float = 0.38
+    identity_weak_reacquire_confirm_frames: int = 3
+    identity_weak_quality_weight: float = 0.30
     identity_min_confidence: float = 0.65
     identity_min_area: float = 0.0
+    identity_min_width_px: float = 0.0
+    identity_min_height_px: float = 0.0
+    identity_max_single_frame_area_shrink_ratio: float = 0.30
+    identity_area_shrink_max_gap_frames: int = 2
     identity_max_area_ratio: float = 0.75
     identity_max_width_ratio: float = 0.85
     identity_max_height_ratio: float = 1.00
@@ -75,6 +99,20 @@ class RKNNVisionConfig:
     identity_controlled_handoff_confirm_frames: int = 3
     identity_controlled_handoff_threshold: float = 0.30
     identity_controlled_handoff_min_old_track_gap_frames: int = 2
+    identity_preferred_search_reacquire_enable: bool = True
+    identity_preferred_search_reacquire_threshold: float = 0.36
+    identity_preferred_search_reacquire_max_disadvantage: float = 0.15
+    identity_preferred_search_reacquire_confirm_frames: int = 2
+    identity_preferred_search_reacquire_instant_threshold: float = 0.28
+    identity_preferred_search_reacquire_side_ratio: float = 0.05
+    identity_duplicate_box_suppression_enable: bool = True
+    identity_duplicate_iou_threshold: float = 0.55
+    identity_duplicate_vertical_overlap_threshold: float = 0.88
+    identity_duplicate_horizontal_overlap_threshold: float = 0.40
+    identity_duplicate_large_height_ratio: float = 0.80
+    identity_duplicate_large_width_ratio: float = 0.45
+    identity_duplicate_max_area_ratio: float = 0.65
+    identity_duplicate_bottom_gap_ratio: float = 0.10
     identity_suppress_duplicate_uids: bool = True
     predicted_reid_verify_enable: bool = False
     predicted_reid_verify_threshold: float = 0.30
@@ -92,6 +130,9 @@ class RKNNVisionConfig:
             reid_enable=os.environ.get("VISION_REID_ENABLE", "1").strip() != "0",
             person_class_id=int(os.environ.get("PERSON_CLASS_ID", "0")),
             conf_threshold=float(os.environ.get("CONFIDENCE_THRESHOLD", "0.25")),
+            search_diagnostic_conf_threshold=float(
+                os.environ.get("RKNN_SEARCH_DIAGNOSTIC_CONF_THRESHOLD", "0.10")
+            ),
             nms_threshold=float(os.environ.get("RKNN_YOLO_NMS_THRESHOLD", "0.45")),
             yolo_input_size=int(os.environ.get("RKNN_YOLO_INPUT_SIZE", "640")),
             yolo_num_classes=int(os.environ.get("RKNN_YOLO_NUM_CLASSES", "80")),
@@ -103,6 +144,8 @@ class RKNNVisionConfig:
             reid_input_dtype=os.environ.get("RKNN_REID_INPUT_DTYPE", "float32").strip(),
             reid_input_layout=os.environ.get("RKNN_REID_INPUT_LAYOUT", "NCHW").strip(),
             reid_normalize=os.environ.get("RKNN_REID_NORMALIZE", "imagenet").strip(),
+            reid_color_fusion_enable=os.environ.get("RKNN_REID_COLOR_FUSION_ENABLE", "1").strip() != "0",
+            reid_color_fusion_weight=float(os.environ.get("RKNN_REID_COLOR_FUSION_WEIGHT", "0.35")),
             frame_width=int(os.environ.get("VISION_FRAME_WIDTH", "1920")),
             frame_height=int(os.environ.get("VISION_FRAME_HEIGHT", "1080")),
             hfov_deg=float(os.environ.get("VISION_HFOV_DEG", "90.0")),
@@ -126,8 +169,43 @@ class RKNNVisionConfig:
             identity_update_threshold=float(os.environ.get("Y8_IDENTITY_UPDATE_THRESHOLD", "0.30")),
             identity_update_interval=max(1, int(os.environ.get("Y8_IDENTITY_UPDATE_INTERVAL", "5"))),
             identity_max_features=max(1, int(os.environ.get("Y8_IDENTITY_MAX_FEATURES", "20"))),
+            identity_max_weak_features=max(0, int(os.environ.get("Y8_IDENTITY_MAX_WEAK_FEATURES", "8"))),
+            identity_diversity_min_distance=max(
+                0.0, float(os.environ.get("Y8_IDENTITY_DIVERSITY_MIN_DISTANCE", "0.02"))
+            ),
+            identity_diversity_replace_margin=max(
+                0.0, float(os.environ.get("Y8_IDENTITY_DIVERSITY_REPLACE_MARGIN", "0.01"))
+            ),
+            identity_weak_update_threshold=float(
+                os.environ.get("Y8_IDENTITY_WEAK_UPDATE_THRESHOLD", "0.42")
+            ),
+            identity_weak_update_interval=max(
+                1, int(os.environ.get("Y8_IDENTITY_WEAK_UPDATE_INTERVAL", "3"))
+            ),
+            identity_weak_match_penalty=max(
+                0.0, float(os.environ.get("Y8_IDENTITY_WEAK_MATCH_PENALTY", "0.10"))
+            ),
+            identity_weak_reacquire_threshold=float(
+                os.environ.get("Y8_IDENTITY_WEAK_REACQUIRE_THRESHOLD", "0.38")
+            ),
+            identity_weak_reacquire_confirm_frames=max(
+                2, int(os.environ.get("Y8_IDENTITY_WEAK_REACQUIRE_CONFIRM_FRAMES", "3"))
+            ),
+            identity_weak_quality_weight=max(
+                0.0,
+                min(1.0, float(os.environ.get("Y8_IDENTITY_WEAK_QUALITY_WEIGHT", "0.30"))),
+            ),
             identity_min_confidence=float(os.environ.get("Y8_IDENTITY_MIN_CONFIDENCE", "0.65")),
             identity_min_area=float(os.environ.get("Y8_IDENTITY_MIN_AREA", "0.0")),
+            identity_min_width_px=float(os.environ.get("Y8_IDENTITY_MIN_WIDTH_PX", "0.0")),
+            identity_min_height_px=float(os.environ.get("Y8_IDENTITY_MIN_HEIGHT_PX", "0.0")),
+            identity_max_single_frame_area_shrink_ratio=float(
+                os.environ.get("Y8_IDENTITY_MAX_SINGLE_FRAME_AREA_SHRINK_RATIO", "0.30")
+            ),
+            identity_area_shrink_max_gap_frames=max(
+                1,
+                int(os.environ.get("Y8_IDENTITY_AREA_SHRINK_MAX_GAP_FRAMES", "2")),
+            ),
             identity_max_area_ratio=float(os.environ.get("Y8_IDENTITY_MAX_AREA_RATIO", "0.75")),
             identity_max_width_ratio=float(os.environ.get("Y8_IDENTITY_MAX_WIDTH_RATIO", "0.85")),
             identity_max_height_ratio=float(os.environ.get("Y8_IDENTITY_MAX_HEIGHT_RATIO", "1.00")),
@@ -176,6 +254,56 @@ class RKNNVisionConfig:
             identity_controlled_handoff_min_old_track_gap_frames=max(
                 1, int(os.environ.get("Y8_IDENTITY_CONTROLLED_HANDOFF_MIN_OLD_TRACK_GAP_FRAMES", "2"))
             ),
+            identity_preferred_search_reacquire_enable=os.environ.get(
+                "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_ENABLE",
+                "1",
+            ).strip()
+            != "0",
+            identity_preferred_search_reacquire_threshold=float(
+                os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_THRESHOLD", "0.36")
+            ),
+            identity_preferred_search_reacquire_max_disadvantage=float(
+                os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MAX_DISADVANTAGE", "0.15")
+            ),
+            identity_preferred_search_reacquire_confirm_frames=max(
+                1,
+                int(os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_CONFIRM_FRAMES", "2")),
+            ),
+            identity_preferred_search_reacquire_instant_threshold=float(
+                os.environ.get(
+                    "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_INSTANT_THRESHOLD",
+                    "0.28",
+                )
+            ),
+            identity_preferred_search_reacquire_side_ratio=float(
+                os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_SIDE_RATIO", "0.05")
+            ),
+            identity_duplicate_box_suppression_enable=os.environ.get(
+                "Y8_IDENTITY_DUPLICATE_BOX_SUPPRESSION_ENABLE",
+                "1",
+            ).strip()
+            != "0",
+            identity_duplicate_iou_threshold=float(
+                os.environ.get("Y8_IDENTITY_DUPLICATE_IOU_THRESHOLD", "0.55")
+            ),
+            identity_duplicate_vertical_overlap_threshold=float(
+                os.environ.get("Y8_IDENTITY_DUPLICATE_VERTICAL_OVERLAP_THRESHOLD", "0.88")
+            ),
+            identity_duplicate_horizontal_overlap_threshold=float(
+                os.environ.get("Y8_IDENTITY_DUPLICATE_HORIZONTAL_OVERLAP_THRESHOLD", "0.40")
+            ),
+            identity_duplicate_large_height_ratio=float(
+                os.environ.get("Y8_IDENTITY_DUPLICATE_LARGE_HEIGHT_RATIO", "0.80")
+            ),
+            identity_duplicate_large_width_ratio=float(
+                os.environ.get("Y8_IDENTITY_DUPLICATE_LARGE_WIDTH_RATIO", "0.45")
+            ),
+            identity_duplicate_max_area_ratio=float(
+                os.environ.get("Y8_IDENTITY_DUPLICATE_MAX_AREA_RATIO", "0.65")
+            ),
+            identity_duplicate_bottom_gap_ratio=float(
+                os.environ.get("Y8_IDENTITY_DUPLICATE_BOTTOM_GAP_RATIO", "0.10")
+            ),
             identity_suppress_duplicate_uids=os.environ.get("Y8_IDENTITY_SUPPRESS_DUPLICATE_UIDS", "1").strip() != "0",
             predicted_reid_verify_enable=os.environ.get("Y8_PREDICTED_REID_VERIFY_ENABLE", "0").strip() != "0",
             predicted_reid_verify_threshold=float(os.environ.get("Y8_PREDICTED_REID_VERIFY_THRESHOLD", "0.30")),
@@ -202,6 +330,8 @@ class RKNNVisionPipeline:
                 model_path=self.config.yolo_model_path,
                 input_size=self.config.yolo_input_size,
                 conf_threshold=self.config.conf_threshold,
+                search_diagnostic_conf_threshold=self.config.search_diagnostic_conf_threshold,
+                search_diagnostic_class_id=self.config.person_class_id,
                 nms_threshold=self.config.nms_threshold,
                 num_classes=self.config.yolo_num_classes,
                 input_format=self.config.yolo_input_format,
@@ -221,6 +351,8 @@ class RKNNVisionPipeline:
                 input_dtype=self.config.reid_input_dtype,
                 input_layout=self.config.reid_input_layout,
                 normalize=self.config.reid_normalize,
+                color_fusion_enable=self.config.reid_color_fusion_enable,
+                color_fusion_weight=self.config.reid_color_fusion_weight,
                 target=self.config.target,
                 core_mask=self.config.core_mask,
                 backend=self.config.backend,
@@ -246,8 +378,25 @@ class RKNNVisionPipeline:
                 identity_update_threshold=self.config.identity_update_threshold,
                 identity_update_interval=self.config.identity_update_interval,
                 identity_max_features=self.config.identity_max_features,
+                identity_max_weak_features=self.config.identity_max_weak_features,
+                identity_diversity_min_distance=self.config.identity_diversity_min_distance,
+                identity_diversity_replace_margin=self.config.identity_diversity_replace_margin,
+                identity_weak_update_threshold=self.config.identity_weak_update_threshold,
+                identity_weak_update_interval=self.config.identity_weak_update_interval,
+                identity_weak_match_penalty=self.config.identity_weak_match_penalty,
+                identity_weak_reacquire_threshold=self.config.identity_weak_reacquire_threshold,
+                identity_weak_reacquire_confirm_frames=self.config.identity_weak_reacquire_confirm_frames,
+                identity_weak_quality_weight=self.config.identity_weak_quality_weight,
                 identity_min_confidence=self.config.identity_min_confidence,
                 identity_min_area=self.config.identity_min_area,
+                identity_min_width_px=self.config.identity_min_width_px,
+                identity_min_height_px=self.config.identity_min_height_px,
+                identity_max_single_frame_area_shrink_ratio=(
+                    self.config.identity_max_single_frame_area_shrink_ratio
+                ),
+                identity_area_shrink_max_gap_frames=(
+                    self.config.identity_area_shrink_max_gap_frames
+                ),
                 identity_max_area_ratio=self.config.identity_max_area_ratio,
                 identity_max_width_ratio=self.config.identity_max_width_ratio,
                 identity_max_height_ratio=self.config.identity_max_height_ratio,
@@ -272,15 +421,33 @@ class RKNNVisionPipeline:
                 identity_controlled_handoff_confirm_frames=self.config.identity_controlled_handoff_confirm_frames,
                 identity_controlled_handoff_threshold=self.config.identity_controlled_handoff_threshold,
                 identity_controlled_handoff_min_old_track_gap_frames=self.config.identity_controlled_handoff_min_old_track_gap_frames,
+                identity_preferred_search_reacquire_enable=self.config.identity_preferred_search_reacquire_enable,
+                identity_preferred_search_reacquire_threshold=self.config.identity_preferred_search_reacquire_threshold,
+                identity_preferred_search_reacquire_max_disadvantage=self.config.identity_preferred_search_reacquire_max_disadvantage,
+                identity_preferred_search_reacquire_confirm_frames=self.config.identity_preferred_search_reacquire_confirm_frames,
+                identity_preferred_search_reacquire_instant_threshold=self.config.identity_preferred_search_reacquire_instant_threshold,
+                identity_preferred_search_reacquire_side_ratio=self.config.identity_preferred_search_reacquire_side_ratio,
+                identity_duplicate_box_suppression_enable=self.config.identity_duplicate_box_suppression_enable,
+                identity_duplicate_iou_threshold=self.config.identity_duplicate_iou_threshold,
+                identity_duplicate_vertical_overlap_threshold=self.config.identity_duplicate_vertical_overlap_threshold,
+                identity_duplicate_horizontal_overlap_threshold=self.config.identity_duplicate_horizontal_overlap_threshold,
+                identity_duplicate_large_height_ratio=self.config.identity_duplicate_large_height_ratio,
+                identity_duplicate_large_width_ratio=self.config.identity_duplicate_large_width_ratio,
+                identity_duplicate_max_area_ratio=self.config.identity_duplicate_max_area_ratio,
+                identity_duplicate_bottom_gap_ratio=self.config.identity_duplicate_bottom_gap_ratio,
             )
         )
         self.last_detections: List[Detection] = []
+        self.last_search_diagnostic_detections: List[Detection] = []
+        self.last_search_candidate_evidence = SearchCandidateEvidence()
         self.last_predicted_reid_verifications: List[dict] = []
         self.last_frame_width = int(self.config.frame_width)
         self.last_frame_height = int(self.config.frame_height)
         self.last_timing_ms = {
             "yolo_preprocess": 0.0,
             "yolo_inference": 0.0,
+            "yolo_decode": 0.0,
+            "yolo_nms": 0.0,
             "yolo_postprocess": 0.0,
             "yolo_total": 0.0,
             "reid_preprocess": 0.0,
@@ -290,6 +457,84 @@ class RKNNVisionPipeline:
             "tracker": 0.0,
             "total": 0.0,
         }
+
+    def _record_detector_output(self, detections: List[Detection]) -> List[Detection]:
+        self.last_detections = detections
+        self.last_search_diagnostic_detections = list(
+            self.detector.last_search_diagnostic_detections
+        )
+        persons = [
+            det
+            for det in detections
+            if int(det.class_id) == int(self.config.person_class_id)
+            and float(det.score) >= float(self.config.conf_threshold)
+        ]
+        probe_persons = tuple(
+            det
+            for det in self.last_search_diagnostic_detections
+            if int(det.class_id) == int(self.config.person_class_id)
+            and float(det.score) < float(self.config.conf_threshold)
+        )
+        self.last_search_candidate_evidence = SearchCandidateEvidence(
+            formal_persons=tuple(persons),
+            probe_persons=probe_persons,
+        )
+        return persons
+
+    def process_search_probe_frame(
+        self,
+        frame: Any,
+        frame_format: Optional[str] = None,
+    ) -> List[TrackRecord]:
+        """Run detector-only recovery without advancing ReID or tracker state."""
+        frame_start = time.perf_counter()
+        arr, width, height, fmt = numpy_from_frame(frame, frame_format)
+        self.last_frame_width = width
+        self.last_frame_height = height
+        self.last_predicted_reid_verifications = []
+        packet = FramePacket(arr, width=width, height=height, format=fmt)
+
+        detections = self.detector.detect(packet, fmt)
+        detect_end = time.perf_counter()
+        persons = self._record_detector_output(detections)
+        yolo_timing = self.detector.last_timing_ms
+        frame_wrap_ms = _elapsed_ms(frame_start, detect_end) - float(
+            yolo_timing.get("total", 0.0)
+        )
+        self.last_timing_ms = {
+            "frame_wrap": max(0.0, frame_wrap_ms),
+            "yolo_preprocess": float(yolo_timing.get("preprocess", 0.0)),
+            "yolo_inference": float(yolo_timing.get("inference", 0.0)),
+            "yolo_decode": float(yolo_timing.get("decode", 0.0)),
+            "yolo_nms": float(yolo_timing.get("nms", 0.0)),
+            "yolo_postprocess": float(yolo_timing.get("postprocess", 0.0)),
+            "yolo_total": float(yolo_timing.get("total", 0.0)),
+            "reid_preprocess": 0.0,
+            "reid_inference": 0.0,
+            "reid_postprocess": 0.0,
+            "reid_total": 0.0,
+            "reid_detections": 0.0,
+            "reid_features": 0.0,
+            "reid_verify_preprocess": 0.0,
+            "reid_verify_inference": 0.0,
+            "reid_verify_postprocess": 0.0,
+            "reid_verify_total": 0.0,
+            "reid_verify_detections": 0.0,
+            "reid_verify_features": 0.0,
+            "tracker": 0.0,
+            "predicted_reid_verify": 0.0,
+            "total": _elapsed_ms(frame_start, detect_end),
+        }
+        if self.logger is not None:
+            self.logger.debug(
+                "rknn detector-only recovery frame processed "
+                "width=%d height=%d detections=%d persons=%d",
+                width,
+                height,
+                len(detections),
+                len(persons),
+            )
+        return []
 
     def process_frame(self, frame: Any, frame_format: Optional[str] = None) -> List[TrackRecord]:
         frame_start = time.perf_counter()
@@ -301,13 +546,7 @@ class RKNNVisionPipeline:
 
         detections = self.detector.detect(packet, fmt)
         detect_end = time.perf_counter()
-        self.last_detections = detections
-        persons = [
-            det
-            for det in detections
-            if int(det.class_id) == int(self.config.person_class_id)
-            and float(det.score) >= float(self.config.conf_threshold)
-        ]
+        persons = self._record_detector_output(detections)
         features = self.reid.extract(packet, persons, fmt)
         reid_end = time.perf_counter()
         records = self.tracker.update(persons, features, image_width=width, image_height=height)
@@ -335,6 +574,8 @@ class RKNNVisionPipeline:
             "frame_wrap": max(0.0, frame_wrap_ms),
             "yolo_preprocess": float(yolo_timing.get("preprocess", 0.0)),
             "yolo_inference": float(yolo_timing.get("inference", 0.0)),
+            "yolo_decode": float(yolo_timing.get("decode", 0.0)),
+            "yolo_nms": float(yolo_timing.get("nms", 0.0)),
             "yolo_postprocess": float(yolo_timing.get("postprocess", 0.0)),
             "yolo_total": float(yolo_timing.get("total", 0.0)),
             "reid_preprocess": float(combined_reid_timing.get("preprocess", 0.0)),
@@ -363,6 +604,43 @@ class RKNNVisionPipeline:
                 len(records),
             )
         return records
+
+    def set_identity_reacquire_context(
+        self,
+        *,
+        active_uid: Optional[int],
+        searching: bool,
+        direction: Optional[str],
+    ) -> None:
+        self.tracker.set_search_reacquire_context(
+            active_uid=active_uid,
+            searching=searching,
+            direction=direction,
+        )
+
+    def set_search_diagnostic_mode(self, enabled: bool) -> None:
+        """Enable passive low-confidence output without touching tracker state."""
+        self.detector.set_search_diagnostic_active(bool(enabled))
+        if not enabled:
+            self.last_search_candidate_evidence = SearchCandidateEvidence()
+
+    def get_search_candidate_evidence(self) -> SearchCandidateEvidence:
+        """Return the latest immutable detector evidence for the control gate."""
+        return self.last_search_candidate_evidence
+
+    def set_search_reacquire_context(
+        self,
+        *,
+        active_uid: Optional[int],
+        searching: bool,
+        direction: Optional[str],
+    ) -> None:
+        """Compatibility alias for identity reacquisition only."""
+        self.set_identity_reacquire_context(
+            active_uid=active_uid,
+            searching=searching,
+            direction=direction,
+        )
 
     def _suppress_duplicate_reid_uids(self, records: List[TrackRecord]) -> List[TrackRecord]:
         counts = {}

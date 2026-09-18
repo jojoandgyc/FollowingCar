@@ -18,6 +18,7 @@ class Track:
         feature=None,
         cls: int = 0,
         confidence: float = 0.0,
+        source_detection_index=None,
     ) -> None:
         self.mean = mean
         self.covariance = covariance
@@ -30,6 +31,7 @@ class Track:
         self.confidence = float(confidence)
         self.features = []
         self.last_feature = feature
+        self.source_detection_index = source_detection_index
         if feature is not None:
             self.features.append(feature)
         self._n_init = int(n_init)
@@ -55,6 +57,7 @@ class Track:
         was_confirmed = self.is_confirmed()
         self.mean, self.covariance = kf.update(self.mean, self.covariance, detection.to_xyah())
         self.last_feature = detection.feature
+        self.source_detection_index = detection.source_detection_index
         if detection.feature is not None and (not was_confirmed or bool(getattr(detection, "store_feature", True))):
             self.features.append(detection.feature)
         self.cls = int(detection.cls)

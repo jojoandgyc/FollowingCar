@@ -42,7 +42,9 @@ def main() -> int:
             height=480,
             min_valid_pixels=20,
             median_window=1,
-            rgb_processing_delay_sec=0.13,
+            # Deliberately use a wrong fallback delay. The real RGB capture
+            # timestamp passed below must still select the matching Depth frame.
+            rgb_processing_delay_sec=0.05,
         )
     )
     aligned_runtime._np = np
@@ -58,7 +60,13 @@ def main() -> int:
         aligned_runtime._latest_depth_ts = now - 0.01
         aligned_runtime._depth_history.append((now - 0.14, captured_depth))
         aligned_runtime._depth_history.append((now - 0.01, latest_wall))
-    aligned = aligned_runtime.measure_target(bbox, 640, 480, target_id=6)
+    aligned = aligned_runtime.measure_target(
+        bbox,
+        640,
+        480,
+        target_id=6,
+        reference_timestamp=now - 0.14,
+    )
     if aligned.detail != "depth_multiregion" or abs((aligned.distance_m or 0.0) - 1.8) > 1e-6:
         raise AssertionError(f"RGB-delayed ROI must select the time-aligned Depth frame: {aligned}")
 
@@ -124,9 +132,9 @@ def main() -> int:
     put_depth(runtime, far_depth)
     initial_far = runtime.measure_target(near_bbox, 640, 480, target_id=9)
     if initial_far.distance_m is not None or not initial_far.detail.startswith(
-        "far_background_guard_large_bbox"
+        "distance_jump_pending_1_of_3"
     ):
-        raise AssertionError(f"large box must reject an initial far wall: {initial_far}")
+        raise AssertionError(f"large box must not publish an initial far sample: {initial_far}")
 
     put_depth(runtime, near_depth)
     near = runtime.measure_target(near_bbox, 640, 480, target_id=9)
@@ -137,7 +145,7 @@ def main() -> int:
     for _ in range(6):
         put_depth(runtime, far_depth)
         guarded = runtime.measure_target(near_bbox, 640, 480, target_id=9)
-    if guarded is None or not guarded.detail.startswith("far_background_guard_large_bbox"):
+    if guarded is None or not guarded.detail.startswith("distance_jump_rate_guard"):
         raise AssertionError(f"large close-person box must reject stable wall depth: {guarded}")
     if guarded.distance_m is not None and abs(guarded.distance_m - 0.7) > 1e-6:
         raise AssertionError(f"background guard must never publish the far wall: {guarded}")
@@ -156,12 +164,34 @@ def main() -> int:
     clipped_bbox = (0.0, 80.0, 250.0, 400.0)
     put_depth(runtime, far_depth)
     clipped = runtime.measure_target(clipped_bbox, 640, 480, target_id=9)
-    if not clipped.detail.startswith("far_background_guard_edge"):
+    if not clipped.detail.startswith("distance_jump_rate_guard"):
         raise AssertionError(f"edge-clipped shrink must not release near lock: {clipped}")
 
+    # A bottom-clipped box with only one coherent far torso region must also
+    # remain held; area/height alone may be below the regular large-box gate.
+    weak_clipped_runtime = AstraDepthRuntime(config)
+    base_depth = np.full((480, 640), 900, dtype=np.uint16)
+    put_depth(weak_clipped_runtime, base_depth)
+    bottom_clipped_bbox = (180.0, 80.0, 355.0, 479.0)
+    weak_clipped_runtime.measure_target(bottom_clipped_bbox, 640, 480, target_id=20)
+    weak_far_depth = np.zeros((480, 640), dtype=np.uint16)
+    regions, _ = weak_clipped_runtime._torso_sampling_regions(
+        bottom_clipped_bbox, 640, 480, 640, 480
+    )
+    _, left, top, right, bottom = regions[-1]
+    weak_far_depth[top:bottom, left:right] = 3000
+    put_depth(weak_clipped_runtime, weak_far_depth)
+    weak_clipped = weak_clipped_runtime.measure_target(bottom_clipped_bbox, 640, 480, target_id=20)
+    if not weak_clipped.detail.startswith("far_background_guard"):
+        raise AssertionError(f"bottom-clipped single-region far depth must hold: {weak_clipped}")
+
     # A genuinely smaller, centered box may accept the farther surface, but it
-    # needs the longer near-to-far confirmation window.
+    # needs the longer near-to-far confirmation window. Use a physically
+    # plausible 1.8 -> 2.7m transition over 0.4s, not a millisecond wall jump.
     far_bbox = (220.0, 80.0, 420.0, 400.0)
+    runtime._last_accepted_distance_m = 1.8
+    runtime._last_accepted_ts = time.monotonic() - 0.4
+    far_depth = np.full((480, 640), 2700, dtype=np.uint16)
     pending = []
     for _ in range(config.near_far_jump_confirm_frames):
         put_depth(runtime, far_depth)
@@ -172,20 +202,21 @@ def main() -> int:
     ):
         raise AssertionError(f"near-to-far jump must wait for all confirmations: {pending}")
     confirmed = pending[-1]
-    if confirmed.detail != "depth_multiregion_after_jump_confirm" or abs((confirmed.distance_m or 0.0) - 4.4) > 1e-6:
+    if confirmed.detail != "depth_multiregion_after_jump_confirm" or abs((confirmed.distance_m or 0.0) - 2.7) > 1e-6:
         raise AssertionError(f"visually consistent far jump should eventually recover: {confirmed}")
 
     # Reusing the same Depth frame must report the threshold selected for this
     # jump (1_of_5), not fall back to the generic 1_of_2 configuration.
     reuse_runtime = AstraDepthRuntime(config)
-    put_depth(reuse_runtime, near_depth)
+    put_depth(reuse_runtime, np.full((480, 640), 1800, dtype=np.uint16))
     reuse_runtime.measure_target(near_bbox, 640, 480, target_id=13)
+    reuse_runtime._last_accepted_ts = time.monotonic() - 0.4
     put_depth(reuse_runtime, far_depth)
     first_pending = reuse_runtime.measure_target(far_bbox, 640, 480, target_id=13)
     reused_pending = reuse_runtime.measure_target(far_bbox, 640, 480, target_id=13)
-    if first_pending.detail != "distance_jump_pending_1_of_5_hold":
+    if first_pending.detail != "distance_jump_pending_1_of_5":
         raise AssertionError(f"fresh near-to-far jump should select five confirmations: {first_pending}")
-    if reused_pending.detail != "distance_jump_pending_1_of_5_hold":
+    if reused_pending.detail != "distance_jump_pending_1_of_5":
         raise AssertionError(f"reused frame must keep the real five-frame threshold: {reused_pending}")
 
     # Once the old near anchor is older than 1.5s, three stable far samples

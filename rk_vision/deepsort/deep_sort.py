@@ -7,7 +7,7 @@ from .detection import Detection
 from .nn_matching import NearestNeighborDistanceMetric
 from .preprocessing import non_max_suppression
 from .track import TrackState
-from .tracker import Tracker
+from .tracker import MatchValidator, Tracker
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,7 @@ class DeepSortOutput:
     hits: int = 0
     age: int = 0
     feature: Optional[Any] = None
+    source_detection_index: Optional[int] = None
 
 
 class DeepSort:
@@ -61,6 +62,7 @@ class DeepSort:
         features: Sequence[Optional[Any]],
         *,
         image_shape: Optional[Tuple[int, int]] = None,
+        match_validator: Optional[MatchValidator] = None,
     ) -> List[DeepSortOutput]:
         store_feature = self._should_store_feature()
         detections = self._make_detections(bbox_xywh, confidences, classes, features, store_feature=store_feature)
@@ -72,7 +74,7 @@ class DeepSort:
             detections = [detections[i] for i in keep]
 
         self.tracker.predict()
-        self.tracker.update(detections)
+        self.tracker.update(detections, match_validator=match_validator)
         self._frame_index += 1
 
         outputs: List[DeepSortOutput] = []
@@ -100,6 +102,9 @@ class DeepSort:
                     hits=int(track.hits),
                     age=int(track.age),
                     feature=track.last_feature if track.time_since_update == 0 else None,
+                    source_detection_index=(
+                        track.source_detection_index if track.time_since_update == 0 else None
+                    ),
                 )
             )
         return outputs
@@ -125,7 +130,9 @@ class DeepSort:
             return []
         bbox_np = bbox_np.reshape(-1, 4)
         detections: List[Detection] = []
-        for box, confidence, class_id, feature in zip(bbox_np, confidences, classes, features):
+        for source_index, (box, confidence, class_id, feature) in enumerate(
+            zip(bbox_np, confidences, classes, features)
+        ):
             if float(confidence) < self.config.min_confidence:
                 continue
             tlwh = box.copy()
@@ -140,6 +147,7 @@ class DeepSort:
                     int(class_id),
                     feature,
                     store_feature=store_feature,
+                    source_detection_index=source_index,
                 )
             )
         return detections

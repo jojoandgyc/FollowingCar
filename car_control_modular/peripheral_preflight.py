@@ -110,7 +110,10 @@ def _check_astra_camera() -> None:
         runtime.start()
         if not runtime.wait_until_ready(2.0):
             raise RuntimeError("Astra Depth流已打开但没有收到深度帧")
-        camera_device = os.environ.get("RKNN_CAMERA_DEVICE", "/dev/video3")
+        camera_device = os.environ.get(
+            "RKNN_CAMERA_DEVICE",
+            "/dev/v4l/by-id/usb-Astra_Pro_HD_Camera_Astra_Pro_HD_Camera-video-index0",
+        )
         _require_accessible_device("Astra RGB摄像头节点", camera_device)
         capture = cv2.VideoCapture(camera_device, cv2.CAP_V4L2)
         try:
@@ -148,7 +151,10 @@ def _check_vision_files() -> None:
             raise RuntimeError(f"RKNN ReID模型不存在: {reid_path}")
     if _env_bool("RKNN_CAMERA_ENABLE", True):
         capture_mode = os.environ.get("RKNN_CAMERA_CAPTURE_MODE", "gstreamer_mjpeg").strip().lower()
-        camera_device = os.environ.get("RKNN_CAMERA_DEVICE", "/dev/video1")
+        camera_device = os.environ.get(
+            "RKNN_CAMERA_DEVICE",
+            "/dev/v4l/by-id/usb-Astra_Pro_HD_Camera_Astra_Pro_HD_Camera-video-index0",
+        )
         if _env_bool("MODULE_ASTRA_DEPTH_ENABLE", False):
             _check_astra_camera()
         elif capture_mode in {"gst", "gstreamer", "gstreamer_mjpeg", "gstreamer_mjpeg_tee"}:

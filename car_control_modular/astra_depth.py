@@ -5,12 +5,18 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import math
 import threading
 import time
 from typing import Optional, Tuple
+
+from .control_types import DepthJumpConfirmation
+from .depth_orientation import configure_orientation, read_orientation
+from .depth_torso_selection import allow_sparse_torso_continuation, select_torso_candidate_group
+from .depth_torso_recovery import assess_torso_recovery, torso_evidence_continuous
+from .depth_temporal_filter import append_depth_sample, reset_depth_window
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,10 @@ class AstraDepthConfig:
     large_bbox_guard_max_distance_m: float = 2.50
     max_distance_jump_m: float = 0.80
     jump_confirm_frames: int = 2
+    # A near-to-far jump must also be physically plausible relative to the
+    # last accepted sample. Encoder-supported chassis motion may override
+    # this guard; otherwise an impossible jump remains held until re-anchor.
+    max_unconfirmed_jump_rate_m_s: float = 3.0
     near_guard_distance_m: float = 1.80
     near_far_jump_confirm_frames: int = 5
     anchor_strict_age_sec: float = 0.60
@@ -60,6 +70,7 @@ class AstraDepthConfig:
     near_far_jump_edge_margin_ratio: float = 0.02
     encoder_wheel_circumference_m: float = 0.60
     log_every_sec: float = 1.0
+    diagnostics_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -78,6 +89,25 @@ class AstraDepthMeasurement:
     required_confirm_frames: int = 0
     confirm_count: int = 0
     rejection_reason: str = ""
+    # A rejected near candidate may still be safety-relevant.  It is kept
+    # separate from distance_m so the longitudinal PID continues using the
+    # last trusted anchor while the caller can apply an immediate brake gate.
+    safety_distance_m: Optional[float] = None
+    region_count: int = 0
+    jump_confirmation: Optional[DepthJumpConfirmation] = None
+    # Only a newly accepted sample carries its source timestamp. Runtime may
+    # recompute age after ROI processing without guessing from an earlier now.
+    sample_timestamp: Optional[float] = None
+    observation_sample_timestamp: Optional[float] = None
+    observation_source: str = "unknown"
+    temporal_status: str = ""
+    roi_valid_pixels: int = 0
+    roi_required_valid_pixels: int = 0
+    sparse_torso_continuation: bool = False
+    torso_recovery_status: str = "not_evaluated"
+    filter_expired_count: int = 0
+    filter_reset_count: int = 0
+    filter_window_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -106,7 +136,9 @@ class AstraDepthRuntime:
         self._device = None
         self._color_stream = None
         self._depth_stream = None
+        self._depth_orientation = None
         self._depth_lock = threading.Lock()
+        self._measurement_lock = threading.RLock()
         self._latest_depth = None
         self._latest_depth_ts = 0.0
         self._last_depth_arrival_ts = 0.0
@@ -125,20 +157,48 @@ class AstraDepthRuntime:
         self._released = False
         self._last_target_id: Optional[int] = None
         self._distance_history = deque(maxlen=max(1, int(config.median_window)))
+        self._distance_history_timestamps = deque(maxlen=self._distance_history.maxlen)
         self._last_accepted_distance_m: Optional[float] = None
         self._last_accepted_ts = 0.0
         self._pending_jump_distance_m: Optional[float] = None
         self._pending_jump_count = 0
         self._pending_jump_required_confirms = 0
+        self._pending_jump_timestamp = 0.0
+        self._pending_jump_kind = ""
+        self._pending_jump_region_count = 0
+        self._pending_torso_recovery_evidence = None
+        self._last_torso_recovery_evidence = None
         self._last_processed_depth_ts = 0.0
+        # A failed latest-frame attempt is not a trusted-state watermark.
+        # Bound memory independently of stream uptime and deduplicate across
+        # latest and RGB-aligned callers using the physical sample timestamp.
+        self._attempted_depth_samples = deque(maxlen=128)
+        self._measurement_sample_ts = None
+        self._measurement_temporal_status = ""
+        self._last_torso_selection = None
+        self._measurement_roi_valid = 0
+        self._measurement_roi_required = 0
+        self._measurement_sparse = False
+        self._measurement_torso_recovery_status = "not_evaluated"
+        self._measurement_filter_expired_count = 0
+        self._measurement_filter_reset_count = 0
         self._near_reference_bbox_area_ratio: Optional[float] = None
         self._last_accepted_bbox_area_ratio: Optional[float] = None
+        self._last_accepted_bbox = None
+        self._last_accepted_region_count = 0
         self._last_feedback_ts: Optional[float] = None
         self._encoder_distance_change_since_accept_m = 0.0
         self._last_log_ts = 0.0
         self._last_region_log_ts = 0.0
         self._last_diagnostic_log_ts = 0.0
         self._last_diagnostic_log_key = None
+        self._measurement_regions = []
+        # Immutable passive evidence; never read by ranging/control.
+        self._shadow_range_evidence = None
+        self.diagnostics = None
+        if config.diagnostics_dir:
+            from .depth_diagnostics import DepthDiagnostics
+            self.diagnostics = DepthDiagnostics(config.diagnostics_dir, self.logger)
 
     def start(self) -> None:
         if self._started:
@@ -176,10 +236,16 @@ class AstraDepthRuntime:
             self._device.set_image_registration_mode(registration_mode)
             if self._device.get_image_registration_mode() != registration_mode:
                 raise RuntimeError("Astra Depth到RGB硬件配准未生效")
-            # Astra Pro exposes RGB through /dev/video3. The OpenNI color stream
+            configure_orientation(self._depth_stream, self._color_stream, self.logger)
+            # Astra Pro exposes RGB through its UVC node. The OpenNI color stream
             # is created only to provide calibration for depth-to-color mapping;
             # starting it yields no frames on this hardware revision.
             self._depth_stream.start()
+            # Some drivers reset properties on start. Verify before any frame
+            # reaches the reader, and derive the ONE ingest transform here.
+            self._depth_orientation = read_orientation(
+                self._depth_stream, self._color_stream, self.logger, stage="started",
+            )
         except Exception:
             self.close()
             raise
@@ -195,7 +261,7 @@ class AstraDepthRuntime:
         self._depth_thread.start()
         info = self._device.get_device_info()
         self.logger.info(
-            "Astra配准Depth已启动: device=%s %dx%d@%dFPS registration=depth_to_color RGB=/dev/video3",
+            "Astra配准Depth已启动: device=%s %dx%d@%dFPS registration=depth_to_color RGB=external_UVC",
             info,
             int(c.width),
             int(c.height),
@@ -210,12 +276,13 @@ class AstraDepthRuntime:
                 if self._openni2.wait_for_any_stream([stream], 0.20) is None:
                     continue
                 frame = stream.read_frame()
+                now = time.monotonic()
                 width = int(frame.width)
                 height = int(frame.height)
                 depth = np.frombuffer(
                     frame.get_buffer_as_uint16(), dtype=np.uint16
                 ).reshape(height, width).copy()
-                now = time.monotonic()
+                depth = self._depth_orientation.normalize(depth)
                 previous_arrival = self._last_depth_arrival_ts
                 period_ms = (
                     max(0.0, now - previous_arrival) * 1000.0
@@ -228,13 +295,15 @@ class AstraDepthRuntime:
                     self._last_depth_arrival_ts = now
                     self._last_depth_period_ms = period_ms
                     self._depth_history.append((now, depth))
+                if self.diagnostics is not None:
+                    self.diagnostics.add_depth(now, depth)
             except Exception as exc:
                 if not self._stop_event.is_set():
                     self.logger.warning("Astra Depth读取失败: %s", exc)
                     self._stop_event.wait(0.05)
 
     def read(self) -> Tuple[bool, object]:
-        """Color is exposed by Astra's UVC /dev/video3 node, not OpenNI."""
+        """Color is exposed by Astra's configured UVC node, not OpenNI."""
         return False, None
 
     def release(self) -> None:
@@ -245,6 +314,32 @@ class AstraDepthRuntime:
         with self._depth_lock:
             return self._latest_depth is not None and self._latest_depth_ts > 0.0
 
+    def copy_depth_history(self, *, after_timestamp: float, max_frames: int = 16, nonblocking: bool = False):
+        """Owned, read-only copies for offline/shadow tracking; no ranging state.
+
+        Physical arrival stamps retain their existing meaning (not exposure
+        timestamps). Copy arrays outside the acquisition lock: published depth
+        arrays are never modified by the producer. A consumer must detect gaps
+        and must not substitute the copy time for a source timestamp.
+        """
+        if not math.isfinite(after_timestamp) or after_timestamp < 0:
+            raise ValueError("after_timestamp must be finite and nonnegative")
+        if isinstance(max_frames, bool) or not isinstance(max_frames, int) or not 1 <= max_frames <= 16:
+            raise ValueError("max_frames must be in 1..16")
+        if not self._depth_lock.acquire(blocking=not nonblocking):
+            return ()
+        try:
+            samples = [(float(t), d) for t, d in self._depth_history if t > after_timestamp]
+            samples = samples[-max_frames:]
+        finally:
+            self._depth_lock.release()
+        owned = []
+        for stamp, depth in samples:
+            copy = depth.copy()
+            copy.setflags(write=False)
+            owned.append((stamp, copy))
+        return tuple(owned)
+
     def wait_until_ready(self, timeout_sec: float = 2.0) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
         while time.monotonic() < deadline:
@@ -253,11 +348,19 @@ class AstraDepthRuntime:
             time.sleep(0.01)
         return self.latest_depth_ready()
 
-    def _aligned_depth_locked(self, now: float, *, use_latest_depth: bool = False):
+    def _aligned_depth_locked(
+        self,
+        now: float,
+        *,
+        reference_timestamp: Optional[float] = None,
+        use_latest_depth: bool = False,
+    ):
         """Return the Depth frame closest to the RGB capture time.
 
         Caller must hold ``_depth_lock``. The latest-frame fallback keeps
-        direct unit-test injection and old camera backends compatible.
+        direct unit-test injection and old camera backends compatible. When a
+        real RGB capture timestamp is available, it is authoritative; the
+        configured delay is only a fallback for older callers.
         """
         if use_latest_depth:
             return (
@@ -265,7 +368,16 @@ class AstraDepthRuntime:
                 float(self._latest_depth_ts),
                 0.0,
             )
-        target_ts = float(now) - max(0.0, float(self.config.rgb_processing_delay_sec))
+        target_ts = None
+        if reference_timestamp is not None:
+            try:
+                candidate_ts = float(reference_timestamp)
+            except (TypeError, ValueError):
+                candidate_ts = 0.0
+            if math.isfinite(candidate_ts) and candidate_ts > 0.0:
+                target_ts = candidate_ts
+        if target_ts is None:
+            target_ts = float(now) - max(0.0, float(self.config.rgb_processing_delay_sec))
         if self._depth_history:
             sample_ts, depth = min(
                 self._depth_history,
@@ -307,11 +419,53 @@ class AstraDepthRuntime:
             return None
         return max(0.0, float(now) - float(self._last_accepted_ts))
 
+    def _reset_pending_jump(self) -> None:
+        self._pending_jump_distance_m = None
+        self._pending_jump_count = 0
+        self._pending_jump_required_confirms = 0
+        self._pending_jump_timestamp = 0.0
+        self._pending_jump_kind = ""
+        self._pending_jump_region_count = 0
+        self._pending_torso_recovery_evidence = None
+
+    def _clear_distance_history(self) -> None:
+        self._measurement_filter_reset_count += reset_depth_window(
+            self._distance_history, self._distance_history_timestamps,
+        )
+
+    def _advance_pending_jump(
+        self, distance_m: float, sample_timestamp: float, *,
+        required_confirms: int, region_count: int, kind: str,
+    ) -> None:
+        """Count distinct, temporally adjacent samples of the same surface."""
+        tolerance = max(0.15, float(self.config.max_distance_jump_m) * 0.35)
+        same_surface = bool(
+            self._pending_jump_distance_m is not None
+            and self._pending_jump_kind == kind
+            and abs(distance_m - float(self._pending_jump_distance_m)) <= tolerance
+            and 0.0 < sample_timestamp - self._pending_jump_timestamp
+            <= max(0.01, float(self.config.max_frame_age_sec))
+        )
+        if same_surface:
+            self._pending_jump_count += 1
+            self._pending_jump_region_count = min(
+                self._pending_jump_region_count, int(region_count)
+            )
+        else:
+            self._pending_jump_distance_m = float(distance_m)
+            self._pending_jump_count = 1
+            self._pending_jump_region_count = int(region_count)
+        self._pending_jump_timestamp = float(sample_timestamp)
+        self._pending_jump_kind = str(kind)
+        self._pending_jump_required_confirms = int(required_confirms)
+
     def _log_depth_diagnostic(self, now: float, measurement: AstraDepthMeasurement) -> None:
         key = (
             str(measurement.detail),
             int(measurement.confirm_count),
             int(measurement.required_confirm_frames),
+            int(measurement.region_count),
+            measurement.jump_confirmation,
         )
         interval = max(0.10, float(self.config.log_every_sec))
         if key == self._last_diagnostic_log_key and now - self._last_diagnostic_log_ts < interval:
@@ -321,7 +475,8 @@ class AstraDepthRuntime:
         self.logger.info(
             "Astra depth diagnostic: target=%s detail=%s rejection=%s "
             "anchor_age_ms=%s candidate_m=%s valid=%d required=%d clipped=%s "
-            "bbox_area=%s bbox_area_change=%s confirm=%d/%d encoder_distance_change=%+.3fm",
+            "bbox_area=%s bbox_area_change=%s confirm=%d/%d safety_candidate_m=%s "
+            "encoder_distance_change=%+.3fm region_count=%d jump_confirmation=%s",
             "none" if self._last_target_id is None else int(self._last_target_id),
             measurement.detail,
             measurement.rejection_reason or "none",
@@ -342,7 +497,12 @@ class AstraDepthRuntime:
             else f"{measurement.bbox_area_change_ratio:.3f}",
             int(measurement.confirm_count),
             int(measurement.required_confirm_frames),
+            "none"
+            if measurement.safety_distance_m is None
+            else f"{measurement.safety_distance_m:.3f}",
             float(self._encoder_distance_change_since_accept_m),
+            int(measurement.region_count),
+            measurement.jump_confirmation or "none",
         )
 
     def _held_measurement(
@@ -359,6 +519,8 @@ class AstraDepthRuntime:
         required_confirm_frames: int = 0,
         confirm_count: int = 0,
         rejection_reason: Optional[str] = None,
+        safety_distance_m: Optional[float] = None,
+        region_count: int = 0,
     ) -> AstraDepthMeasurement:
         c = self.config
         age = self._anchor_age(now)
@@ -382,6 +544,8 @@ class AstraDepthRuntime:
                 required_confirm_frames=int(required_confirm_frames),
                 confirm_count=int(confirm_count),
                 rejection_reason=rejection_reason or detail,
+                safety_distance_m=safety_distance_m,
+                region_count=int(region_count),
             )
         else:
             measurement = AstraDepthMeasurement(
@@ -399,6 +563,8 @@ class AstraDepthRuntime:
                 required_confirm_frames=int(required_confirm_frames),
                 confirm_count=int(confirm_count),
                 rejection_reason=rejection_reason or detail,
+                safety_distance_m=safety_distance_m,
+                region_count=int(region_count),
             )
         self._log_depth_diagnostic(now, measurement)
         return measurement
@@ -545,6 +711,7 @@ class AstraDepthRuntime:
         frame_height: int,
         anchor_age_sec: Optional[float],
     ) -> Tuple[Optional[float], int, int, int, str, bool]:
+        self._last_torso_selection = None
         regions, clipped = self._torso_sampling_regions(
             bbox,
             frame_width,
@@ -554,6 +721,8 @@ class AstraDepthRuntime:
         )
         candidates = []
         region_diagnostics = []
+        self._measurement_depth_size = [int(depth.shape[1]), int(depth.shape[0])]
+        self._measurement_regions = []
         region_valid_total = 0
         required_max = 0
         for name, left, top, right, bottom in regions:
@@ -575,6 +744,17 @@ class AstraDepthRuntime:
                 & (patch <= int(round(max(float(self.config.min_distance_m), float(self.config.max_distance_m)) * 1000.0)))
             ))
             region_required = self._dynamic_required_pixels(int(patch.size))
+            self._measurement_regions.append({
+                "name": name, "roi": [left, top, right, bottom],
+                "pixels": int(patch.size), "valid": region_valid,
+                "required": region_required,
+                "nonzero_below_0_4m": int(self._np.count_nonzero((patch > 0) & (patch < 400))),
+                "cluster_count": len(region_candidates),
+                "clusters": [dict(distance_m=float(c.distance_m), pixels=int(c.pixels),
+                                  spatial_support=float(c.spatial_support_fraction))
+                             for c in region_candidates[:8]],
+                "clusters_omitted": max(0, len(region_candidates)-8),
+            })
             best_distance = (
                 None
                 if not region_candidates
@@ -601,82 +781,39 @@ class AstraDepthRuntime:
                 )
             return None, 0, region_valid_total, required_max, "none", clipped
 
-        tolerance = max(0.15, float(self.config.foreground_cluster_span_m) * 0.75)
-        groups = []
-        for candidate in sorted(candidates, key=lambda item: item.distance_m):
-            matching = None
-            for group in groups:
-                if abs(candidate.distance_m - group["center"]) <= tolerance:
-                    matching = group
-                    break
-            if matching is None:
-                matching = {"items": [], "center": float(candidate.distance_m)}
-                groups.append(matching)
-            matching["items"].append(candidate)
-            weights = [max(1, item.pixels) for item in matching["items"]]
-            matching["center"] = sum(
-                item.distance_m * weight
-                for item, weight in zip(matching["items"], weights)
-            ) / float(sum(weights))
-
-        reference = self._last_accepted_distance_m
-        strict_age = max(0.0, float(self.config.anchor_strict_age_sec))
-        expire_age = max(strict_age, float(self.config.anchor_expire_age_sec))
-        for group in groups:
-            items = group["items"]
-            region_count = len({item.region_name for item in items})
-            support = sum(item.pixels for item in items)
-            coherence = sum(item.spatial_support_fraction for item in items) / float(len(items))
-            continuity = 0.0
-            if reference is not None and anchor_age_sec is not None and anchor_age_sec < expire_age:
-                age_weight = 1.0 if anchor_age_sec < strict_age else 0.45
-                continuity = age_weight * max(
-                    0.0,
-                    1.0 - abs(float(group["center"]) - float(reference)) / max(0.20, float(self.config.max_distance_jump_m)),
-                )
-            group["score"] = (
-                2.0 * float(region_count)
-                + math.log1p(max(0, support))
-                + coherence
-                + 4.0 * continuity
-            )
-            group["support"] = support
-            group["region_count"] = region_count
-
-        selected = max(groups, key=lambda group: float(group["score"]))
-        closest = min(groups, key=lambda group: float(group["center"]))
-        # A coherent nearer surface is safety-relevant even if fewer torso
-        # regions see it. Farther surfaces still pass the age-based guard below.
-        if (
-            float(closest["center"]) + max(0.15, float(self.config.max_distance_jump_m))
-            < float(selected["center"])
-            and int(closest["support"]) >= max(
-                item.required_pixels for item in closest["items"]
-            )
-        ):
-            selected = closest
-        selected_items = selected["items"]
-        selected_pixels = sum(item.pixels for item in selected_items)
-        selected_valid = sum(item.valid_pixels for item in selected_items)
-        selected_required = max(item.required_pixels for item in selected_items)
-        region_names = "+".join(sorted({item.region_name for item in selected_items}))
+        selected = select_torso_candidate_group(
+            candidates,
+            anchor_distance_m=self._last_accepted_distance_m,
+            anchor_age_sec=anchor_age_sec,
+            cluster_span_m=self.config.foreground_cluster_span_m,
+            max_distance_jump_m=self.config.max_distance_jump_m,
+            anchor_strict_age_sec=self.config.anchor_strict_age_sec,
+            anchor_expire_age_sec=self.config.anchor_expire_age_sec,
+            minimum_spatial_support_fraction=self.config.foreground_spatial_support_fraction,
+        )
+        self._last_torso_selection = selected
+        if selected is None:
+            return None, 0, region_valid_total, required_max, "none", clipped
+        region_names = "+".join(selected.region_names)
         now = time.monotonic()
         if now - self._last_region_log_ts >= max(0.1, float(self.config.log_every_sec)):
             self._last_region_log_ts = now
             self.logger.info(
                 "Astra depth regions: selected=%s selected_distance=%.3fm "
-                "selected_pixels=%d clipped=%s details=%s",
+                "selected_pixels=%d clipped=%s details=%s selection_reason=%s groups=%s",
                 region_names,
-                float(selected["center"]),
-                selected_pixels,
+                selected.distance_m,
+                selected.pixels,
                 bool(clipped),
                 "; ".join(region_diagnostics),
+                selected.selection_reason,
+                selected.candidate_summary,
             )
         return (
-            float(selected["center"]),
-            int(selected_pixels),
-            int(selected_valid),
-            int(selected_required),
+            selected.distance_m,
+            selected.pixels,
+            selected.valid_pixels,
+            selected.required_pixels,
             region_names,
             clipped,
         )
@@ -857,33 +994,213 @@ class AstraDepthRuntime:
         target_id: Optional[int] = None,
         use_latest_depth: bool = False,
         steering_feedback=None,
+        reference_timestamp: Optional[float] = None,
+        evidence_capture_frame_id: Optional[int] = None,
+    ) -> AstraDepthMeasurement:
+        # Search reacquisition can also measure outside the main control
+        # mutex. Keep sample deduplication, filtering and confirmation atomic.
+        with self._measurement_lock:
+            started = time.monotonic()
+            self._measurement_sample_ts = None
+            self._measurement_temporal_status = "no_sample"
+            self._last_torso_selection = None
+            self._measurement_regions = []
+            self._measurement_depth_size = None
+            self._measurement_roi_valid = self._measurement_roi_required = 0
+            self._measurement_sparse = False
+            self._measurement_torso_recovery_status = "not_evaluated"
+            self._measurement_filter_expired_count = 0
+            self._measurement_filter_reset_count = 0
+            result = self._measure_target_locked(
+                bbox, frame_width, frame_height, target_id=target_id,
+                use_latest_depth=use_latest_depth, steering_feedback=steering_feedback,
+                reference_timestamp=reference_timestamp,
+            )
+            # Only a genuinely new failed observation breaks the accepted
+            # torso shortcut. Old/duplicate reads cannot revoke newer evidence.
+            if result.raw_distance_m is None and (
+                self._measurement_temporal_status == "new_sample"
+                or self._measurement_temporal_status == "expired_during_sampling"
+                or (use_latest_depth and self._measurement_temporal_status == "no_sample")
+            ):
+                self._last_torso_recovery_evidence = None
+            source = "latest" if use_latest_depth else "rgb_aligned"
+            result = replace(
+                result, observation_sample_timestamp=self._measurement_sample_ts,
+                observation_source=source, temporal_status=self._measurement_temporal_status,
+                roi_valid_pixels=self._measurement_roi_valid,
+                roi_required_valid_pixels=self._measurement_roi_required,
+                sparse_torso_continuation=self._measurement_sparse,
+                torso_recovery_status=self._measurement_torso_recovery_status,
+                filter_expired_count=self._measurement_filter_expired_count,
+                filter_reset_count=self._measurement_filter_reset_count,
+                filter_window_count=len(self._distance_history),
+            )
+            finished = time.monotonic()
+            if (result.sample_timestamp is not None and result.raw_distance_m is not None
+                    and target_id is not None and not result.rejection_reason
+                    and result.sample_timestamp == self._measurement_sample_ts):
+                previous_shadow = self._shadow_range_evidence
+                if previous_shadow is None or result.sample_timestamp > previous_shadow[1]:
+                    self._shadow_range_evidence = (
+                        int(target_id), float(result.sample_timestamp), float(result.raw_distance_m),
+                    )
+            self.logger.info(
+                "Astra depth timeline: target=%s source=%s reference_ts=%s sample_ts=%s "
+                "attempt_watermark=%.6f accepted_ts=%.6f pending_ts=%.6f "
+                "temporal=%s detail=%s candidate=%s raw=%s distance=%s "
+                "sample_age_ms=%s anchor_age_ms=%s processing_ms=%.1f "
+                "roi_valid=%d roi_required=%d selected_regions=%s selection_reason=%s "
+                "sparse_continuation=%s torso_recovery=%s "
+                "filter_expired=%d filter_reset=%d filter_window=%d evidence_capture_frame_id=%s "
+                "roi_scan_skipped=%s",
+                target_id, source, reference_timestamp, self._measurement_sample_ts,
+                self._last_processed_depth_ts, self._last_accepted_ts,
+                self._pending_jump_timestamp, self._measurement_temporal_status,
+                result.detail, result.candidate_distance_m, result.raw_distance_m,
+                result.distance_m,
+                None if self._measurement_sample_ts is None
+                else round((finished - self._measurement_sample_ts) * 1000.0, 1),
+                None if self._anchor_age(finished) is None
+                else round(self._anchor_age(finished) * 1000.0, 1),
+                (finished - started) * 1000.0,
+                self._measurement_roi_valid, self._measurement_roi_required,
+                "none" if self._last_torso_selection is None
+                else "+".join(self._last_torso_selection.region_names),
+                "none" if self._last_torso_selection is None
+                else self._last_torso_selection.selection_reason,
+                self._measurement_sparse,
+                self._measurement_torso_recovery_status,
+                self._measurement_filter_expired_count, self._measurement_filter_reset_count,
+                len(self._distance_history),
+                evidence_capture_frame_id,
+                result.temporal_status in {"duplicate", "older_than_anchor", "older_than_pending"},
+            )
+            if self.diagnostics is not None:
+                # Diagnostic failures must never turn a usable measurement
+                # into a controller failure or alter any confirmation state.
+                try:
+                    metadata = dict(
+                        target_id=target_id, source=source, reference_timestamp=reference_timestamp,
+                        evidence_capture_frame_id=evidence_capture_frame_id,
+                        sample_timestamp=self._measurement_sample_ts, observed_at=finished,
+                        bbox=[float(v) for v in bbox], frame_size=[frame_width, frame_height],
+                        temporal=result.temporal_status, detail=result.detail,
+                        candidate_m=result.candidate_distance_m, accepted_raw_m=result.raw_distance_m,
+                        filtered_or_held_m=result.distance_m, accepted_timestamp=self._last_accepted_ts,
+                        roi_valid=self._measurement_roi_valid, roi_required=self._measurement_roi_required,
+                        region_count=result.region_count, regions=self._measurement_regions,
+                        depth_size=self._measurement_depth_size,
+                        selected_region_distances=({} if self._last_torso_selection is None else {
+                            r.region_name: float(r.distance_m)
+                            for r in self._last_torso_selection._region_evidence
+                        }),
+                        selected_regions=([] if self._last_torso_selection is None
+                                          else list(self._last_torso_selection.region_names)),
+                        rejection_reason=result.rejection_reason,
+                        confirm_count=result.confirm_count, required_confirms=result.required_confirm_frames,
+                        orientation=(None if self._depth_orientation is None
+                                     else self._depth_orientation.metadata()),
+                        roi_scan_skipped=result.temporal_status in {
+                            "duplicate", "older_than_anchor", "older_than_pending",
+                        },
+                    )
+                    self.diagnostics.observe(
+                        metadata, anomaly=result.raw_distance_m is None and result.temporal_status
+                        in {"new_sample", "historical_after_later_attempt", "expired_during_sampling"},
+                        now=finished, sample_stamp=self._measurement_sample_ts,
+                    )
+                except Exception as exc:
+                    self.logger.warning("Depth diagnostic observation skipped: %s", exc)
+            return result
+
+    def _measure_target_locked(
+        self,
+        bbox: Tuple[float, float, float, float],
+        frame_width: int,
+        frame_height: int,
+        *,
+        target_id: Optional[int] = None,
+        use_latest_depth: bool = False,
+        steering_feedback=None,
+        reference_timestamp: Optional[float] = None,
     ) -> AstraDepthMeasurement:
         now = time.monotonic()
-        with self._depth_lock:
-            depth, sample_ts, alignment_error_sec = self._aligned_depth_locked(
-                now,
-                use_latest_depth=bool(use_latest_depth),
-            )
-        if depth is None or sample_ts <= 0.0:
-            return self._held_measurement(now, "no_depth_frame")
-        sample_age = max(0.0, now - sample_ts)
-        if sample_age > max(0.01, float(self.config.max_frame_age_sec)):
-            return self._held_measurement(now, "stale_depth_frame")
-
         current_target_id = None if target_id is None else int(target_id)
         if current_target_id != self._last_target_id:
             self._last_target_id = current_target_id
-            self._distance_history.clear()
+            self._clear_distance_history()
+            self._last_torso_recovery_evidence = None
             self._last_accepted_distance_m = None
             self._last_accepted_ts = 0.0
-            self._pending_jump_distance_m = None
-            self._pending_jump_count = 0
-            self._pending_jump_required_confirms = 0
+            self._reset_pending_jump()
             self._last_processed_depth_ts = 0.0
+            self._attempted_depth_samples.clear()
             self._near_reference_bbox_area_ratio = None
             self._last_accepted_bbox_area_ratio = None
+            self._last_accepted_bbox = None
+            self._last_accepted_region_count = 0
             self._last_feedback_ts = None
             self._encoder_distance_change_since_accept_m = 0.0
+        with self._depth_lock:
+            depth, sample_ts, alignment_error_sec = self._aligned_depth_locked(
+                now,
+                reference_timestamp=reference_timestamp,
+                use_latest_depth=bool(use_latest_depth),
+            )
+        if depth is None or not math.isfinite(float(sample_ts)) or sample_ts <= 0.0:
+            if use_latest_depth:
+                self._reset_pending_jump()
+            return self._held_measurement(now, "no_depth_frame")
+        self._measurement_sample_ts = float(sample_ts)
+        previous_attempt_ts = self._last_processed_depth_ts
+        sample_age = now - sample_ts
+        if sample_age < 0.0 or sample_age > max(0.01, float(self.config.max_frame_age_sec)):
+            self._measurement_temporal_status = "stale_or_future"
+            if 0.0 <= sample_age and (use_latest_depth or sample_ts >= previous_attempt_ts):
+                self._reset_pending_jump()
+            return self._held_measurement(now, "stale_depth_frame")
+        attempted = any(abs(sample_ts - stamp) <= 1e-9 for stamp in self._attempted_depth_samples)
+        if not attempted:
+            self._attempted_depth_samples.append(float(sample_ts))
+        self._last_processed_depth_ts = max(previous_attempt_ts, float(sample_ts))
+        older_than_anchor = sample_ts <= self._last_accepted_ts + 1e-9
+        older_than_pending = bool(
+            self._pending_jump_count > 0 and sample_ts <= self._pending_jump_timestamp + 1e-9
+        )
+        out_of_order = sample_ts < previous_attempt_ts - 1e-9
+        is_new_depth = not attempted and not older_than_anchor and not older_than_pending
+        self._measurement_temporal_status = (
+            "duplicate" if attempted else "older_than_anchor" if older_than_anchor
+            else "older_than_pending" if older_than_pending
+            else "historical_after_later_attempt" if out_of_order else "new_sample"
+        )
+
+        if not is_new_depth:
+            # A physical sample cannot become new evidence by changing callers
+            # or bboxes. Avoid expensive ROI clustering and do not renew the
+            # accepted anchor, pending count, or PID authority. An unseen sample
+            # after a newer FAILED attempt remains eligible below.
+            if self._pending_jump_count > 0:
+                confirms = max(1, int(self._pending_jump_required_confirms),
+                               int(self.config.jump_confirm_frames))
+                return self._held_measurement(
+                    now, f"distance_jump_pending_{self._pending_jump_count}_of_{confirms}",
+                    candidate_distance_m=self._pending_jump_distance_m,
+                    required_confirm_frames=confirms, confirm_count=self._pending_jump_count,
+                    rejection_reason="reused_depth_frame",
+                    safety_distance_m=(
+                        self._pending_jump_distance_m
+                        if self._pending_jump_distance_m is not None
+                        and self._last_accepted_distance_m is not None
+                        and self._pending_jump_distance_m < self._last_accepted_distance_m
+                        else None
+                    ),
+                )
+            return self._held_measurement(
+                now, "depth_observation_reused" if self._last_accepted_distance_m is not None
+                else "reused_depth_frame", rejection_reason="reused_depth_frame",
+            )
 
         self._update_encoder_motion(steering_feedback)
 
@@ -901,12 +1218,14 @@ class AstraDepthRuntime:
         valid = roi[(roi >= min_mm) & (roi <= max_mm)]
         valid_pixels = int(valid.size)
         required_valid_pixels = self._dynamic_required_pixels(int(roi.size))
+        self._measurement_roi_valid = valid_pixels
+        self._measurement_roi_required = required_valid_pixels
         bbox_area_ratio, _ = self._bbox_depth_evidence(
             bbox,
             frame_width,
             frame_height,
         )
-        _, bbox_clipped = self._torso_sampling_regions(
+        sampling_regions, bbox_clipped = self._torso_sampling_regions(
             bbox,
             frame_width,
             frame_height,
@@ -920,17 +1239,6 @@ class AstraDepthRuntime:
             else float(bbox_area_ratio) / float(previous_bbox_area)
         )
         anchor_age_sec = self._anchor_age(now)
-        if valid_pixels < required_valid_pixels:
-            return self._held_measurement(
-                now,
-                "insufficient_depth_pixels",
-                valid_pixels,
-                required_valid_pixels=required_valid_pixels,
-                bbox_clipped=bbox_clipped,
-                bbox_area_ratio=bbox_area_ratio,
-                bbox_area_change_ratio=bbox_area_change_ratio,
-            )
-
         (
             raw_distance_m,
             foreground_pixels,
@@ -945,11 +1253,41 @@ class AstraDepthRuntime:
             frame_height,
             anchor_age_sec,
         )
+        if valid_pixels < required_valid_pixels:
+            sparse_continuation = allow_sparse_torso_continuation(
+                self._last_torso_selection,
+                anchor_distance_m=self._last_accepted_distance_m,
+                anchor_age_sec=anchor_age_sec,
+                strict_age_sec=self.config.anchor_strict_age_sec,
+                max_near_distance_m=self.config.large_bbox_guard_max_distance_m,
+                cluster_span_m=self.config.foreground_cluster_span_m,
+                max_distance_jump_m=self.config.max_distance_jump_m,
+                minimum_spatial_support_fraction=self.config.foreground_spatial_support_fraction,
+            )
+            if not sparse_continuation:
+                if is_new_depth:
+                    self._reset_pending_jump()
+                return self._held_measurement(
+                    now, "insufficient_depth_pixels", valid_pixels,
+                    candidate_distance_m=raw_distance_m,
+                    required_valid_pixels=required_valid_pixels,
+                    bbox_clipped=bbox_clipped, bbox_area_ratio=bbox_area_ratio,
+                    bbox_area_change_ratio=bbox_area_change_ratio,
+                    region_count=(0 if self._last_torso_selection is None
+                                  else self._last_torso_selection.region_count),
+                )
+            # The original central ROI remains in diagnostics. Measurement
+            # support now describes the actually selected, validated regions.
+            self._measurement_sparse = True
+            valid_pixels = foreground_pixels
+            required_valid_pixels = region_required_pixels
         required_valid_pixels = max(required_valid_pixels, region_required_pixels)
         _center_patch_distance, center_patch_valid, center_patch_pixels, center_patch_kept = (
             self._select_center_patch_distance(depth, left, top, right, bottom)
         )
-        measurement_detail = "depth_multiregion"
+        measurement_detail = (
+            "depth_torso_continuation" if self._measurement_sparse else "depth_multiregion"
+        )
         if raw_distance_m is None:
             # Multi-region sampling is authoritative. The whole torso ROI is a
             # last-resort coherent foreground fallback, never a plain median.
@@ -957,6 +1295,8 @@ class AstraDepthRuntime:
                 self._select_foreground_cluster(valid)
             )
             if raw_distance_m is None:
+                if is_new_depth:
+                    self._reset_pending_jump()
                 return self._held_measurement(
                     now,
                     "multiregion_and_foreground_insufficient",
@@ -982,6 +1322,67 @@ class AstraDepthRuntime:
         large_bbox = bool(
             bbox_area_ratio >= large_bbox_guard_area
             or bbox_height_ratio >= large_bbox_guard_height
+        )
+        consensus_regions = tuple(
+            item.strip()
+            for item in str(selected_regions or "").split("+")
+            if item.strip() and item.strip() not in ("whole_torso", "none")
+        )
+        region_count = len(set(consensus_regions))
+        torso_recovery_evidence = None
+        if (
+            bbox_clipped and 1 <= region_count <= 2
+            and raw_distance_m > float(self.config.large_bbox_guard_max_distance_m)
+            and current_target_id is not None and current_target_id > 0
+        ):
+            torso_recovery_evidence, recovery_reason = assess_torso_recovery(
+                selection=self._last_torso_selection, bbox=bbox,
+                frame_width=frame_width, frame_height=frame_height,
+                depth_width=int(depth.shape[1]), depth_height=int(depth.shape[0]),
+                regions=sampling_regions,
+                anchor_distance_m=self._last_accepted_distance_m,
+                anchor_age_sec=anchor_age_sec, sample_timestamp=sample_ts,
+                max_distance_jump_m=self.config.max_distance_jump_m,
+                max_anchor_age_sec=min(3.0, 2.0 * self.config.anchor_expire_age_sec),
+                edge_margin_ratio=self.config.near_far_jump_edge_margin_ratio,
+                large_bbox_area_ratio=self.config.large_bbox_guard_area_ratio,
+                large_bbox_height_ratio=self.config.large_bbox_guard_height_ratio,
+                min_spatial_support_fraction=self.config.foreground_spatial_support_fraction,
+            )
+            self._measurement_torso_recovery_status = recovery_reason
+        # A box touching the image boundary can expose a large background
+        # surface even when its area is below the normal large-box threshold.
+        # For ranges beyond the near-field guard, a single torso region is not
+        # enough evidence to advance the distance anchor.
+        clipped_far_weak_consensus = bool(
+            bbox_clipped
+            and raw_distance_m > float(self.config.large_bbox_guard_max_distance_m)
+            and region_count < 2
+            and torso_recovery_evidence is None
+        )
+        if clipped_far_weak_consensus:
+            if is_new_depth:
+                self._reset_pending_jump()
+            edge_guard_detail = self._near_far_jump_guard_detail(
+                bbox,
+                frame_width,
+                frame_height,
+            )
+            return self._held_measurement(
+                now,
+                edge_guard_detail or "far_background_guard_clipped_multiregion",
+                valid_pixels,
+                candidate_distance_m=raw_distance_m,
+                required_valid_pixels=required_valid_pixels,
+                bbox_clipped=bbox_clipped,
+                bbox_area_ratio=bbox_area_ratio,
+                bbox_area_change_ratio=bbox_area_change_ratio,
+                rejection_reason="clipped_bbox_single_region",
+                region_count=region_count,
+            )
+        multi_region_consensus = bool(
+            region_count >= 3
+            and int(foreground_pixels) >= int(required_valid_pixels)
         )
         if large_bbox and raw_distance_m > float(self.config.large_bbox_guard_max_distance_m):
             # 人靠近摄像头时，中心区域可能恰好落在腋下、衣服深度孔洞或
@@ -1009,17 +1410,31 @@ class AstraDepthRuntime:
                     and anchor_age_sec <= float(self.config.anchor_expire_age_sec)
                     else None,
                 )
-            if anchored_m is not None:
+            if anchored_m is not None and (
+                float(anchored_m) <= float(self.config.large_bbox_guard_max_distance_m)
+                or not multi_region_consensus
+            ):
                 raw_distance_m = float(anchored_m)
                 foreground_pixels = int(anchored_pixels)
                 total_valid_pixels = int(anchored_total)
                 measurement_detail = "depth_foreground_fallback_large_bbox_anchor"
-            elif not anchor_relaxed:
+                # Whole-ROI fallback is not independent torso-region proof.
+                region_count = 0
+                multi_region_consensus = False
+            else:
                 nearest_m, nearest_pixels, nearest_total = self._select_foreground_cluster(valid)
-                if (
-                    nearest_m is None
-                    or float(nearest_m) > float(self.config.large_bbox_guard_max_distance_m)
+                if nearest_m is not None and float(nearest_m) <= float(
+                    self.config.large_bbox_guard_max_distance_m
                 ):
+                    raw_distance_m = float(nearest_m)
+                    foreground_pixels = int(nearest_pixels)
+                    total_valid_pixels = int(nearest_total)
+                    measurement_detail = "depth_foreground_fallback_large_bbox_nearest"
+                    region_count = 0
+                    multi_region_consensus = False
+                elif not multi_region_consensus:
+                    if is_new_depth:
+                        self._reset_pending_jump()
                     return self._held_measurement(
                         now,
                         "far_background_guard_large_bbox",
@@ -1029,45 +1444,48 @@ class AstraDepthRuntime:
                         bbox_clipped=bbox_clipped,
                         bbox_area_ratio=bbox_area_ratio,
                         bbox_area_change_ratio=bbox_area_change_ratio,
+                        region_count=region_count,
                     )
-                raw_distance_m = float(nearest_m)
-                foreground_pixels = int(nearest_pixels)
-                total_valid_pixels = int(nearest_total)
-                measurement_detail = "depth_foreground_fallback_large_bbox_nearest"
-        if sample_ts <= self._last_processed_depth_ts + 1e-9:
-            if self._pending_jump_count > 0:
-                confirms = max(
-                    1,
-                    int(self._pending_jump_required_confirms),
-                    int(self.config.jump_confirm_frames),
-                )
+                else:
+                    measurement_detail = "depth_multiregion_large_bbox_consensus"
+        high_risk_far = bool(
+            (large_bbox or bbox_clipped)
+            and raw_distance_m > float(self.config.large_bbox_guard_max_distance_m)
+        )
+        if high_risk_far and not multi_region_consensus and torso_recovery_evidence is None:
+            # A reference ROI fallback may continue an already trusted far
+            # anchor, but cannot bootstrap/re-anchor a clipped far surface.
+            far_anchor_continuation = bool(
+                measurement_detail == "depth_foreground_fallback_large_bbox_anchor"
+                and self._last_accepted_distance_m is not None
+                and self._last_accepted_distance_m > float(self.config.large_bbox_guard_max_distance_m)
+                and anchor_age_sec is not None
+                and anchor_age_sec <= float(self.config.anchor_expire_age_sec)
+            )
+            if not far_anchor_continuation:
+                if is_new_depth:
+                    self._reset_pending_jump()
                 return self._held_measurement(
-                    now,
-                    f"distance_jump_pending_{self._pending_jump_count}_of_{confirms}",
-                    valid_pixels,
-                    candidate_distance_m=self._pending_jump_distance_m,
+                    now, "far_background_guard_clipped_multiregion", valid_pixels,
+                    candidate_distance_m=raw_distance_m,
                     required_valid_pixels=required_valid_pixels,
                     bbox_clipped=bbox_clipped,
                     bbox_area_ratio=bbox_area_ratio,
                     bbox_area_change_ratio=bbox_area_change_ratio,
-                    required_confirm_frames=confirms,
-                    confirm_count=self._pending_jump_count,
-                    rejection_reason="reused_depth_frame",
+                    rejection_reason="insufficient_multiregion_consensus",
+                    region_count=region_count,
                 )
-            if self._last_accepted_distance_m is not None:
-                return AstraDepthMeasurement(
-                    distance_m=float(self._last_accepted_distance_m),
-                    raw_distance_m=None,
-                    sample_age_sec=sample_age,
-                    valid_pixels=valid_pixels,
-                    detail=f"{measurement_detail}_reused_hold",
-                    anchor_age_sec=anchor_age_sec,
-                    required_valid_pixels=required_valid_pixels,
-                    bbox_clipped=bbox_clipped,
-                    bbox_area_ratio=bbox_area_ratio,
-                    bbox_area_change_ratio=bbox_area_change_ratio,
-                )
-        self._last_processed_depth_ts = sample_ts
+        sampled_now = time.monotonic()
+        if not 0.0 <= sampled_now - sample_ts <= max(0.01, float(self.config.max_frame_age_sec)):
+            self._measurement_temporal_status = "expired_during_sampling"
+            if is_new_depth and not out_of_order:
+                self._reset_pending_jump()
+            return self._held_measurement(
+                sampled_now, "stale_depth_frame", valid_pixels,
+                candidate_distance_m=raw_distance_m, required_valid_pixels=required_valid_pixels,
+                bbox_clipped=bbox_clipped, bbox_area_ratio=bbox_area_ratio,
+                region_count=region_count,
+            )
         last = self._last_accepted_distance_m
         jump_limit = max(0.0, float(self.config.max_distance_jump_m))
         farther_jump = bool(
@@ -1080,11 +1498,129 @@ class AstraDepthRuntime:
             and raw_distance_m < float(last)
             and float(last) - raw_distance_m > jump_limit
         )
+        expire_age = max(
+            float(self.config.anchor_strict_age_sec),
+            float(self.config.anchor_expire_age_sec),
+        )
+        # A continuous torso moving across 2.5m is not a new background
+        # surface. This narrow boundary path requires proof on BOTH endpoints;
+        # it does not bootstrap identity, renew a stale anchor or admit jumps.
+        boundary = float(self.config.large_bbox_guard_max_distance_m)
+        boundary_dt = float(sample_ts) - self._last_accepted_ts
+        old_bbox = self._last_accepted_bbox
+        boundary_continuous = bool(
+            high_risk_far and multi_region_consensus and not out_of_order
+            and current_target_id is not None and current_target_id > 0
+            and last is not None and boundary-.10 <= float(last) <= boundary
+            and boundary < raw_distance_m <= boundary+.10
+            and self._last_accepted_region_count >= 3
+            and anchor_age_sec is not None and 0 <= anchor_age_sec <= .18
+            and 0 <= sampled_now-sample_ts <= .18
+            and 0 < boundary_dt <= .18
+            and abs(raw_distance_m-float(last)) <= min(.08, jump_limit)
+            and abs(raw_distance_m-float(last))/boundary_dt <= min(
+                1.5, float(self.config.max_unconfirmed_jump_rate_m_s))
+            and bbox_area_change_ratio is not None and .85 <= bbox_area_change_ratio <= 1.15
+            and old_bbox is not None
+            and .85 <= (bbox[2]-bbox[0])/max(1.,old_bbox[2]-old_bbox[0]) <= 1.15
+            and .85 <= (bbox[3]-bbox[1])/max(1.,old_bbox[3]-old_bbox[1]) <= 1.15
+            and abs((bbox[0]+bbox[2]-old_bbox[0]-old_bbox[2])*.5) <= frame_width*.05
+            and abs((bbox[1]+bbox[3]-old_bbox[1]-old_bbox[3])*.5) <= frame_height*.05
+        )
+        if boundary_continuous:
+            self.logger.info(
+                "depth_boundary_continuity uid=%s sample_ts=%.6f anchor_ts=%.6f "
+                "candidate_m=%.3f anchor_m=%.3f region_count=%d previous_regions=%d "
+                "pending_bypassed=True identity_changed=False",
+                current_target_id, sample_ts, self._last_accepted_ts,
+                raw_distance_m, last, region_count, self._last_accepted_region_count,
+            )
+        needs_far_consensus_confirmation = bool(
+            high_risk_far
+            and multi_region_consensus
+            and not boundary_continuous
+            and (
+                last is None
+                or float(last) <= float(self.config.large_bbox_guard_max_distance_m)
+                or (anchor_age_sec is not None and anchor_age_sec > expire_age)
+            )
+        )
+        if out_of_order and (
+            farther_jump or closer_jump or needs_far_consensus_confirmation
+            or torso_recovery_evidence is not None
+        ):
+            # A late observation can restore a continuous trusted range, but
+            # cannot backfill confirmations across a newer failed sample.
+            self._measurement_temporal_status = "out_of_order_jump_observation"
+            return self._held_measurement(
+                now, "depth_out_of_order_jump_observation", valid_pixels,
+                candidate_distance_m=raw_distance_m,
+                required_valid_pixels=required_valid_pixels,
+                bbox_clipped=bbox_clipped, bbox_area_ratio=bbox_area_ratio,
+                bbox_area_change_ratio=bbox_area_change_ratio,
+                rejection_reason="out_of_order_jump_observation", region_count=region_count,
+            )
+        jump_confirmation = None
+        accepted_confirm_count = 0
+        accepted_required_confirms = 0
         reanchoring_after_timeout = False
-        if farther_jump:
+        if torso_recovery_evidence is not None:
+            # A foot touching the lower image edge is not itself evidence that
+            # the chest/abdomen sampling area is clipped. This narrow exception
+            # still requires an existing nearby anchor and two physical frames;
+            # it is never a replacement for three-region far-jump proof.
+            rate_limit = max(0.1, float(self.config.max_unconfirmed_jump_rate_m_s))
+            anchor_dt = max(0.033, float(sample_ts) - self._last_accepted_ts)
+            if abs(float(raw_distance_m) - float(last)) / anchor_dt > rate_limit:
+                self._reset_pending_jump()
+                self._measurement_torso_recovery_status = "anchor_rate_rejected"
+                return self._held_measurement(
+                    now, "distance_jump_rate_guard", valid_pixels,
+                    candidate_distance_m=raw_distance_m,
+                    required_valid_pixels=required_valid_pixels,
+                    bbox_clipped=bbox_clipped, bbox_area_ratio=bbox_area_ratio,
+                    bbox_area_change_ratio=bbox_area_change_ratio,
+                    rejection_reason="torso_recovery_rate_guard", region_count=region_count,
+                )
+            continuity = dict(
+                max_gap_sec=max(0.01, float(self.config.max_frame_age_sec)),
+                max_distance_delta_m=min(0.28, max(0.0, self.config.max_distance_jump_m)),
+                max_rate_m_s=rate_limit,
+            )
+            continuing = torso_evidence_continuous(
+                self._last_torso_recovery_evidence, torso_recovery_evidence, **continuity,
+            )
+            if not continuing:
+                if self._pending_jump_kind != "torso_recovery" or not torso_evidence_continuous(
+                    self._pending_torso_recovery_evidence, torso_recovery_evidence, **continuity,
+                ):
+                    self._reset_pending_jump()
+                self._advance_pending_jump(
+                    raw_distance_m, sample_ts, required_confirms=2,
+                    region_count=region_count, kind="torso_recovery",
+                )
+                self._pending_torso_recovery_evidence = torso_recovery_evidence
+                if self._pending_jump_count < 2:
+                    self._measurement_torso_recovery_status = "pending_1_of_2"
+                    return self._held_measurement(
+                        now, "distance_jump_pending_torso_1_of_2", valid_pixels,
+                        candidate_distance_m=raw_distance_m,
+                        required_valid_pixels=required_valid_pixels,
+                        bbox_clipped=bbox_clipped, bbox_area_ratio=bbox_area_ratio,
+                        bbox_area_change_ratio=bbox_area_change_ratio,
+                        required_confirm_frames=2, confirm_count=1,
+                        rejection_reason="bottom_only_torso_confirmation", region_count=region_count,
+                    )
+                accepted_confirm_count = accepted_required_confirms = 2
+                # A locally reconfirmed surface starts a new median window.
+                # Do not blend it with the pre-loss surface, even if nearby.
+                self._clear_distance_history()
+            self._measurement_torso_recovery_status = "continued" if continuing else "confirmed_2_of_2"
+            measurement_detail = "depth_torso_continuation" if continuing else "depth_torso_recovery_confirmed"
+        elif farther_jump or needs_far_consensus_confirmation:
             confirms = max(1, int(self.config.jump_confirm_frames))
             far_from_near = bool(
-                float(last) <= float(self.config.near_guard_distance_m)
+                last is not None and float(last) <= float(self.config.near_guard_distance_m)
             )
             strict_age = max(0.0, float(self.config.anchor_strict_age_sec))
             expire_age = max(strict_age, float(self.config.anchor_expire_age_sec))
@@ -1104,10 +1640,12 @@ class AstraDepthRuntime:
                         frame_width,
                         frame_height,
                     )
-                    if guard_detail is not None and not motion_supported:
-                        self._pending_jump_distance_m = None
-                        self._pending_jump_count = 0
-                        self._pending_jump_required_confirms = 0
+                    if (
+                        guard_detail is not None
+                        and not motion_supported
+                        and not (high_risk_far and multi_region_consensus)
+                    ):
+                        self._reset_pending_jump()
                         return self._held_measurement(
                             now,
                             guard_detail,
@@ -1119,6 +1657,7 @@ class AstraDepthRuntime:
                             bbox_area_change_ratio=bbox_area_change_ratio,
                             required_confirm_frames=int(self.config.near_far_jump_confirm_frames),
                             rejection_reason=guard_detail,
+                            region_count=region_count,
                         )
                     confirms = max(
                         confirms,
@@ -1133,20 +1672,65 @@ class AstraDepthRuntime:
                 else:
                     confirms = max(confirms, int(self.config.reanchor_confirm_frames))
                     reanchoring_after_timeout = True
-            elif effective_anchor_age > expire_age:
+            elif last is not None and effective_anchor_age > expire_age:
                 confirms = max(confirms, int(self.config.reanchor_confirm_frames))
                 reanchoring_after_timeout = True
+            if high_risk_far:
+                confirms = max(2, confirms, int(self.config.reanchor_confirm_frames))
 
-            pending = self._pending_jump_distance_m
-            if pending is not None and abs(raw_distance_m - float(pending)) <= max(0.15, jump_limit * 0.35):
-                self._pending_jump_count += 1
-            else:
-                self._pending_jump_distance_m = raw_distance_m
-                self._pending_jump_count = 1
-            self._pending_jump_required_confirms = int(confirms)
+            # A person cannot move from 1.8m to 3.7m in a few 30Hz samples.
+            # Do not let a stable background surface become authoritative just
+            # because it satisfies the frame-count confirmation. Once the
+            # anchor is old enough, the normal re-anchor confirmation is used.
+            elapsed_since_accept = max(
+                0.033,
+                float(sample_ts) - float(self._last_accepted_ts),
+            )
+            jump_rate = (
+                0.0 if last is None
+                else (float(raw_distance_m) - float(last)) / elapsed_since_accept
+            )
+            rate_limit = max(0.1, float(self.config.max_unconfirmed_jump_rate_m_s))
+            if (
+                jump_rate > rate_limit
+                and farther_jump
+                and effective_anchor_age <= expire_age
+                and not motion_supported
+            ):
+                self._reset_pending_jump()
+                rate_guard_confirms = max(
+                    int(confirms), int(self.config.near_far_jump_confirm_frames)
+                )
+                return self._held_measurement(
+                    now,
+                    "distance_jump_rate_guard",
+                    valid_pixels,
+                    candidate_distance_m=raw_distance_m,
+                    required_valid_pixels=required_valid_pixels,
+                    bbox_clipped=bbox_clipped,
+                    bbox_area_ratio=bbox_area_ratio,
+                    bbox_area_change_ratio=bbox_area_change_ratio,
+                    required_confirm_frames=rate_guard_confirms,
+                    confirm_count=0,
+                    rejection_reason="physically_impossible_far_jump",
+                    region_count=region_count,
+                )
+
+            confirmation_kind = (
+                "reanchor" if reanchoring_after_timeout
+                else "far_jump" if farther_jump
+                else "large_clipped_consensus"
+            )
+            self._advance_pending_jump(
+                raw_distance_m, sample_ts, required_confirms=confirms,
+                region_count=region_count if multi_region_consensus else 0,
+                kind=confirmation_kind,
+            )
             if self._pending_jump_count < confirms:
                 if reanchoring_after_timeout:
                     rejection_reason = "reanchor_after_anchor_timeout"
+                elif not farther_jump:
+                    rejection_reason = "large_clipped_multiregion_confirmation"
                 elif effective_anchor_age < strict_age:
                     rejection_reason = "strict_near_to_far_confirmation"
                 else:
@@ -1163,30 +1747,96 @@ class AstraDepthRuntime:
                     required_confirm_frames=confirms,
                     confirm_count=self._pending_jump_count,
                     rejection_reason=rejection_reason,
+                    region_count=region_count,
                 )
 
             # A confirmed new surface replaces the old median history instead
             # of being blended with the background/person surface it replaced.
-            self._distance_history.clear()
+            self._clear_distance_history()
+            accepted_confirm_count = self._pending_jump_count
+            accepted_required_confirms = confirms
+            if (
+                current_target_id is not None and current_target_id > 0
+                and math.isfinite(float(sample_ts)) and 0.0 < float(sample_ts) <= now
+                and self._pending_jump_region_count >= 3
+                and accepted_confirm_count >= confirms >= 2
+            ):
+                jump_confirmation = DepthJumpConfirmation(
+                    target_id=current_target_id,
+                    sample_timestamp=float(sample_ts),
+                    distance_m=float(raw_distance_m),
+                    kind=confirmation_kind,
+                    confirm_count=accepted_confirm_count,
+                    required_confirm_frames=confirms,
+                    region_count=self._pending_jump_region_count,
+                )
             measurement_detail = (
                 "depth_reanchored_after_timeout"
                 if reanchoring_after_timeout
+                else "depth_large_clipped_consensus_confirmed"
+                if not farther_jump
                 else "depth_multiregion_after_jump_confirm"
             )
 
         elif closer_jump:
-            # Any coherent sudden closer return is safety-relevant. Accept it
-            # immediately; only farther jumps wait for confirmation.
-            self._distance_history.clear()
+            # A sudden closer return is normally safety-relevant and is
+            # accepted immediately.  A clipped large box backed by only one
+            # torso region is the exception: CAP569-like samples commonly hit
+            # a nearby background/object and must not replace the longitudinal
+            # anchor until the same surface is seen again.
+            single_region_closer = bool(
+                large_bbox
+                and bbox_clipped
+                and region_count < 2
+            )
+            if single_region_closer:
+                confirms = max(2, int(self.config.jump_confirm_frames))
+                self._advance_pending_jump(
+                    raw_distance_m, sample_ts, required_confirms=confirms,
+                    region_count=region_count, kind="closer_jump",
+                )
+                if self._pending_jump_count < confirms:
+                    return self._held_measurement(
+                        now,
+                        f"closer_jump_pending_{self._pending_jump_count}_of_{confirms}",
+                        valid_pixels,
+                        candidate_distance_m=raw_distance_m,
+                        required_valid_pixels=required_valid_pixels,
+                        bbox_clipped=bbox_clipped,
+                        bbox_area_ratio=bbox_area_ratio,
+                        bbox_area_change_ratio=bbox_area_change_ratio,
+                        required_confirm_frames=confirms,
+                        confirm_count=self._pending_jump_count,
+                        rejection_reason="single_region_closer_jump",
+                        safety_distance_m=raw_distance_m,
+                        region_count=region_count,
+                    )
+                measurement_detail = "depth_multiregion_after_closer_jump_confirm"
+            self._clear_distance_history()
 
-        self._pending_jump_distance_m = None
-        self._pending_jump_count = 0
-        self._pending_jump_required_confirms = 0
-        self._distance_history.append(raw_distance_m)
-        filtered_distance_m = float(self._np.median(tuple(self._distance_history)))
+        self._reset_pending_jump()
+        temporal_filter = append_depth_sample(
+            self._distance_history, self._distance_history_timestamps,
+            distance_m=raw_distance_m, sample_timestamp=sample_ts, now=time.monotonic(),
+            max_age_sec=max(
+                0.01, float(self.config.max_frame_age_sec), float(self.config.anchor_strict_age_sec),
+            ),
+        )
+        self._measurement_filter_expired_count = temporal_filter.expired_count
+        if not temporal_filter.accepted:
+            self._measurement_temporal_status = "out_of_order_jump_observation"
+            return self._held_measurement(
+                time.monotonic(), "depth_filter_observation_rejected", valid_pixels,
+                candidate_distance_m=raw_distance_m, region_count=region_count,
+                rejection_reason=temporal_filter.reason,
+            )
+        filtered_distance_m = float(temporal_filter.distance_m)
         self._last_accepted_distance_m = filtered_distance_m
         self._last_accepted_ts = sample_ts
+        self._last_torso_recovery_evidence = torso_recovery_evidence
         self._last_accepted_bbox_area_ratio = bbox_area_ratio
+        self._last_accepted_bbox = tuple(bbox)
+        self._last_accepted_region_count = region_count
         self._encoder_distance_change_since_accept_m = 0.0
         if filtered_distance_m <= float(self.config.near_guard_distance_m):
             previous_area = self._near_reference_bbox_area_ratio
@@ -1215,7 +1865,8 @@ class AstraDepthRuntime:
                 p10_mm = p25_mm = p50_mm = float("nan")
             self.logger.info(
                 "Astra depth sample: target=%s mode=%s regions=%s samples=%d/%d "
-                "required=%d center_keep=%d p10/p25/p50=%.3f/%.3f/%.3fm",
+                "required=%d center_keep=%d p10/p25/p50=%.3f/%.3f/%.3fm "
+                "region_count=%d jump_confirmation=%s",
                 "none" if target_id is None else int(target_id),
                 measurement_detail,
                 selected_regions,
@@ -1226,9 +1877,11 @@ class AstraDepthRuntime:
                 float(p10_mm) / 1000.0,
                 float(p25_mm) / 1000.0,
                 float(p50_mm) / 1000.0,
+                region_count,
+                jump_confirmation or "none",
             )
             self.logger.info(
-                "Astra目标深度: target=%s distance=%.3fm raw=%.3fm mode=%s "
+                "Astra目标深度: target=%s control_distance=%.3fm raw_sample=%.3fm mode=%s "
                 "regions=%s valid_pixels=%d required=%d clipped=%s bbox_area=%.3f "
                 "bbox_area_change=%s previous_anchor_age_ms=%s center_patch=%dx%d "
                 "middle_keep=%d center_valid=%d/%d roi=(%d,%d)-(%d,%d) age=%.0fms "
@@ -1262,7 +1915,7 @@ class AstraDepthRuntime:
                 alignment_error_sec * 1000.0,
                 float(self._last_depth_period_ms),
             )
-        return AstraDepthMeasurement(
+        measurement = AstraDepthMeasurement(
             distance_m=filtered_distance_m,
             raw_distance_m=raw_distance_m,
             sample_age_sec=sample_age,
@@ -1274,7 +1927,15 @@ class AstraDepthRuntime:
             bbox_clipped=bbox_clipped,
             bbox_area_ratio=bbox_area_ratio,
             bbox_area_change_ratio=bbox_area_change_ratio,
+            confirm_count=accepted_confirm_count,
+            required_confirm_frames=accepted_required_confirms,
+            region_count=region_count,
+            jump_confirmation=jump_confirmation,
+            sample_timestamp=float(sample_ts),
         )
+        if jump_confirmation is not None:
+            self._log_depth_diagnostic(now, measurement)
+        return measurement
 
     def close(self) -> None:
         self._stop_event.set()
@@ -1282,6 +1943,8 @@ class AstraDepthRuntime:
         if thread is not None:
             thread.join(timeout=0.30)
         self._depth_thread = None
+        if self.diagnostics is not None:
+            self.diagnostics.close()
         for stream in (self._depth_stream, self._color_stream):
             if stream is None:
                 continue

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Callable, Optional, Sequence
 
 from . import iou_matching, kalman_filter, linear_assignment
 from .nn_matching import NearestNeighborDistanceMetric
 from .track import Track
+
+
+MatchValidator = Callable[[int, Optional[int]], bool]
 
 
 class Tracker:
@@ -29,8 +32,13 @@ class Tracker:
         for track in self.tracks:
             track.predict(self.kf)
 
-    def update(self, detections: Sequence) -> None:
-        matches, unmatched_tracks, unmatched_detections = self._match(detections)
+    def update(
+        self,
+        detections: Sequence,
+        *,
+        match_validator: Optional[MatchValidator] = None,
+    ) -> None:
+        matches, unmatched_tracks, unmatched_detections = self._match(detections, match_validator)
 
         for track_idx, detection_idx in matches:
             self.tracks[track_idx].update(self.kf, detections[detection_idx])
@@ -53,7 +61,28 @@ class Tracker:
             track.features = []
         self.metric.partial_fit(features, targets, active_targets)
 
-    def _match(self, detections: Sequence):
+    def _match(self, detections: Sequence, match_validator: Optional[MatchValidator] = None):
+        validation_results = {}
+
+        def guard_cost_matrix(cost_matrix, tracks, dets, track_indices, detection_indices):
+            if match_validator is None:
+                return cost_matrix
+            for row, track_idx in enumerate(track_indices):
+                for col, detection_idx in enumerate(detection_indices):
+                    pair = (track_idx, detection_idx)
+                    if pair not in validation_results:
+                        validation_results[pair] = bool(
+                            match_validator(
+                                int(tracks[track_idx].track_id),
+                                dets[detection_idx].source_detection_index,
+                            )
+                        )
+                    if not validation_results[pair]:
+                        # Reject before assignment: a bad candidate must not consume
+                        # a valid match or update this track's state and gallery.
+                        cost_matrix[row, col] = linear_assignment.INFTY_COST
+            return cost_matrix
+
         def gated_metric(tracks, dets, track_indices, detection_indices):
             features = [dets[i].feature for i in detection_indices]
             targets = [tracks[i].track_id for i in track_indices]
@@ -62,7 +91,7 @@ class Tracker:
                 for col, detection_idx in enumerate(detection_indices):
                     if int(tracks[track_idx].cls) != int(dets[detection_idx].cls):
                         cost_matrix[row, col] = linear_assignment.INFTY_COST
-            return linear_assignment.gate_cost_matrix(
+            cost_matrix = linear_assignment.gate_cost_matrix(
                 self.kf,
                 cost_matrix,
                 tracks,
@@ -70,6 +99,11 @@ class Tracker:
                 track_indices,
                 detection_indices,
             )
+            return guard_cost_matrix(cost_matrix, tracks, dets, track_indices, detection_indices)
+
+        def guarded_iou_cost(tracks, dets, track_indices, detection_indices):
+            cost_matrix = iou_matching.iou_cost(tracks, dets, track_indices, detection_indices)
+            return guard_cost_matrix(cost_matrix, tracks, dets, track_indices, detection_indices)
 
         confirmed_tracks = [i for i, track in enumerate(self.tracks) if track.is_confirmed()]
         unconfirmed_tracks = [i for i, track in enumerate(self.tracks) if not track.is_confirmed()]
@@ -94,7 +128,7 @@ class Tracker:
             if self.tracks[idx].time_since_update > self.max_bbox_age
         ]
         matches_b, unmatched_tracks_b, unmatched_detections = linear_assignment.min_cost_matching(
-            iou_matching.iou_cost,
+            guarded_iou_cost,
             self.max_iou_distance,
             self.tracks,
             detections,
@@ -118,6 +152,7 @@ class Tracker:
                 detection.feature,
                 detection.cls,
                 detection.confidence,
+                source_detection_index=detection.source_detection_index,
             )
         )
         self._next_id += 1

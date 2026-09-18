@@ -26,6 +26,17 @@ class OSNetConfig:
     # shapes. It is computed from the crop and adds no RKNN inference.
     color_fusion_enable: bool = True
     color_fusion_weight: float = 0.35
+    # A visible-torso descriptor for edge-clipped/near-camera candidates.  It
+    # is kept in a separate gallery so the normal full-body threshold remains
+    # unchanged.
+    partial_appearance_enable: bool = True
+    # Run the same OSNet model on a central torso ROI for the separate partial
+    # gallery.  Keeping this configurable makes it possible to fall back to
+    # the legacy histogram on boards where the extra pass is too expensive.
+    partial_osnet_enable: bool = True
+    partial_torso_top_ratio: float = 0.10
+    partial_torso_bottom_ratio: float = 0.86
+    partial_torso_side_ratio: float = 0.10
 
 
 class OSNetRKNNExtractor:
@@ -35,11 +46,14 @@ class OSNetRKNNExtractor:
         self.last_timing_ms = {
             "preprocess": 0.0,
             "inference": 0.0,
+            "partial_inference": 0.0,
             "postprocess": 0.0,
             "total": 0.0,
             "detections": 0.0,
             "features": 0.0,
         }
+        self.last_partial_features: List[Optional[Any]] = []
+        self.last_partial_feature_sources: List[Optional[str]] = []
         if config.enabled and config.model_path:
             self.session = RKNNInferenceSession(
                 config.model_path,
@@ -48,7 +62,14 @@ class OSNetRKNNExtractor:
                 backend=config.backend,
             )
 
-    def extract(self, frame: Any, detections: Sequence[Detection], frame_format: str = "BGR") -> List[Optional[Any]]:
+    def extract(
+        self,
+        frame: Any,
+        detections: Sequence[Detection],
+        frame_format: str = "BGR",
+        *,
+        compute_partial: bool = True,
+    ) -> List[Optional[Any]]:
         if not self.config.enabled or self.session is None or not detections:
             self._set_empty_timing(len(detections))
             return [None for _ in detections]
@@ -58,14 +79,19 @@ class OSNetRKNNExtractor:
         preprocess_ms = 0.0
         inference_ms = 0.0
         postprocess_ms = 0.0
+        partial_inference_ms = 0.0
         arr, _, _, fmt = numpy_from_frame(frame, frame_format)
         features: List[Optional[Any]] = []
+        partial_features: List[Optional[Any]] = []
+        partial_sources: List[Optional[str]] = []
         for det in detections:
             prep_start = time.perf_counter()
             crop = self._crop(arr, det.bbox)
             if crop is None:
                 preprocess_ms += _elapsed_ms(prep_start, time.perf_counter())
                 features.append(None)
+                partial_features.append(None)
+                partial_sources.append(None)
                 continue
             tensor = self._prepare_crop(crop, fmt)
             infer_start = time.perf_counter()
@@ -76,11 +102,13 @@ class OSNetRKNNExtractor:
             if not outputs:
                 postprocess_ms += _elapsed_ms(post_start, time.perf_counter())
                 features.append(None)
+                partial_features.append(None)
+                partial_sources.append(None)
                 continue
-            feat = np.asarray(outputs[0]).reshape(-1).astype("float32")
-            norm = float(np.linalg.norm(feat))
-            if norm > 1e-12:
-                feat = feat / norm
+            # Keep the raw normalized OSNet vector while the full-body feature
+            # optionally receives an appended color cue.
+            osnet_feat = _normalize_embedding(outputs[0])
+            feat = osnet_feat.copy()
             if self.config.color_fusion_enable:
                 color = _color_signature(crop)
                 if color is not None:
@@ -89,17 +117,52 @@ class OSNetRKNNExtractor:
                         color,
                         self.config.color_fusion_weight,
                     )
+            partial_feature = None
+            partial_source = None
+            if compute_partial and self.config.partial_appearance_enable:
+                if self.config.partial_osnet_enable:
+                    torso = _torso_crop(
+                        crop,
+                        top_ratio=self.config.partial_torso_top_ratio,
+                        bottom_ratio=self.config.partial_torso_bottom_ratio,
+                        side_ratio=self.config.partial_torso_side_ratio,
+                    )
+                    if torso is not None:
+                        partial_tensor = self._prepare_crop(torso, fmt)
+                        partial_infer_start = time.perf_counter()
+                        partial_outputs = self.session.inference([partial_tensor])
+                        partial_infer_end = time.perf_counter()
+                        partial_inference_ms += _elapsed_ms(
+                            partial_infer_start, partial_infer_end
+                        )
+                        if partial_outputs:
+                            partial_feature = _normalize_embedding(partial_outputs[0])
+                            partial_source = "osnet_torso"
+                    if partial_feature is None:
+                        # Do not turn a failed torso pass into a full-body
+                        # match.  That would silently contaminate the partial
+                        # gallery and recreate the exact near-camera error
+                        # this branch is meant to address.
+                        partial_source = "osnet_torso_unavailable"
+                else:
+                    partial_feature = _partial_appearance_descriptor(crop)
+                    partial_source = "histogram"
             postprocess_ms += _elapsed_ms(post_start, time.perf_counter())
             features.append(feat)
+            partial_features.append(partial_feature)
+            partial_sources.append(partial_source)
         end = time.perf_counter()
         self.last_timing_ms = {
             "preprocess": preprocess_ms,
-            "inference": inference_ms,
+            "inference": inference_ms + partial_inference_ms,
+            "partial_inference": partial_inference_ms,
             "postprocess": postprocess_ms,
             "total": _elapsed_ms(start, end),
             "detections": float(len(detections)),
             "features": float(sum(feature is not None for feature in features)),
         }
+        self.last_partial_features = partial_features
+        self.last_partial_feature_sources = partial_sources
         return features
 
     def release(self) -> None:
@@ -114,11 +177,14 @@ class OSNetRKNNExtractor:
         self.last_timing_ms = {
             "preprocess": 0.0,
             "inference": 0.0,
+            "partial_inference": 0.0,
             "postprocess": 0.0,
             "total": 0.0,
             "detections": float(detections),
             "features": 0.0,
         }
+        self.last_partial_features = [None for _ in range(max(0, int(detections)))]
+        self.last_partial_feature_sources = [None for _ in range(max(0, int(detections)))]
 
     def _crop(self, arr: Any, bbox):
         x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
@@ -214,6 +280,74 @@ def _color_signature(crop: Any):
         ).astype("float32")
     descriptor /= max(float(np.linalg.norm(descriptor)), 1e-12)
     return descriptor
+
+
+def _partial_appearance_descriptor(crop: Any):
+    """Build a fixed-size descriptor from the visible central torso.
+
+    This is deliberately a separate, inexpensive cue rather than a second
+    RKNN pass.  It remains useful when the head/feet are outside the frame,
+    while the full OSNet embedding can stay strict.  The descriptor combines
+    coarse BGR histograms with a small grayscale texture histogram and is
+    L2-normalized for cosine distance in ``IdentityEntry``.
+    """
+    np = _np()
+    arr = np.asarray(crop)
+    if arr.ndim != 3 or arr.shape[0] < 8 or arr.shape[1] < 8:
+        return None
+    height, width = arr.shape[:2]
+    y1, y2 = int(round(height * 0.15)), int(round(height * 0.85))
+    x1, x2 = int(round(width * 0.12)), int(round(width * 0.88))
+    torso = arr[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)]
+    if torso.size == 0:
+        return None
+    parts = []
+    for channel in range(min(3, torso.shape[2])):
+        values = torso[:, :, channel].reshape(-1)
+        hist, _ = np.histogram(values, bins=8, range=(0, 256))
+        parts.append(hist.astype("float32"))
+    gray = np.mean(torso[:, :, :3], axis=2).astype("float32")
+    texture, _ = np.histogram(gray.reshape(-1), bins=8, range=(0, 256))
+    parts.append(texture.astype("float32"))
+    descriptor = np.concatenate(parts).astype("float32")
+    descriptor /= max(float(np.linalg.norm(descriptor)), 1e-12)
+    return descriptor
+
+
+def _torso_crop(
+    crop: Any,
+    *,
+    top_ratio: float = 0.10,
+    bottom_ratio: float = 0.86,
+    side_ratio: float = 0.10,
+):
+    """Return a background-reduced torso ROI while preserving visible body pixels.
+
+    Ratios are intentionally conservative: on a near-camera crop the head or
+    feet may already be outside the frame, so this must not assume a complete
+    person box.  The ROI remains valid even when it touches the crop boundary.
+    """
+    np = _np()
+    arr = np.asarray(crop)
+    if arr.ndim != 3 or arr.shape[0] < 8 or arr.shape[1] < 8:
+        return None
+    height, width = arr.shape[:2]
+    top = max(0, min(height - 1, int(round(height * float(top_ratio)))))
+    bottom = max(top + 1, min(height, int(round(height * float(bottom_ratio)))))
+    side = max(0, min(width // 3, int(round(width * float(side_ratio)))))
+    left = side
+    right = max(left + 1, width - side)
+    torso = arr[top:bottom, left:right, :]
+    return torso if torso.size else None
+
+
+def _normalize_embedding(value: Any):
+    np = _np()
+    feature = np.asarray(value).reshape(-1).astype("float32")
+    norm = float(np.linalg.norm(feature))
+    if norm > 1e-12:
+        feature = feature / norm
+    return feature
 
 
 def _fuse_appearance_features(osnet_feature: Any, color_feature: Any, weight: float):

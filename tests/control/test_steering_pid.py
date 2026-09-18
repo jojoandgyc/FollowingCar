@@ -146,8 +146,8 @@ def main() -> int:
     )
     if (
         not speed_matched.target_speed_match_limited
-        or abs(speed_matched.target_speed_match_limit_dps - 24.0) > 0.01
-        or abs(speed_matched.desired_yaw_rate_dps - 24.0) > 0.01
+        or abs(speed_matched.target_speed_match_limit_dps - 28.0) > 0.01
+        or abs(speed_matched.desired_yaw_rate_dps - 28.0) > 0.01
     ):
         raise AssertionError(
             "visible tracking must cap chassis closing speed relative to the target: "
@@ -854,6 +854,32 @@ def main() -> int:
             "a fresh center crossing must use at most 3 RPM until residual yaw "
             f"falls below 5 dps: {bounded_reversal}"
         )
+
+    # A target crossing back to the already-moving side must not immediately
+    # re-arm that same rotation. The controller should coast until the
+    # measured yaw is quiet for two feedback samples.
+    settle_cfg = VisualSteeringPidConfig(
+        enabled=True,
+        camera_hfov_deg=60.0,
+        camera_latency_sec=0.0,
+        deadband_deg=3.0,
+        outer_kp_per_sec=2.0,
+        max_correction_rpm=10.0,
+        dynamic_small_max_correction_rpm=5.0,
+        opposite_yaw_brake_threshold_dps=3.0,
+        braking_max_correction_rpm=5.0,
+        visual_direction_guard_enabled=True,
+    )
+    settle = VisualSteeringPid(settle_cfg)
+    settle.update(0.70, 0, _feedback(20.0), now=20.0)
+    settle.update(0.40, 0, _feedback(20.0), now=20.1)
+    held = settle.update(0.70, 0, _feedback(20.0), now=20.2)
+    if held.correction_rpm != 0 or held.output_floor_reason != "reversal_settle":
+        raise AssertionError(f"same-side reversal must wait for yaw to settle: {held}")
+    settle.update(0.70, 0, _feedback(1.0), now=20.3)
+    released = settle.update(0.70, 0, _feedback(1.0), now=20.4)
+    if released.correction_rpm <= 0 or released.output_floor_reason == "reversal_settle":
+        raise AssertionError(f"reversal gate should release after two quiet samples: {released}")
 
     controller.reset()
     stale = controller.update(0.5, 30, _feedback(25.0, age_sec=1.0))

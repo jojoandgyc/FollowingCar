@@ -33,6 +33,11 @@ class SearchCandidateGateConfig:
     # threshold. Keep an observed candidate blocked across that short gap so
     # the same person cannot repeatedly stop an otherwise bounded sweep.
     blocked_reset_missing_frames: int = 8
+    # A detector fragment can consume the observation hold just before the
+    # real person box appears.  A large, valid area change is evidence of a
+    # new observation candidate; re-arm once, while ordinary coordinate drift
+    # remains blocked by the missing-frame rule above.
+    blocked_rearm_area_ratio: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -339,6 +344,18 @@ class SearchCandidateGate:
             )
 
         if self._blocked_bbox is not None:
+            # A fresh, strongly matched active-UID bbox is allowed to replace
+            # a previously blocked detector candidate.  This is the handoff
+            # path for a target reappearing on the opposite side of a frozen
+            # sweep; ordinary detector boxes still follow the bounded missing
+            # frame reset below.
+            if preferred_bbox is not None and self._iou(self._blocked_bbox, preferred_bbox) < float(
+                self.config.consistency_iou
+            ):
+                self._blocked_bbox = None
+                self._blocked_missing_frames = 0
+
+        if self._blocked_bbox is not None:
             # Once a candidate has completed its observation hold, changing
             # bbox coordinates does not make it a new candidate.  Re-arm only
             # after the candidate is actually absent for the configured gap;
@@ -351,32 +368,57 @@ class SearchCandidateGate:
                     blocked_candidates,
                     key=lambda item: self._iou(self._blocked_bbox, item.bbox),
                 )
-                # A person can move a large fraction of the frame between two
-                # detector results. Once the gate is already blocked, that
-                # current box is still useful for active candidate centering;
-                # withholding it would turn a visible moving target into a
-                # false missing frame and keep the old search direction alive.
-                matched_bbox = current.bbox
-                matched_score = float(current.score)
-                if self._iou(self._blocked_bbox, matched.bbox) >= float(
-                    self.config.consistency_iou
-                ):
-                    self._blocked_bbox = matched.bbox
-                    matched_bbox = matched.bbox
-                    matched_score = float(matched.score)
-                return SearchCandidateGateDecision(
-                    source="blocked",
-                    reason="candidate_already_observed",
-                    score=matched_score,
-                    bbox=matched_bbox,
+                blocked_area = max(
+                    0.0,
+                    (float(self._blocked_bbox[2]) - float(self._blocked_bbox[0]))
+                    * (float(self._blocked_bbox[3]) - float(self._blocked_bbox[1])),
                 )
-            self._blocked_missing_frames += 1
-            if self._blocked_missing_frames < max(
-                1, int(self.config.blocked_reset_missing_frames)
-            ):
-                return SearchCandidateGateDecision(reason="candidate_block_reset_wait")
-            self._blocked_bbox = None
-            self._blocked_missing_frames = 0
+                current_area = max(
+                    0.0,
+                    (float(current.bbox[2]) - float(current.bbox[0]))
+                    * (float(current.bbox[3]) - float(current.bbox[1])),
+                )
+                area_ratio = (
+                    max(current_area, blocked_area) / min(current_area, blocked_area)
+                    if min(current_area, blocked_area) > 0.0
+                    else 1.0
+                )
+                if area_ratio >= max(
+                    1.0, float(self.config.blocked_rearm_area_ratio)
+                ):
+                    # Re-arm only for a valid, large scale transition. The
+                    # normal gate will still require its configured hold and
+                    # never grants identity or motor authority by itself.
+                    self._blocked_bbox = None
+                    self._blocked_missing_frames = 0
+                else:
+                    # A person can move a large fraction of the frame between two
+                    # detector results. Once the gate is already blocked, that
+                    # current box is still useful for active candidate centering;
+                    # withholding it would turn a visible moving target into a
+                    # false missing frame and keep the old search direction alive.
+                    matched_bbox = current.bbox
+                    matched_score = float(current.score)
+                    if self._iou(self._blocked_bbox, matched.bbox) >= float(
+                        self.config.consistency_iou
+                    ):
+                        self._blocked_bbox = matched.bbox
+                        matched_bbox = matched.bbox
+                        matched_score = float(matched.score)
+                    return SearchCandidateGateDecision(
+                        source="blocked",
+                        reason="candidate_already_observed",
+                        score=matched_score,
+                        bbox=matched_bbox,
+                    )
+            if current is None:
+                self._blocked_missing_frames += 1
+                if self._blocked_missing_frames < max(
+                    1, int(self.config.blocked_reset_missing_frames)
+                ):
+                    return SearchCandidateGateDecision(reason="candidate_block_reset_wait")
+                self._blocked_bbox = None
+                self._blocked_missing_frames = 0
 
         if current is not None and current_source == "formal":
             return self._start_hold(

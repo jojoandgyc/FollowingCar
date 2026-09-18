@@ -396,6 +396,23 @@ def _assert_depth_zero_longitudinal_preserves_visible_yaw(mod) -> None:
     print("depth_zero_longitudinal_preserves_visible_yaw: PASS")
 
 
+def _assert_depth_longitudinal_stage2_speed_cap(mod) -> None:
+    actions = [
+        mod.ControlAction.forward(100, "longitudinal_distance_pid"),
+        mod.ControlAction.backward(50, "target_approaching_reverse", correction_rpm=7),
+        mod.ControlAction.steer_left(70, 100, 100, "visual_yaw", correction_rpm=4),
+    ]
+    capped = mod.PersonTracker._cap_depth_longitudinal_actions(actions)
+    if [int(action.speed_percent) for action in capped] != [20, 20, 70]:
+        raise AssertionError(
+            "Stage-2 Depth must cap only longitudinal speeds: "
+            f"{[(action.kind, action.speed_percent) for action in capped]}"
+        )
+    if capped[1].steer_correction_rpm != 7:
+        raise AssertionError("Depth reverse cap must preserve the visual correction field")
+    print("depth_longitudinal_stage2_speed_cap: PASS")
+
+
 def _assert_pair(label: str, actual, expected) -> None:
     print(label, actual)
     if actual != expected:
@@ -611,6 +628,7 @@ def main() -> int:
     _assert_motor_startup_thread_order(mod)
     _assert_depth_recovery_ramp_and_timeout_clamp(mod)
     _assert_depth_zero_longitudinal_preserves_visible_yaw(mod)
+    _assert_depth_longitudinal_stage2_speed_cap(mod)
     tracker = _make_tracker_shell(mod)
     backend = tracker._motor_backend
     _assert_hard_stop_policy(mod, tracker)
@@ -759,7 +777,7 @@ def main() -> int:
 
     if not mod.ROTATE_PULSE_BRAKE_ENABLE:
         raise AssertionError("rotate pulse scan must be enabled")
-    if not math.isclose(float(mod.ROTATE_DURATION), 0.10):
+    if not math.isclose(float(mod.ROTATE_DURATION), 0.18):
         raise AssertionError(f"unexpected rotate pulse duration: {mod.ROTATE_DURATION}")
     if not math.isclose(float(mod.ROTATE_PULSE_PAUSE_SEC), 0.00):
         raise AssertionError(f"unexpected rotate observation pause: {mod.ROTATE_PULSE_PAUSE_SEC}")
@@ -771,11 +789,11 @@ def main() -> int:
         raise AssertionError("search rotation should use short pulse mode")
     if not math.isclose(float(mod.ROTATE_PULSE_SETTLE_QUIET_SEC), 0.05):
         raise AssertionError(f"unexpected rotate settle quiet time: {mod.ROTATE_PULSE_SETTLE_QUIET_SEC}")
-    if not math.isclose(float(mod.ROTATE_PULSE_SETTLE_TIMEOUT_SEC), 0.25):
+    if not math.isclose(float(mod.ROTATE_PULSE_SETTLE_TIMEOUT_SEC), 0.18):
         raise AssertionError(f"unexpected rotate settle timeout: {mod.ROTATE_PULSE_SETTLE_TIMEOUT_SEC}")
-    if int(mod.ROTATE_PULSE_TRANSITION_RPM) != 1:
+    if int(mod.ROTATE_PULSE_TRANSITION_RPM) != 4:
         raise AssertionError(
-            f"search pulse transition must use 1 RPM: {mod.ROTATE_PULSE_TRANSITION_RPM}"
+            f"search pulse transition must use 4 RPM: {mod.ROTATE_PULSE_TRANSITION_RPM}"
         )
     for reason, expected in (
         ("person_left_rotate", (int(mod.ROTATE_RAW_TARGET_VISIBLE), "visible")),
@@ -811,11 +829,11 @@ def main() -> int:
 
     runtime.send_rotate_transition_hold(mod.ACTION_ROTATE_RIGHT)
     transition_expected = (
-        backend.wheel_raw_state_to_target("left", 1, 0x01),
-        backend.wheel_raw_state_to_target("right", 1, 0x02),
+        backend.wheel_raw_state_to_target("left", 4, 0x01),
+        backend.wheel_raw_state_to_target("right", 4, 0x02),
     )
     _assert_pair(
-        "rotate_transition_one_rpm",
+        "rotate_transition_4rpm",
         (backend.driver.left, backend.driver.right),
         transition_expected,
     )
@@ -869,7 +887,7 @@ def main() -> int:
     tracker._rotate_settle_quiet_started_monotonic = (
         time.monotonic() - float(mod.ROTATE_PULSE_SETTLE_QUIET_SEC) - 0.01
     )
-    set_feedback(2, 0, 0.0)
+    set_feedback(6, 0, 0.0)
     if not runtime.rotate_pulse_observation_pending(mod.ACTION_ROTATE_LEFT):
         raise AssertionError("post-stop wheel rebound must keep the settle gate closed")
     if tracker._rotate_settle_quiet_started_monotonic != 0.0:

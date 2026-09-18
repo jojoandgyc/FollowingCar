@@ -39,6 +39,46 @@ def main() -> int:
     if rec.track_id != 1 or rec.tracker_state != TRACK_STATE_STABLE:
         raise AssertionError(f"unexpected track record: {rec}")
 
+    # DeepSORT associates on a 1.20x expanded box.  Near an image edge that
+    # display/association box may be clipped even though the source YOLO box
+    # is a valid person crop.  Quality for identity evidence must follow the
+    # source detector box, not the expanded display box.
+    detector_bbox = (260.0, 80.0, 380.0, 400.0)
+    tracker._current_detections = (Detection(detector_bbox, 0.92, 0),)
+    tracker._frame_index = 10
+    expanded_output = SimpleNamespace(
+        track_id=7,
+        reid_uid=0,
+        x1=0.0,
+        y1=0.0,
+        x2=640.0,
+        y2=480.0,
+        class_id=0,
+        confidence=0.92,
+        feature=feature,
+        state=2,
+        time_since_update=0,
+        source_detection_index=0,
+    )
+    tracker._to_record(
+        expanded_output,
+        640,
+        480,
+        1,
+        partial_features=[None],
+    )
+    detector_assignment = tracker.identity_bank.last_assignments.get(7, {})
+    if not detector_assignment.get("bbox_quality_ok"):
+        raise AssertionError(
+            "a valid detector bbox must not be rejected by the clipped "
+            f"expanded track bbox: {detector_assignment}"
+        )
+    if detector_assignment.get("bbox_quality_tier") != "strong":
+        raise AssertionError(
+            "detector-backed identity evidence should be strong, got "
+            f"{detector_assignment}"
+        )
+
     good, reason = tracker._bbox_quality((820, 10, 1260, 1070), 1920, 1080)
     if not good:
         raise AssertionError(f"standing close person-shaped bbox should be accepted, got {reason}")
@@ -150,6 +190,7 @@ def main() -> int:
         1920,
         1080,
         1,
+        partial_features=[],
         duplicate_identity_box=True,
     )
     if fragment_record.reid_uid != 0 or len(tracker.identity_bank.identities) != identity_count_before:
@@ -166,6 +207,8 @@ def main() -> int:
     tracker.set_search_reacquire_context(active_uid=1, searching=True, direction="right")
     if not tracker._search_candidate_direction_ok(0.56 * 1920, 1920):
         raise AssertionError("a right-side search candidate should be eligible")
+    if not tracker._search_candidate_direction_ok(0.49 * 1920, 1920):
+        raise AssertionError("a center-crossing candidate should be eligible for ReID confirmation")
     if tracker._search_candidate_direction_ok(0.44 * 1920, 1920):
         raise AssertionError("a left-side candidate must not be eligible during right search")
     tracker._search_reacquire_eligible_tracks.add(9)

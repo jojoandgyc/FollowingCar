@@ -8,8 +8,10 @@ SCRIPT_NAME="$(basename "$0")"
 SCRIPT_BASE="${SCRIPT_NAME%.*}"
 REQUEST_SCRIPT="$ROOT/request_0513_modular.py"
 PREFLIGHT_SCRIPT="$ROOT/car_control_modular/peripheral_preflight.py"
-LOG_DIR="$ROOT/${SCRIPT_BASE}_logs"
-LOG_FILE="$LOG_DIR/request_0513_modular.log"
+LOG_ROOT="$ROOT/${SCRIPT_BASE}_logs"
+LOG_DIR=""
+LOG_FILE=""
+RUN_LOG_PREPARE_SCRIPT="$ROOT/tools/prepare_run_logs.py"
 DEFAULT_CONFIG="car_control_modular/config/reid_runtime.ini"
 CONFIG="$DEFAULT_CONFIG"
 
@@ -21,13 +23,17 @@ Usage:
 
 Environment:
   PY=/path/to/python3
+  FOLLOW_DISTANCE_P_TRIAL=36  # optional A/B: only longitudinal P; 24, 27 or 36
+  FOLLOW_MATCHING_BIAS_TRIAL=5  # optional matching RPM bias experiment: 0, 5, 10
+  FOLLOW_MATCHING_MODE=distance_only  # A/B: optional (normal) or distance_only; braking unchanged
   MMWAVE_AT2410_PORT=/dev/serial/by-id/usb-SIPEED_UARTx4_HS_FactoryAIOT_Prog_Serial-if00
-  PERIPHERAL_PREFLIGHT=1  # verify enabled peripherals before control starts
+  PERIPHERAL_PREFLIGHT=0  # optional; disabled for the depth+IR runtime
   # AT2410 USB reset/verification runs inside the long-lived Python runtime.
   REQUEST_LOOPBACK_UP=1  # optional: run "ip link set lo up" before startup
 
 Logs:
-  ./${SCRIPT_BASE}_logs/ is cleared at startup and reused for each run.
+  ./${SCRIPT_BASE}_logs/run_<timestamp>_<unique>/ stores each run separately.
+  Only the latest three managed run directories are retained.
 EOF
 }
 
@@ -92,25 +98,37 @@ if [ -d "$BOARD_USER_SITE" ]; then
   export PYTHONPATH
 fi
 
-if [ -z "$SCRIPT_BASE" ] || [ "$LOG_DIR" = "$ROOT" ] || [ "$LOG_DIR" = "/" ]; then
-  echo "unsafe log dir: $LOG_DIR" >&2
+if [ -z "$SCRIPT_BASE" ] || [ "$LOG_ROOT" = "$ROOT" ] || [ "$LOG_ROOT" = "/" ]; then
+  echo "unsafe log root: $LOG_ROOT" >&2
   exit 2
 fi
 
-rm -rf "$LOG_DIR"
-mkdir -p "$LOG_DIR"
+# Check before rotating records, including when peripheral preflight is off.
+if pgrep -f "$REQUEST_SCRIPT" >/dev/null 2>&1; then
+  echo "已有跟随车进程正在运行，拒绝轮换记录或重复启动" >&2
+  exit 5
+fi
+
+if [ ! -f "$RUN_LOG_PREPARE_SCRIPT" ]; then
+  echo "run log preparation helper not found: $RUN_LOG_PREPARE_SCRIPT" >&2
+  exit 3
+fi
+LOG_DIR="$($PY -u "$RUN_LOG_PREPARE_SCRIPT" "$LOG_ROOT" --keep 3)" || {
+  echo "failed to prepare isolated run log directory" >&2
+  exit 3
+}
+if [ -z "$LOG_DIR" ] || [ "$LOG_DIR" = "$LOG_ROOT" ] || [ "$LOG_DIR" = "/" ]; then
+  echo "unsafe prepared run log dir: $LOG_DIR" >&2
+  exit 3
+fi
+LOG_FILE="$LOG_DIR/request_0513_modular.log"
 export FOLLOW_LOG_DIR="$LOG_DIR"
 
-if [ "${PERIPHERAL_PREFLIGHT:-1}" != "0" ]; then
+if [ "${PERIPHERAL_PREFLIGHT:-0}" != "0" ]; then
   if [ ! -f "$PREFLIGHT_SCRIPT" ]; then
     echo "外设自检程序不存在: $PREFLIGHT_SCRIPT" >&2
     exit 5
   fi
-  if pgrep -f "$REQUEST_SCRIPT" >/dev/null 2>&1; then
-    echo "已有跟随车进程正在运行，拒绝复位USB或重复启动" >&2
-    exit 5
-  fi
-
   PREFLIGHT_LOG="$LOG_DIR/peripheral_preflight.log"
   PREFLIGHT_RC_FILE="$LOG_DIR/.peripheral_preflight.rc"
   echo "外设启动基础自检" | tee -a "$PREFLIGHT_LOG"

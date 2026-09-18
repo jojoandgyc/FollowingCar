@@ -4,11 +4,14 @@ import logging
 import math
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
 
-from .control_types import DistanceState, PersonTarget, SteeringFeedback
+from .control_types import (
+    DepthJumpConfirmation, DepthTargetObservation, DistanceState, PersonTarget,
+    SteeringFeedback,
+)
 from .distance_fusion import DistanceFusionConfig, VisionRadarEncoderDistanceFusion
 
 
@@ -70,6 +73,8 @@ class DistanceRuntimeConfig:
     )
     vision_depth_max_distance_jump_m: float = 0.0
     vision_depth_jump_confirm_frames: int = 3
+    vision_depth_require_detector_bbox: bool = False
+    vision_depth_detector_bbox_max_age_sec: float = 0.18
 
 
 class DistanceRuntime:
@@ -147,6 +152,7 @@ class DistanceRuntime:
                 max_distance_m=8.0,
                 fresh_far_jump_m=float(config.vision_depth_max_distance_jump_m),
                 fresh_far_jump_confirm_frames=int(config.vision_depth_jump_confirm_frames),
+                allow_depth_jump_confirmation=True,
             )
         )
         sample_window = max(1, int(config.ultrasonic_filter_window))
@@ -995,6 +1001,7 @@ class DistanceRuntime:
         target_distance_m: Optional[float] = None,
         brake_distance_m: Optional[float] = None,
         depth_use_latest: bool = False,
+        capture_timestamp: Optional[float] = None,
     ) -> DistanceState:
         if self.config.distance_source in self.config.vision_depth_source_aliases:
             return self.get_vision_depth_state(
@@ -1005,6 +1012,7 @@ class DistanceRuntime:
                 target_distance_m=target_distance_m,
                 brake_distance_m=brake_distance_m,
                 use_latest_depth=bool(depth_use_latest),
+                capture_timestamp=capture_timestamp,
             )
         if self.config.distance_source in self.config.vision_mmwave_source_aliases:
             radar_distance_m = self.get_vision_mmwave_distance(width, target)
@@ -1065,20 +1073,77 @@ class DistanceRuntime:
             and not detail.endswith("_hold")
             and detail.startswith("depth_")
         )
+        measurement_sample_ts = getattr(measurement, "sample_timestamp", None)
+        current_sample_age = measurement.sample_age_sec
+        try:
+            sample_ts = float(measurement_sample_ts)
+            valid_sample_timestamp = math.isfinite(sample_ts) and sample_ts > 0.0
+        except (TypeError, ValueError, OverflowError):
+            sample_ts = 0.0
+            valid_sample_timestamp = False
+        if fresh_depth and valid_sample_timestamp:
+            # Sampling/clustering can take tens of milliseconds. Publish the
+            # actual current age, not the sensor's pre-computation age.
+            current_sample_age = now - sample_ts
+            if not 0.0 <= current_sample_age <= self._vision_depth_fusion.config.depth_confirmation_max_age_sec:
+                fresh_depth = False
+                measurement_distance = None
+                detail = "stale_depth_frame"
+        jump_confirmation = getattr(measurement, "jump_confirmation", None)
+        proof_rejection = None
+        if isinstance(jump_confirmation, DepthJumpConfirmation):
+            try:
+                proof_distance = float(jump_confirmation.distance_m)
+                raw_distance = float(measurement.raw_distance_m)
+                proof_sample_ts = float(jump_confirmation.sample_timestamp)
+                if not valid_sample_timestamp:
+                    proof_rejection = "sample_timestamp_missing"
+                elif not math.isfinite(proof_sample_ts) or abs(proof_sample_ts - sample_ts) > 1e-6:
+                    proof_rejection = "measurement_timestamp_mismatch"
+                elif (
+                    not math.isfinite(raw_distance)
+                    or not math.isfinite(proof_distance)
+                    or abs(raw_distance - proof_distance) > 1e-6
+                ):
+                    proof_rejection = "raw_distance_mismatch"
+            except (TypeError, ValueError, OverflowError):
+                proof_rejection = "raw_distance_missing"
+        if proof_rejection is not None:
+            jump_confirmation = None
+        temporal_status = str(getattr(measurement, "temporal_status", ""))
+        discard_observation = temporal_status in (
+            "duplicate", "older_than_anchor", "older_than_pending",
+            "out_of_order_jump_observation", "stale_or_future",
+            "expired_during_sampling",
+        )
         fusion = self._vision_depth_fusion.update(
             target=target,
             frame_height=int(frame_height),
             radar_distance_m=measurement_distance,
             radar_fresh=fresh_depth,
-            sample_age_sec=measurement.sample_age_sec,
+            sample_age_sec=current_sample_age,
             steering_feedback=steering_feedback,
             now=now,
+            jump_confirmation=jump_confirmation,
+            sample_timestamp=sample_ts if valid_sample_timestamp else None,
+            discard_observation=discard_observation,
         )
+        if fusion.sample_timestamp_rejected:
+            fresh_depth = False
+            detail = f"depth_sample_{fusion.sample_timestamp_reason}"
         distance_m = fusion.distance_m
         source_detail = detail
-        sample_age_sec = measurement.sample_age_sec
+        sample_age_sec = current_sample_age
         raw_distance_m = measurement.raw_distance_m if fresh_depth else None
-        if not fresh_depth and distance_m is not None:
+        safety_distance_m = getattr(measurement, "safety_distance_m", None)
+        safety_brake = bool(
+            safety_distance_m is not None
+            and brake_distance_m is not None
+            and float(safety_distance_m) < float(brake_distance_m)
+        )
+        if fusion.depth_confirmation_used:
+            source_detail = "depth_confirmed_jump"
+        elif not fresh_depth and distance_m is not None:
             source_detail = f"{detail}_fused_{fusion.mode}_hold"
             sample_age_sec = fusion.anchor_age_sec
         elif fresh_depth and fusion.mode == "radar_jump_pending":
@@ -1087,14 +1152,39 @@ class DistanceRuntime:
                 f"{self._vision_depth_fusion._pending_far_count}_of_"
                 f"{max(2, int(self.config.vision_depth_jump_confirm_frames))}"
             )
+        if getattr(measurement, "jump_confirmation", None) is not None:
+            self.logger.info(
+                "Depth confirmation: target=%s proof=%s decision=%s used=%s "
+                "measurement_detail=%s raw=%s measured=%s fused=%s",
+                target.track_id, getattr(measurement, "jump_confirmation", None),
+                proof_rejection or fusion.depth_confirmation_reason,
+                fusion.depth_confirmation_used, str(measurement.detail),
+                measurement.raw_distance_m, measurement_distance, distance_m,
+            )
+        self.logger.info(
+            "Depth timeline: target=%s sample_ts=%s sample_age_ms=%s "
+            "anchor_age_ms=%s observation_ts=%s temporal_status=%s "
+            "sample_decision=%s fusion=%s raw=%s used=%s",
+            target.track_id, measurement_sample_ts,
+            None if current_sample_age is None else round(float(current_sample_age) * 1000.0, 1),
+            None if fusion.anchor_age_sec is None else round(float(fusion.anchor_age_sec) * 1000.0, 1),
+            getattr(measurement, "observation_sample_timestamp", None), temporal_status,
+            fusion.sample_timestamp_reason, fusion.mode, raw_distance_m, distance_m,
+        )
+        trigger = self._distance_trigger(distance_m, target_distance_m, brake_distance_m)
+        if safety_brake:
+            trigger = "brake_candidate"
         state = DistanceState(
             source="vision_depth",
             raw_distance_m=raw_distance_m,
             filtered_distance_m=distance_m,
             used_distance_m=distance_m,
-            trigger=self._distance_trigger(distance_m, target_distance_m, brake_distance_m),
+            trigger=trigger,
             source_detail=source_detail,
             sample_age_sec=sample_age_sec,
+            sample_timestamp=sample_ts if valid_sample_timestamp else None,
+            observation_timestamp=getattr(measurement, "observation_sample_timestamp", None),
+            temporal_status=temporal_status,
             target_threshold_m=target_distance_m,
             brake_threshold_m=brake_distance_m,
             sample_count=int(measurement.valid_pixels) if fresh_depth else 0,
@@ -1103,6 +1193,136 @@ class DistanceRuntime:
             fusion_radar_distance_m=fusion.radar_distance_m,
             fusion_visual_distance_m=fusion.visual_distance_m,
             fusion_encoder_delta_m=fusion.encoder_delta_m,
+            brake_latched=safety_brake,
+            safety_distance_m=(
+                None if safety_distance_m is None else float(safety_distance_m)
+            ),
+        )
+        self.last_distance_state = state
+        return state
+
+    def _depth_target_for_ranging(
+        self,
+        target: PersonTarget,
+        width: int,
+        height: int,
+        *,
+        now: float,
+        use_latest_depth: bool,
+        capture_timestamp: Optional[float],
+        steering_feedback: Optional[SteeringFeedback] = None,
+    ) -> Tuple[Optional[PersonTarget], str]:
+        """Validate a bound detector snapshot without altering steering geometry."""
+        observation = getattr(target, "depth_observation", None)
+        if observation is None:
+            if self.config.vision_depth_require_detector_bbox:
+                return None, "depth_detector_bbox_missing"
+            return target, "legacy_track_bbox"
+        if not isinstance(observation, DepthTargetObservation):
+            return None, "depth_detector_bbox_invalid_observation"
+        if observation.source != "yolo_detector":
+            return None, "depth_detector_bbox_invalid_source"
+        try:
+            identities = (
+                target.track_id, observation.target_id,
+                observation.capture_frame_id,
+            )
+            if any(
+                isinstance(value, bool) or not math.isfinite(float(value))
+                or int(value) != float(value) or int(value) <= 0
+                for value in identities
+            ):
+                return None, "depth_detector_bbox_invalid_identity"
+            raw_track_id = observation.raw_track_id
+            if (
+                isinstance(raw_track_id, bool)
+                or not math.isfinite(float(raw_track_id))
+                or int(raw_track_id) != float(raw_track_id)
+                or not (int(raw_track_id) == -1 or int(raw_track_id) > 0)
+            ):
+                return None, "depth_detector_bbox_invalid_identity"
+            if int(observation.target_id) != int(target.track_id):
+                return None, "depth_detector_bbox_target_mismatch"
+            bbox = tuple(float(value) for value in observation.bbox)
+            if len(bbox) != 4 or not all(math.isfinite(value) for value in bbox):
+                return None, "depth_detector_bbox_invalid_geometry"
+            x1, y1, x2, y2 = bbox
+            if not (0.0 <= x1 < x2 <= float(width) and 0.0 <= y1 < y2 <= float(height)):
+                return None, "depth_detector_bbox_outside_frame"
+            capture_ts = float(observation.capture_timestamp)
+            if not math.isfinite(capture_ts) or capture_ts <= 0.0:
+                return None, "depth_detector_bbox_invalid_timestamp"
+            if capture_timestamp is not None:
+                provided_ts = float(capture_timestamp)
+                if (
+                    not math.isfinite(provided_ts) or provided_ts <= 0.0
+                    or abs(provided_ts - capture_ts) > 1e-6
+                ):
+                    return None, "depth_detector_bbox_capture_mismatch"
+            age = float(now) - capture_ts
+            # Latest-depth refresh needs a tighter RGB age bound than the
+            # visual path, which samples the RGB-aligned historical depth.
+            max_age = (
+                float(self.config.vision_depth_detector_bbox_max_age_sec)
+                if use_latest_depth else 0.25
+            )
+            if not math.isfinite(max_age) or max_age <= 0.0:
+                return None, "depth_detector_bbox_invalid_age_limit"
+            if not math.isfinite(age) or age < 0.0 or age > max_age:
+                return None, "depth_detector_bbox_stale"
+            if use_latest_depth:
+                from .depth_roi_policy import roi_age_status
+                status = roi_age_status(capture_ts, now, max_age, steering_feedback)
+                if age > .18:
+                    self.logger.info(
+                        "depth_roi_extension capture_frame_id=%s uid=%s age_ms=%.1f "
+                        "status=%s physical_depth_ttl_ms=180",
+                        observation.capture_frame_id, observation.target_id, age*1000, status,
+                    )
+                if status not in {"normal", "extended"}:
+                    return None, "depth_detector_bbox_stale"
+        except (TypeError, ValueError, OverflowError):
+            return None, "depth_detector_bbox_invalid_observation"
+        return replace(target, bbox=bbox, area=(x2 - x1) * (y2 - y1)), "yolo_detector"
+
+    def _clear_vision_depth_state(
+        self,
+        detail: str,
+        *,
+        target_distance_m: Optional[float],
+        brake_distance_m: Optional[float],
+        retain_target_id: Optional[int] = None,
+    ) -> DistanceState:
+        self._last_vision_depth_target = None
+        self._last_vision_depth_frame_size = (0, 0)
+        fusion = self._vision_depth_fusion
+        anchor_ts = fusion._last_anchor_ts
+        now = time.monotonic()
+        retain = bool(
+            detail == "depth_detector_bbox_stale" and retain_target_id is not None
+            and fusion._active_track_id == retain_target_id
+            and fusion._last_accepted_depth_sample_ts is not None
+            and anchor_ts is not None and math.isfinite(anchor_ts)
+            and 0 <= now-anchor_ts <= fusion.config.hold_max_sec
+            and fusion._last_distance_m is not None
+        )
+        if retain:
+            key = (retain_target_id, anchor_ts)
+            if getattr(self, "_depth_cache_retain_log_key", None) != key:
+                self._depth_cache_retain_log_key = key
+                self.logger.info(
+                    "depth_cache_retained uid=%s reason=%s anchor_ts=%.6f age_ms=%.1f "
+                    "distance_m=%.4f roi_usable=False measurement_updated=False deadline_renewed=False",
+                    retain_target_id, detail, anchor_ts, (now-anchor_ts)*1000,
+                    fusion._last_distance_m,
+                )
+        else:
+            fusion.reset()
+        state = DistanceState(
+            source="vision_depth",
+            source_detail=detail,
+            target_threshold_m=target_distance_m,
+            brake_threshold_m=brake_distance_m,
         )
         self.last_distance_state = state
         return state
@@ -1117,37 +1337,68 @@ class DistanceRuntime:
         target_distance_m: Optional[float] = None,
         brake_distance_m: Optional[float] = None,
         use_latest_depth: bool = False,
+        capture_timestamp: Optional[float] = None,
     ) -> DistanceState:
         if not self.config.module_astra_depth_enable or target is None or width <= 0 or height <= 0:
-            if target is None:
-                self._last_vision_depth_target = None
-                self._last_vision_depth_frame_size = (0, 0)
-                self._vision_depth_fusion.reset()
-            state = DistanceState(
-                source="vision_depth",
-                source_detail="disabled" if not self.config.module_astra_depth_enable else "no_visual_target",
-                target_threshold_m=target_distance_m,
-                brake_threshold_m=brake_distance_m,
+            return self._clear_vision_depth_state(
+                "disabled" if not self.config.module_astra_depth_enable else "no_visual_target",
+                target_distance_m=target_distance_m,
+                brake_distance_m=brake_distance_m,
             )
-            self.last_distance_state = state
-            return state
+
+        ranging_target, geometry_reason = self._depth_target_for_ranging(
+            target, width, height, now=time.monotonic(),
+            use_latest_depth=use_latest_depth, capture_timestamp=capture_timestamp,
+            steering_feedback=steering_feedback,
+        )
+        observation = getattr(target, "depth_observation", None)
+        self.logger.info(
+            "Depth geometry: target=%s raw_track=%s capture=%s capture_ts=%s "
+            "display_bbox=%s detector_bbox=%s source=%s latest=%s decision=%s",
+            target.track_id, getattr(observation, "raw_track_id", None),
+            getattr(observation, "capture_frame_id", None),
+            getattr(observation, "capture_timestamp", None), target.bbox,
+            getattr(observation, "bbox", None), getattr(observation, "source", None),
+            use_latest_depth, geometry_reason,
+        )
+        if ranging_target is None:
+            return self._clear_vision_depth_state(
+                geometry_reason,
+                target_distance_m=target_distance_m,
+                brake_distance_m=brake_distance_m,
+                retain_target_id=(target.track_id if geometry_reason == "depth_detector_bbox_stale"
+                                  and observation is not None
+                                  and 0 < float(observation.capture_timestamp) <= time.monotonic()
+                                  else None),
+            )
 
         self._last_vision_depth_target = target
         self._last_vision_depth_frame_size = (int(width), int(height))
         measurement_kwargs = {"target_id": int(target.track_id)}
+        if observation is not None:
+            measurement_kwargs["evidence_capture_frame_id"] = int(observation.capture_frame_id)
         if use_latest_depth:
             measurement_kwargs["use_latest_depth"] = True
         if steering_feedback is not None:
             measurement_kwargs["steering_feedback"] = steering_feedback
+        if observation is not None and not use_latest_depth:
+            measurement_kwargs["reference_timestamp"] = float(observation.capture_timestamp)
+        elif capture_timestamp is not None and not use_latest_depth:
+            try:
+                capture_ts = float(capture_timestamp)
+            except (TypeError, ValueError):
+                capture_ts = 0.0
+            if math.isfinite(capture_ts) and capture_ts > 0.0:
+                measurement_kwargs["reference_timestamp"] = capture_ts
         measurement = self.sensor_runtime.get_astra_target_distance(
-            target.bbox,
+            ranging_target.bbox,
             int(width),
             int(height),
             **measurement_kwargs,
         )
         return self._build_vision_depth_state(
             measurement,
-            target=target,
+            target=ranging_target,
             frame_height=int(height),
             steering_feedback=steering_feedback,
             target_distance_m=target_distance_m,

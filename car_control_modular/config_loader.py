@@ -12,6 +12,7 @@ from __future__ import annotations
 import configparser
 import os
 import sys
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
 
@@ -78,6 +79,41 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     read_files = parser.read(path, encoding="utf-8")
     if not read_files:
         raise RuntimeError(f"配置文件不存在或无法读取: {path}")
+
+    # This explicit process override is also the rollback switch. Older INIs
+    # keep their approach/legacy behaviour when no control_mode is present.
+    control_mode = os.environ.get("FOLLOW_DISTANCE_CONTROL_MODE", "").strip()
+    if not control_mode:
+        control_mode = parser.get("distance_pid", "control_mode", fallback="").strip()
+    if not control_mode:
+        approach = parser.get("distance_pid", "approach_enable", fallback="false")
+        control_mode = "approach" if _as_bool_env(approach) == "1" else "legacy"
+    if control_mode not in {"distance_pi", "approach", "legacy"}:
+        raise ValueError("FOLLOW_DISTANCE_CONTROL_MODE / [distance_pid] control_mode must be distance_pi, approach or legacy")
+
+    # Narrow, opt-in A/B experiment. Normal DISTANCE_PID_* environment values
+    # are overwritten by INI below; this explicit switch changes ONLY P.
+    p_trial = os.environ.get("FOLLOW_DISTANCE_P_TRIAL", "").strip()
+    if p_trial:
+        if p_trial not in {"24", "27", "36"} or not parser.has_section("distance_pid"):
+            raise ValueError("FOLLOW_DISTANCE_P_TRIAL must be 24, 27 or 36 with [distance_pid]")
+        parser.set("distance_pid", "kp_rpm_per_m", p_trial)
+        if control_mode == "distance_pi":
+            warnings.warn(
+                "FOLLOW_DISTANCE_P_TRIAL does not tune distance_pi forward control; "
+                "it only changes the legacy/reverse PID. Use "
+                "FOLLOW_DISTANCE_CONTROL_MODE=legacy for the legacy P experiment.",
+                RuntimeWarning, stacklevel=2,
+            )
+    bias_trial = os.environ.get("FOLLOW_MATCHING_BIAS_TRIAL", "0").strip() or "0"
+    if bias_trial not in {"0", "5", "10"}:
+        raise ValueError("FOLLOW_MATCHING_BIAS_TRIAL must be 0, 5 or 10 (RPM)")
+    os.environ["DISTANCE_MATCHING_TEST_BIAS_RPM"] = bias_trial
+    matching_mode = os.environ.get("FOLLOW_MATCHING_MODE", "").strip()
+    if matching_mode:
+        if matching_mode not in {"optional", "distance_only"} or not parser.has_section("distance_pid"):
+            raise ValueError("FOLLOW_MATCHING_MODE must be optional or distance_only with [distance_pid]")
+        parser.set("distance_pid", "approach_matching_enable", "true" if matching_mode == "optional" else "false")
 
     # Module switches.  Keep both generic MODULE_* names and existing BUNKER_*.
     _set_bool_env_if_present(parser, "modules", "vision", "MODULE_VISION_ENABLE")
@@ -237,6 +273,12 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(
         parser,
         "astra_depth",
+        "max_unconfirmed_jump_rate_m_s",
+        "ASTRA_DEPTH_MAX_UNCONFIRMED_JUMP_RATE_M_S",
+    )
+    _set_env_if_present(
+        parser,
+        "astra_depth",
         "near_guard_distance_m",
         "ASTRA_DEPTH_NEAR_GUARD_DISTANCE_M",
     )
@@ -309,6 +351,27 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     )
     _set_env_if_present(
         parser,
+        "astra_depth",
+        "longitudinal_max_forward_percent",
+        "ASTRA_DEPTH_LONGITUDINAL_MAX_FORWARD_PERCENT",
+    )
+    # Forward grant TTL only; fresh PI integration/ROI/reverse clocks stay separate.
+    _set_env_if_present(parser, "astra_depth", "longitudinal_sample_max_age_sec",
+                        "ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC")
+    _set_env_if_present(
+        parser,
+        "astra_depth",
+        "longitudinal_far_distance_m",
+        "ASTRA_DEPTH_LONGITUDINAL_FAR_DISTANCE_M",
+    )
+    _set_env_if_present(
+        parser,
+        "astra_depth",
+        "longitudinal_far_forward_percent",
+        "ASTRA_DEPTH_LONGITUDINAL_FAR_FORWARD_PERCENT",
+    )
+    _set_env_if_present(
+        parser,
         "vision",
         "control_max_result_age_sec",
         "VISION_CONTROL_MAX_RESULT_AGE_SEC",
@@ -372,6 +435,30 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "search_diagnostic_conf_threshold",
         "RKNN_SEARCH_DIAGNOSTIC_CONF_THRESHOLD",
     )
+    _set_bool_env_if_present(
+        parser,
+        "vision",
+        "search_probe_cluster_enable",
+        "RKNN_SEARCH_PROBE_CLUSTER_ENABLE",
+    )
+    _set_env_if_present(
+        parser,
+        "vision",
+        "search_probe_cluster_iou_threshold",
+        "RKNN_SEARCH_PROBE_CLUSTER_IOU_THRESHOLD",
+    )
+    _set_env_if_present(
+        parser,
+        "vision",
+        "search_probe_cluster_center_distance_ratio",
+        "RKNN_SEARCH_PROBE_CLUSTER_CENTER_DISTANCE_RATIO",
+    )
+    _set_env_if_present(
+        parser,
+        "vision",
+        "search_probe_cluster_min_score_gap",
+        "RKNN_SEARCH_PROBE_CLUSTER_MIN_SCORE_GAP",
+    )
     _set_env_if_present(parser, "vision", "target_select", "VISION_TARGET_SELECT")
     _set_bool_env_if_present(parser, "vision", "control_use_predicted_tracks", "VISION_CONTROL_USE_PREDICTED_TRACKS")
     _set_bool_env_if_present(
@@ -432,6 +519,12 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "vision", "reid_normalize", "RKNN_REID_NORMALIZE")
     _set_bool_env_if_present(parser, "vision", "reid_color_fusion_enable", "RKNN_REID_COLOR_FUSION_ENABLE")
     _set_env_if_present(parser, "vision", "reid_color_fusion_weight", "RKNN_REID_COLOR_FUSION_WEIGHT")
+    _set_bool_env_if_present(parser, "vision", "reid_partial_appearance_enable", "RKNN_REID_PARTIAL_APPEARANCE_ENABLE")
+    _set_bool_env_if_present(parser, "vision", "reid_partial_osnet_enable", "RKNN_REID_PARTIAL_OSNET_ENABLE")
+    _set_bool_env_if_present(parser, "vision", "reid_diagnostics_enable", "RKNN_REID_DIAGNOSTICS_ENABLE")
+    _set_env_if_present(parser, "vision", "reid_diagnostics_max_samples", "RKNN_REID_DIAGNOSTICS_MAX_SAMPLES")
+    _set_env_if_present(parser, "vision", "reid_diagnostics_queue_capacity", "RKNN_REID_DIAGNOSTICS_QUEUE_CAPACITY")
+    _set_env_if_present(parser, "vision", "reid_diagnostics_mapped_interval", "RKNN_REID_DIAGNOSTICS_MAPPED_INTERVAL")
 
     # RKNN camera source. request_0513_modular.py can use a GStreamer MJPEG
     # capture path here while request_0512_modular.py keeps the OpenCV path.
@@ -551,6 +644,30 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "area_shrink_max_gap_frames",
         "Y8_IDENTITY_AREA_SHRINK_MAX_GAP_FRAMES",
     )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "max_center_jump_ratio",
+        "Y8_IDENTITY_MAX_CENTER_JUMP_RATIO",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "center_jump_max_gap_frames",
+        "Y8_IDENTITY_CENTER_JUMP_MAX_GAP_FRAMES",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "swap_min_mapped_jump_ratio",
+        "Y8_IDENTITY_SWAP_MIN_MAPPED_JUMP_RATIO",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "swap_max_replacement_distance_ratio",
+        "Y8_IDENTITY_SWAP_MAX_REPLACEMENT_DISTANCE_RATIO",
+    )
     _set_env_if_present(parser, "identity_bank", "max_area_ratio", "Y8_IDENTITY_MAX_AREA_RATIO")
     _set_env_if_present(parser, "identity_bank", "max_width_ratio", "Y8_IDENTITY_MAX_WIDTH_RATIO")
     _set_env_if_present(parser, "identity_bank", "max_height_ratio", "Y8_IDENTITY_MAX_HEIGHT_RATIO")
@@ -602,11 +719,20 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     )
     _set_env_if_present(parser, "identity_bank", "exclusive_uid_claim_frames", "Y8_IDENTITY_EXCLUSIVE_UID_CLAIM_FRAMES")
     _set_bool_env_if_present(parser, "identity_bank", "controlled_handoff_enable", "Y8_IDENTITY_CONTROLLED_HANDOFF_ENABLE")
+    _set_env_if_present(parser, "identity_bank", "handoff_geometry_max_gap_frames", "Y8_IDENTITY_HANDOFF_GEOMETRY_MAX_GAP_FRAMES")
+    _set_env_if_present(parser, "identity_bank", "handoff_geometry_max_center_jump_ratio", "Y8_IDENTITY_HANDOFF_GEOMETRY_MAX_CENTER_JUMP_RATIO")
+    _set_env_if_present(parser, "identity_bank", "handoff_geometry_min_area_similarity", "Y8_IDENTITY_HANDOFF_GEOMETRY_MIN_AREA_SIMILARITY")
     _set_env_if_present(
         parser,
         "identity_bank",
         "controlled_handoff_confirm_frames",
         "Y8_IDENTITY_CONTROLLED_HANDOFF_CONFIRM_FRAMES",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "controlled_handoff_instant_threshold",
+        "Y8_IDENTITY_CONTROLLED_HANDOFF_INSTANT_THRESHOLD",
     )
     _set_env_if_present(
         parser,
@@ -641,6 +767,30 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(
         parser,
         "identity_bank",
+        "preferred_search_reacquire_min_confidence",
+        "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MIN_CONFIDENCE",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "preferred_search_reacquire_observation_min_confidence",
+        "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_OBSERVATION_MIN_CONFIDENCE",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "preferred_search_reacquire_max_age_sec",
+        "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MAX_AGE_SEC",
+    )
+    _set_bool_env_if_present(
+        parser,
+        "identity_bank",
+        "preferred_search_reacquire_late_candidate_enable",
+        "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_LATE_CANDIDATE_ENABLE",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
         "preferred_search_reacquire_confirm_frames",
         "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_CONFIRM_FRAMES",
     )
@@ -653,9 +803,54 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(
         parser,
         "identity_bank",
+        "preferred_search_reacquire_min_score_gap",
+        "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MIN_SCORE_GAP",
+    )
+    _set_bool_env_if_present(
+        parser,
+        "identity_bank",
+        "preferred_search_soft_candidate_enable",
+        "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_CANDIDATE_ENABLE",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "preferred_search_soft_candidate_threshold",
+        "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_CANDIDATE_THRESHOLD",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "preferred_search_soft_min_score_gap",
+        "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_MIN_SCORE_GAP",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "preferred_search_soft_min_area_ratio",
+        "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_MIN_AREA_RATIO",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
+        "preferred_search_soft_min_confidence",
+        "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_MIN_CONFIDENCE",
+    )
+    _set_env_if_present(
+        parser,
+        "identity_bank",
         "preferred_search_reacquire_side_ratio",
         "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_SIDE_RATIO",
     )
+    _set_bool_env_if_present(
+        parser,
+        "identity_bank",
+        "partial_appearance_enable",
+        "Y8_IDENTITY_PARTIAL_APPEARANCE_ENABLE",
+    )
+    _set_env_if_present(parser, "identity_bank", "partial_match_threshold", "Y8_IDENTITY_PARTIAL_MATCH_THRESHOLD")
+    _set_env_if_present(parser, "identity_bank", "partial_max_features", "Y8_IDENTITY_PARTIAL_MAX_FEATURES")
+    _set_env_if_present(parser, "identity_bank", "partial_update_threshold", "Y8_IDENTITY_PARTIAL_UPDATE_THRESHOLD")
     _set_bool_env_if_present(
         parser,
         "identity_bank",
@@ -742,6 +937,12 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
 
     # Distance/safety.
     _set_env_if_present(parser, "distance", "target_distance_m", "TARGET_DISTANCE")
+    _set_bool_env_if_present(
+        parser,
+        "distance",
+        "auto_tune_follow_distance",
+        "FOLLOW_DISTANCE_AUTO_TUNE",
+    )
     _set_env_if_present(parser, "distance", "target_distance_release_m", "TARGET_DISTANCE_RELEASE_M")
     _set_env_if_present(
         parser,
@@ -786,6 +987,36 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "distance",
         "near_distance_rotation_only_max_rpm",
         "FOLLOW_NEAR_DISTANCE_ROTATION_ONLY_MAX_RPM",
+    )
+    _set_env_if_present(
+        parser,
+        "distance",
+        "near_distance_settle_confirm_frames",
+        "FOLLOW_NEAR_DISTANCE_SETTLE_CONFIRM_FRAMES",
+    )
+    _set_env_if_present(
+        parser,
+        "distance",
+        "near_distance_settle_hold_sec",
+        "FOLLOW_NEAR_DISTANCE_SETTLE_HOLD_SEC",
+    )
+    _set_env_if_present(
+        parser,
+        "distance",
+        "near_distance_settle_release_margin_ratio",
+        "FOLLOW_NEAR_DISTANCE_SETTLE_RELEASE_MARGIN_RATIO",
+    )
+    _set_env_if_present(
+        parser,
+        "distance",
+        "near_distance_settle_release_frames",
+        "FOLLOW_NEAR_DISTANCE_SETTLE_RELEASE_FRAMES",
+    )
+    _set_bool_env_if_present(
+        parser,
+        "distance",
+        "near_distance_disable_rate_feedforward",
+        "FOLLOW_NEAR_DISTANCE_DISABLE_RATE_FEEDFORWARD",
     )
     _set_env_if_present(parser, "distance", "reverse_start_distance_m", "FOLLOW_REVERSE_START_DISTANCE_M")
     _set_env_if_present(
@@ -900,9 +1131,13 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "distance", "fallback_forward_percent", "DISTANCE_MISSING_FORWARD_PERCENT")
 
     # Longitudinal cascade outer loop: depth distance error -> target wheel RPM.
+    os.environ["DISTANCE_CONTROL_MODE"] = control_mode
+    for key in ("kp_per_sec", "ki_per_sec2", "integral_max_m_s", "memory_sec", "launch_request_rpm", "motion_memory_sec"):
+        _set_env_if_present(parser, "distance_pid", "pi_" + key, "DISTANCE_PI_" + key.upper())
     _set_bool_env_if_present(parser, "distance_pid", "enable", "DISTANCE_PID_ENABLE")
     _set_env_if_present(parser, "distance_pid", "kp_rpm_per_m", "DISTANCE_PID_KP_RPM_PER_M")
     _set_env_if_present(parser, "distance_pid", "ki_rpm_per_m_s", "DISTANCE_PID_KI_RPM_PER_M_S")
+    _set_env_if_present(parser, "distance_pid", "forward_integral_limit_m_s", "DISTANCE_PID_FORWARD_INTEGRAL_LIMIT_M_S")
     _set_env_if_present(parser, "distance_pid", "kd_rpm_s_per_m", "DISTANCE_PID_KD_RPM_S_PER_M")
     _set_env_if_present(
         parser,
@@ -911,6 +1146,15 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "DISTANCE_PID_INTEGRAL_LIMIT_M_S",
     )
     _set_env_if_present(parser, "distance_pid", "deadband_m", "DISTANCE_PID_DEADBAND_M")
+    _set_bool_env_if_present(parser, "distance_pid", "feedforward_enable", "DISTANCE_FEEDFORWARD_ENABLE")
+    _set_bool_env_if_present(parser, "distance_pid", "approach_enable", "DISTANCE_APPROACH_ENABLE")
+    _set_bool_env_if_present(parser, "distance_pid", "approach_matching_enable", "DISTANCE_APPROACH_MATCHING_ENABLE")
+    for key in ("gain_per_sec", "max_catchup_m_s", "deceleration_m_s2", "response_delay_sec", "no_matching_max_rpm"):
+        _set_env_if_present(parser, "distance_pid", "approach_" + key, "DISTANCE_APPROACH_" + key.upper())
+    _set_bool_env_if_present(parser, "distance_pid", "turn_compensation_enable", "DISTANCE_TURN_COMPENSATION_ENABLE")
+    _set_bool_env_if_present(parser, "distance_pid", "measured_recovery_enable", "DEPTH_MEASURED_RECOVERY_ENABLE")
+    _set_env_if_present(parser, "distance_pid", "feedforward_max_rpm", "DISTANCE_FEEDFORWARD_MAX_RPM")
+    _set_env_if_present(parser, "distance_pid", "matching_base_max_rpm", "DISTANCE_MATCHING_BASE_MAX_RPM")
     _set_env_if_present(
         parser,
         "distance_pid",
@@ -1258,9 +1502,34 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_bool_env_if_present(
         parser,
         "follow",
+        "visual_reacquire_hold_enable",
+        "VISUAL_REACQUIRE_HOLD_ENABLE",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "visual_reacquire_hold_sec",
+        "VISUAL_REACQUIRE_HOLD_SEC",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "visual_reacquire_hold_max_center_jump_ratio",
+        "VISUAL_REACQUIRE_HOLD_MAX_CENTER_JUMP_RATIO",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "visual_reacquire_hold_min_area_similarity",
+        "VISUAL_REACQUIRE_HOLD_MIN_AREA_SIMILARITY",
+    )
+    _set_bool_env_if_present(
+        parser,
+        "follow",
         "search_evidence_gate_enable",
         "SEARCH_EVIDENCE_GATE_ENABLE",
     )
+    _set_bool_env_if_present(parser, "follow", "search_evidence_retry_enable", "SEARCH_EVIDENCE_RETRY_ENABLE")
     _set_env_if_present(
         parser,
         "follow",
@@ -1341,6 +1610,54 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "follow",
         "direction_history_enable",
         "FOLLOW_DIRECTION_HISTORY_ENABLE",
+    )
+    _set_bool_env_if_present(
+        parser,
+        "follow",
+        "historical_direction_backfill_enable",
+        "HISTORICAL_DIRECTION_BACKFILL_ENABLE",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "historical_direction_backfill_max_age_sec",
+        "HISTORICAL_DIRECTION_BACKFILL_MAX_AGE_SEC",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "historical_direction_backfill_min_samples",
+        "HISTORICAL_DIRECTION_BACKFILL_MIN_SAMPLES",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "historical_direction_backfill_max_capture_gap",
+        "HISTORICAL_DIRECTION_BACKFILL_MAX_CAPTURE_GAP",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "historical_direction_backfill_max_center_jump_ratio",
+        "HISTORICAL_DIRECTION_BACKFILL_MAX_CENTER_JUMP_RATIO",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "historical_direction_backfill_min_area_similarity",
+        "HISTORICAL_DIRECTION_BACKFILL_MIN_AREA_SIMILARITY",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "historical_direction_backfill_confidence_cap",
+        "HISTORICAL_DIRECTION_BACKFILL_CONFIDENCE_CAP",
+    )
+    _set_env_if_present(
+        parser,
+        "follow",
+        "historical_direction_backfill_min_score",
+        "HISTORICAL_DIRECTION_BACKFILL_MIN_SCORE",
     )
     _set_env_if_present(
         parser,
@@ -1504,6 +1821,12 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "steering_pid", "fallback_base_rpm", "VISIBLE_STEERING_PID_FALLBACK_BASE_RPM")
     _set_env_if_present(parser, "steering_pid", "parked_recenter_min_rpm", "PARKED_RECENTER_MIN_RPM")
     _set_env_if_present(parser, "steering_pid", "parked_recenter_max_rpm", "PARKED_RECENTER_MAX_RPM")
+    _set_env_if_present(
+        parser,
+        "steering_pid",
+        "lost_hold_min_correction_rpm",
+        "VISIBLE_STEERING_PID_LOST_HOLD_MIN_CORRECTION_RPM",
+    )
     _set_bool_env_if_present(parser, "lateral_intent", "enable", "LATERAL_INTENT_CONTROL_ENABLE")
     _set_env_if_present(parser, "lateral_intent", "control_rate_hz", "LATERAL_INTENT_CONTROL_RATE_HZ")
     _set_env_if_present(parser, "lateral_intent", "ttl_sec", "LATERAL_INTENT_TTL_SEC")
@@ -1512,6 +1835,8 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "lateral_intent", "rise_rpm_per_sec", "LATERAL_INTENT_RISE_RPM_PER_SEC")
     _set_env_if_present(parser, "lateral_intent", "brake_rpm_per_sec", "LATERAL_INTENT_BRAKE_RPM_PER_SEC")
     _set_env_if_present(parser, "lateral_intent", "motor_publish_interval_sec", "LATERAL_INTENT_MOTOR_PUBLISH_INTERVAL_SEC")
+    _set_env_if_present(parser, "lateral_intent", "follow_wheel_period_sec", "FOLLOW_WHEEL_PERIOD_SEC")
+    _set_bool_env_if_present(parser, "lateral_intent", "follow_forward_handoff_enable", "FOLLOW_FORWARD_HANDOFF_ENABLE")
     _set_env_if_present(parser, "lateral_intent", "log_interval_sec", "LATERAL_INTENT_LOG_INTERVAL_SEC")
     _set_bool_env_if_present(parser, "safety", "side_ir_blocks_rotation", "SIDE_IR_BLOCKS_ROTATION")
     _set_env_if_present(parser, "safety", "side_ir_confirm_sec", "SIDE_IR_CONFIRM_SEC")

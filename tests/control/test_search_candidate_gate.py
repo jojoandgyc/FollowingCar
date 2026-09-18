@@ -154,6 +154,75 @@ def main() -> int:
     if not retriggered.pause_rotation or not retriggered.entered:
         raise AssertionError(f"candidate did not retrigger after a real gap: {retriggered}")
 
+    # A strong identity-prioritized bbox must supersede a stale blocked
+    # detector candidate so the correct person can start a fresh hold.
+    priority_gate = SearchCandidateGate(SearchCandidateGateConfig(hold_frames=2))
+    wrong = candidate(420.0, 0.95)
+    priority_gate.update(
+        timestamp=5.0,
+        search_active=True,
+        width=640,
+        height=480,
+        formal_candidates=(wrong,),
+    )
+    priority_gate.update(
+        timestamp=5.1,
+        search_active=True,
+        width=640,
+        height=480,
+        formal_candidates=(wrong,),
+    )
+    preferred = candidate(20.0, 0.35)
+    preferred_result = priority_gate.update(
+        timestamp=5.2,
+        search_active=True,
+        width=640,
+        height=480,
+        formal_candidates=(wrong, preferred),
+        preferred_bbox=preferred.bbox,
+    )
+    if (
+        not preferred_result.pause_rotation
+        or not preferred_result.entered
+        or preferred_result.bbox != preferred.bbox
+    ):
+        raise AssertionError(
+            f"preferred identity bbox did not supersede blocked candidate: {preferred_result}"
+        )
+
+    # A tiny detector fragment must not consume the only observation window
+    # when the next frame contains the same person's valid near-camera box.
+    scale_gate = SearchCandidateGate(
+        SearchCandidateGateConfig(hold_frames=2, blocked_rearm_area_ratio=3.0)
+    )
+    fragment = CandidateObservation((40.0, 180.0, 160.0, 500.0), 0.40)
+    scale_gate.update(
+        timestamp=5.0,
+        search_active=True,
+        width=640,
+        height=480,
+        formal_candidates=(fragment,),
+    )
+    scale_gate.update(
+        timestamp=5.1,
+        search_active=True,
+        width=640,
+        height=480,
+        formal_candidates=(fragment,),
+    )
+    near_person = CandidateObservation((20.0, 20.0, 500.0, 470.0), 0.28)
+    rearmed = scale_gate.update(
+        timestamp=5.2,
+        search_active=True,
+        width=640,
+        height=480,
+        formal_candidates=(near_person,),
+    )
+    if not rearmed.pause_rotation or not rearmed.entered or rearmed.bbox != near_person.bbox:
+        raise AssertionError(
+            f"large valid candidate did not re-arm observation window: {rearmed}"
+        )
+
     probe_gate = SearchCandidateGate(config)
     probe = candidate(250.0, 0.16)
     confirming = probe_gate.update(

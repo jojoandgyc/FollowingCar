@@ -205,6 +205,40 @@ def test_controller_freezes_search_direction_from_capture_timeline() -> None:
     assert controller.search_status().hint_source == "capture_timeline_exit_side"
 
 
+def test_unverified_direction_classifier_cannot_replace_last_target_side() -> None:
+    controller = FollowSafetyController(
+        FollowPolicyConfig(
+            direction_history_enable=True,
+            lost_confirm_frames=3,
+            lost_confirm_sec=0.0,
+            initial_target_confirm_frames=1,
+            search_timeout_sec=60.0,
+        )
+    )
+    left_target = PersonTarget((0, 50, 120, 470), track_id=1, confidence=0.95, area=50400)
+    controller.decide(1, _frame(100, left_target))
+
+    # The asynchronous direction worker sees a right-side person but has no
+    # ReID/DeepSORT identity. It must not overwrite the trusted left exit slot.
+    controller.note_direction_classifier_evidence(
+        101,
+        101.0 / 15.0,
+        state="visible",
+        bbox=(520, 50, 639, 470),
+        frame_width=640,
+        confidence=0.90,
+        reason="detector_formal_person_side",
+    )
+    wait_one = controller.decide(2, _frame(101, None))
+    wait_two = controller.decide(3, _frame(102, None))
+    search = controller.decide(4, _frame(103, None))
+
+    assert wait_one.actions[0].kind == "rotate_left"
+    assert wait_two.actions[0].kind == "rotate_left"
+    assert search.actions[0].kind == "rotate_left"
+    assert controller.search_direction == "left"
+
+
 def test_controller_searches_side_after_reversed_edge_history() -> None:
     controller = FollowSafetyController(
         FollowPolicyConfig(

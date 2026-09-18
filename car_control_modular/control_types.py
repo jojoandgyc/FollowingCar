@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -12,11 +13,58 @@ BBox = Tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
+class DepthLinearTiming:
+    """Provenance bound to one committed authority, not a processed watermark.
+
+    snapshot[3] retains the motor lease's Depth time for existing consumers.
+    accepted_depth_timestamp is for duplicate detection; feedforward time only
+    limits the extra matching component, never makes fresh Depth disappear.
+    """
+
+    snapshot: Tuple[str, int, int, float]
+    accepted_depth_timestamp: float
+    depth_expires_at: float
+    feedforward_timestamp: Optional[float] = None
+    feedforward_expires_at: Optional[float] = None
+    distance_only_percent: int = 0
+    # Only an already-approved forward grant may use 180..250ms. These
+    # conservative braking inputs stay tied to snapshot[3], never a replay.
+    continuation_distance_m: Optional[float] = None
+    continuation_speed_bound_m_s: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class DepthTargetObservation:
+    """Identity-bound detector geometry; never replaces the steering bbox."""
+
+    bbox: BBox
+    target_id: int
+    raw_track_id: int
+    capture_frame_id: int
+    capture_timestamp: float
+    source: str = "yolo_detector"
+
+
+@dataclass(frozen=True)
+class DepthJumpConfirmation:
+    """Proof emitted only by Astra after fresh multi-frame depth acceptance."""
+
+    target_id: int
+    sample_timestamp: float
+    distance_m: float
+    kind: str
+    confirm_count: int
+    required_confirm_frames: int
+    region_count: int
+
+
+@dataclass(frozen=True)
 class PersonTarget:
     bbox: BBox
     track_id: int
     confidence: float
     area: float
+    depth_observation: Optional[DepthTargetObservation] = None
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -79,6 +127,29 @@ class DistanceState:
     fusion_radar_distance_m: Optional[float] = None
     fusion_visual_distance_m: Optional[float] = None
     fusion_encoder_delta_m: float = 0.0
+    # Candidate kept out of the PID anchor but low enough to require an
+    # immediate safety response (for example a clipped single-region near hit).
+    safety_distance_m: Optional[float] = None
+    # Physical Depth capture time, shared by RGB-aligned and latest-depth paths.
+    # Processing time must not turn the same sample into a new PID observation.
+    sample_timestamp: Optional[float] = None
+    # Discarded observations are not new range measurements. Preserve their
+    # physical provenance separately; never use this timestamp to renew a PID.
+    observation_timestamp: Optional[float] = None
+    temporal_status: str = ""
+
+    def is_replay_of(self, accepted_timestamp: Optional[float]) -> bool:
+        stamp = self.observation_timestamp
+        return bool(
+            self.source == "vision_depth"
+            and self.temporal_status in {"duplicate", "older_than_anchor"}
+            and self.raw_distance_m is None
+            and isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            and isinstance(accepted_timestamp, (int, float))
+            and math.isfinite(stamp) and math.isfinite(accepted_timestamp)
+            and 0.0 < stamp <= accepted_timestamp
+            and self.safety_distance_m is None and not self.brake_latched
+        )
 
 
 @dataclass(frozen=True)
@@ -232,3 +303,7 @@ class ControlDecision:
     # runtime uses it for command provenance; normal live decisions leave it
     # unset and therefore use the current capture slot.
     evidence_capture_frame_id: Optional[int] = None
+    # Normal (non-hazard) chassis parking after a near-target yaw stop. The
+    # executor must preserve NORMAL parking against subsequent zero-speed
+    # refreshes, without turning every longitudinal zero into a full stop.
+    near_yaw_park_requested: bool = False

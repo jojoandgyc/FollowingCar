@@ -29,7 +29,26 @@ except ModuleNotFoundError:
     sys.modules["track_first_person2"] = tracker_stub
 
 import request_0513_modular as mod
-from rk_vision.tracker import TrackRecord
+from rk_vision.tracker import DeepSortTracker, DeepSortTrackerConfig, TrackRecord
+
+
+def test_detector_crop_edge_reason_keeps_partial_identity_tier() -> None:
+    tracker = DeepSortTracker(DeepSortTrackerConfig())
+    edge_crop_tier = tracker._bbox_identity_tier(
+        bbox_quality_ok=False,
+        bbox_quality_reason="edge_touch>2,detector_crop:edge_touch>2",
+        confidence=0.9,
+        bbox=(0.0, 0.0, 639.0, 479.0),
+    )
+    assert edge_crop_tier == "weak"
+
+    mixed_risk_tier = tracker._bbox_identity_tier(
+        bbox_quality_ok=False,
+        bbox_quality_reason="area_ratio>0.75,detector_crop:edge_touch>2",
+        confidence=0.9,
+        bbox=(0.0, 0.0, 639.0, 479.0),
+    )
+    assert mixed_risk_tier == "reject"
 
 
 def _track(
@@ -119,7 +138,7 @@ class _DummyTracker:
     def _hold_for_visible_unsteerable_target(self, **_kwargs) -> bool:
         return False
 
-    def _clear_longitudinal_context(self) -> None:
+    def _clear_longitudinal_context(self, **_kwargs) -> None:
         return None
 
     def _publish_longitudinal_context(
@@ -331,7 +350,7 @@ def _assert_stale_result_revokes_published_yaw_without_brake() -> None:
         search_direction="right",
         lost_confirm_frames=0,
         _clear_lateral_intent=lambda reason: events.append(("clear_lateral", reason)),
-        _clear_longitudinal_context=lambda: events.append(("clear_longitudinal",)),
+        _clear_longitudinal_context=lambda **kwargs: events.append(("clear_longitudinal",)),
         _action_queue_snapshot_locked=lambda: [],
         _action_names_for_log=lambda actions: [
             mod.ACTION_NAMES.get(action, str(action)) for action in actions
@@ -448,7 +467,7 @@ def _assert_confirmed_search_reacquire_respects_configured_stability() -> None:
         def _clear_lateral_intent(self, _reason: str) -> None:
             return None
 
-        def _clear_longitudinal_context(self) -> None:
+        def _clear_longitudinal_context(self, **_kwargs) -> None:
             return None
 
         def _replace_action_queue(self, actions, reason: str) -> None:
@@ -501,20 +520,143 @@ def _assert_confirmed_search_reacquire_respects_configured_stability() -> None:
         "bbox": (125.0, 40.0, 345.0, 450.0),
         "rec": second_record,
     }]
-    if tracker._hold_for_confirmed_search_reacquire(second, width=640):
-        raise AssertionError("two stable UID frames must release normal follow control")
-    expected_soft = [([mod.ACTION_FORWARD], "confirmed_search_reacquire_wait")]
-    if stops or holds != [True] or tracker.soft_actions != expected_soft:
+    second_held = tracker._hold_for_confirmed_search_reacquire(second, width=640)
+    if required > 2 and not second_held:
+        raise AssertionError("the second stable UID frame must still be held")
+    if required <= 2:
+        if second_held:
+            raise AssertionError("two stable UID frames must release normal follow control")
+    else:
+        tracker.frame_index = 202
+        third_record = _track(22, 7, bbox=(130.0, 40.0, 350.0, 450.0))
+        third = [{
+            "stable_id": 7,
+            "geometry_fallback": False,
+            "bbox": (130.0, 40.0, 350.0, 450.0),
+            "rec": third_record,
+        }]
+        if tracker._hold_for_confirmed_search_reacquire(third, width=640):
+            raise AssertionError("three stable UID frames must release normal follow control")
+        expected_soft = [
+            ([mod.ACTION_FORWARD], "confirmed_search_reacquire_wait"),
+            ([mod.ACTION_FORWARD], "confirmed_search_reacquire_wait"),
+        ]
+        if stops or holds != [True, True] or tracker.soft_actions != expected_soft:
+            raise AssertionError(
+                "reacquire observation must use publisher zero without brake hold: "
+                f"stops={stops} holds={holds} soft={tracker.soft_actions}"
+            )
+
+    class _DepthWaitTracker(_ReacquireTracker):
+        _publish_search_reacquire_direction_hold = (
+            mod.PersonTracker._publish_search_reacquire_direction_hold
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.search_direction = "left"
+            self._distance_runtime = object()
+            self._follow_controller.search_status = lambda _now=None: SimpleNamespace(
+                state="searching",
+                direction="left",
+                active_target_id=7,
+            )
+
+        def _observe_search_reacquire_depth(self, **_kwargs):
+            return False, SimpleNamespace(
+                used_distance_m=None,
+                sample_count=0,
+                source_detail="insufficient_depth_pixels",
+                sample_age_sec=None,
+            )
+
+    depth_tracker = _DepthWaitTracker()
+    depth_record = _track(30, 7, bbox=(120.0, 40.0, 340.0, 450.0))
+    depth_candidate = [{
+        "stable_id": 7,
+        "geometry_fallback": False,
+        "bbox": (120.0, 40.0, 340.0, 450.0),
+        "rec": depth_record,
+    }]
+    previous_depth_enable = mod.MODULE_ASTRA_DEPTH_ENABLE
+    previous_depth_gate = mod.SEARCH_REACQUIRE_DEPTH_GATE_ENABLE
+    mod.MODULE_ASTRA_DEPTH_ENABLE = True
+    mod.SEARCH_REACQUIRE_DEPTH_GATE_ENABLE = True
+    try:
+        if not depth_tracker._hold_for_confirmed_search_reacquire(
+            depth_candidate, width=640
+        ):
+            raise AssertionError("invalid depth must keep the reacquire hold active")
+    finally:
+        mod.MODULE_ASTRA_DEPTH_ENABLE = previous_depth_enable
+        mod.SEARCH_REACQUIRE_DEPTH_GATE_ENABLE = previous_depth_gate
+    expected_depth_hold = [
+        ([mod.ACTION_ROTATE_LEFT], "confirmed_search_reacquire_depth_wait")
+    ]
+    if depth_tracker.soft_actions != expected_depth_hold:
         raise AssertionError(
-            "reacquire observation must use publisher zero without brake hold: "
-            f"stops={stops} holds={holds} soft={tracker.soft_actions}"
+            "invalid depth must preserve the frozen search direction: "
+            f"soft={depth_tracker.soft_actions}"
+        )
+
+    # IdentityBank's late-candidate path has already completed its own 2/2
+    # visual confirmation.  An invalid Depth sample must suppress forward
+    # context, but must not keep the old frozen search direction active.
+    late_tracker = _DepthWaitTracker()
+    released = []
+    late_tracker._follow_controller.release_search_on_confirmed_target = (
+        lambda reason: released.append(str(reason))
+    )
+    late_tracker.assignment = {
+        "uid": 7,
+        "reason": "preferred_search_late_reacquire",
+        "distance": 0.12,
+        "match_source": "strong",
+        "reacquire_geometry_ok": True,
+        "bbox_quality_ok": True,
+    }
+    late_candidate = [{
+        "stable_id": 7,
+        "geometry_fallback": False,
+        "bbox": (120.0, 40.0, 340.0, 450.0),
+        "rec": _track(31, 7, bbox=(120.0, 40.0, 340.0, 450.0)),
+        "debug": {"assignment": dict(late_tracker.assignment)},
+    }]
+    previous_depth_enable = mod.MODULE_ASTRA_DEPTH_ENABLE
+    previous_depth_gate = mod.SEARCH_REACQUIRE_DEPTH_GATE_ENABLE
+    mod.MODULE_ASTRA_DEPTH_ENABLE = True
+    mod.SEARCH_REACQUIRE_DEPTH_GATE_ENABLE = True
+    try:
+        if late_tracker._hold_for_confirmed_search_reacquire(
+            late_candidate, width=640
+        ):
+            raise AssertionError(
+                "2/2 late visual confirmation must release search even with invalid depth"
+            )
+    finally:
+        mod.MODULE_ASTRA_DEPTH_ENABLE = previous_depth_enable
+        mod.SEARCH_REACQUIRE_DEPTH_GATE_ENABLE = previous_depth_gate
+    if late_tracker.search_state != "none" or late_tracker.search_direction is not None:
+        raise AssertionError(
+            "late visual confirmation must clear the frozen search direction"
+        )
+    if late_tracker._reacquire_depth_pending is not True:
+        raise AssertionError(
+            "invalid depth must remain an explicit longitudinal pending state: "
+            f"pending={getattr(late_tracker, '_reacquire_depth_pending', 'missing')} "
+            f"released={released} soft={late_tracker.soft_actions}"
+        )
+    if released != ["visual_reacquire_depth_pending"]:
+        raise AssertionError(f"unexpected visual release reason: {released}")
+    if late_tracker.soft_actions:
+        raise AssertionError(
+            "released late visual confirmation must not publish a search rotate action"
         )
 
 
-def _assert_search_candidate_observation_uses_publisher_zero() -> None:
+def _assert_search_candidate_observation_uses_soft_stop() -> None:
     queued = []
     hard_stops = []
-    cancelled = []
 
     class _EvidenceTracker:
         _publish_observation_soft_zero = mod.PersonTracker._publish_observation_soft_zero
@@ -532,7 +674,6 @@ def _assert_search_candidate_observation_uses_publisher_zero() -> None:
                 defer_search_timeout=lambda _seconds: None,
             )
             self._action_runtime = SimpleNamespace(
-                cancel_rotate_pulse_observation=lambda reason: cancelled.append(str(reason)),
                 send_stop_with_brake_hold=lambda reason: hard_stops.append(str(reason)),
             )
             self.is_forwarding = True
@@ -540,7 +681,7 @@ def _assert_search_candidate_observation_uses_publisher_zero() -> None:
         def _clear_lateral_intent(self, reason: str) -> None:
             queued.append(("clear_lateral", str(reason)))
 
-        def _clear_longitudinal_context(self) -> None:
+        def _clear_longitudinal_context(self, **_kwargs) -> None:
             queued.append(("clear_longitudinal",))
 
         def _replace_action_queue(self, actions, reason: str) -> None:
@@ -561,16 +702,18 @@ def _assert_search_candidate_observation_uses_publisher_zero() -> None:
     )
     expected = (
         "replace",
-        [mod.ACTION_FORWARD],
+        [mod.ACTION_STOP],
         "search_candidate_evidence_observe",
     )
     if hard_stops or expected not in queued:
         raise AssertionError(
-            "candidate observation must publish zero drive without brake hold: "
+            "candidate observation must publish soft STOP without brake hold: "
             f"hard={hard_stops} queued={queued}"
         )
-    if not tracker._search_evidence_observation_active or not cancelled:
-        raise AssertionError("candidate observation window or pulse cancellation was not armed")
+    if not tracker._search_evidence_observation_active:
+        raise AssertionError("candidate observation window was not armed")
+    if not tracker._use_soft_stop_next:
+        raise AssertionError("candidate observation must mark the queued STOP as soft")
 
 
 def _assert_visible_unsteerable_target_holds_without_search() -> None:
@@ -1084,7 +1227,7 @@ def main() -> int:
     if multi._single_person_geometry_unsteerable_uid is not None:
         raise AssertionError("multi-person UID0 boxes must not claim the active UID")
     _assert_confirmed_search_reacquire_respects_configured_stability()
-    _assert_search_candidate_observation_uses_publisher_zero()
+    _assert_search_candidate_observation_uses_soft_stop()
     _assert_search_geometry_reacquires_unique_target()
     _assert_pid_zero_guard_brakes_unsettled_yaw()
     _assert_long_low_quality_never_recovers_uid()

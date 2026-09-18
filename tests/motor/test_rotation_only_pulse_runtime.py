@@ -42,9 +42,15 @@ class FakeBackend:
 def main() -> int:
     owner = SimpleNamespace(
         action_queue_lock=threading.Lock(),
+        command_lock=threading.Lock(),
         motor_io_lock=threading.Lock(),
         _last_motor_dispatch_source="action_queue",
         frame_index=1,
+        current_command=None,
+        command_start_time=None,
+        _rotate_transition_hold_active=False,
+        _rotate_follows_previous_rotate=False,
+        _last_rotate_end_ts=0.0,
     )
     backend = FakeBackend()
     config = SimpleNamespace(
@@ -94,6 +100,21 @@ def main() -> int:
     owner._last_control_decision_reason = "target_distance_hold"
     if runtime.can_release_brake_hold(symbols.rotate_left):
         raise AssertionError("an unrelated parked rotation must not release brake hold")
+
+    # A candidate observation must stop an already running search turn before
+    # the queued soft STOP is consumed. Otherwise the action thread can issue
+    # one more stale rotate refresh during that queue handoff.
+    owner.current_command = symbols.rotate_right
+    owner.command_start_time = time.time()
+    if not runtime.cancel_active_rotate_for_observation("search_candidate_evidence_observe"):
+        raise AssertionError("active search rotation must be cancelled for observation")
+    if owner.current_command is not None or backend.targets[-1][:3] != (0, 0, "TURN_ZERO"):
+        raise AssertionError(
+            "candidate observation must clear current rotation and write zero target: "
+            f"command={owner.current_command!r} target={backend.targets[-1]}"
+        )
+    if runtime.cancel_active_rotate_for_observation("already_stopped"):
+        raise AssertionError("cancelling an idle action must be a no-op")
 
     if not runtime.request_rotation_only_yaw_pulse(8):
         raise AssertionError("a fresh visual yaw request must start one pulse")

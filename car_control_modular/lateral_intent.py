@@ -31,6 +31,13 @@ class LateralControlIntent:
     # Capture slot at which this intent was computed.  capture_frame_id may
     # intentionally point to an older evidence frame during reacquisition.
     decision_capture_frame_id: int = 0
+    # Zero is a command, not the absence of an owner. A new visual sample is
+    # required to release a deliberate coast/center hold.
+    hold_zero: bool = False
+    near_distance_mode: bool = False
+    # Whole-chassis NORMAL parking, only with zero longitudinal authority.
+    # Unlike hold_zero, this survives old-frame refreshes and zero writes.
+    park_requested: bool = False
 
     def age_sec(self, now: float) -> float:
         return max(0.0, float(now) - float(self.published_at))

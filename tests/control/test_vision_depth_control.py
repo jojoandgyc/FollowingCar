@@ -16,9 +16,19 @@ from car_control_modular.distance_runtime import DistanceRuntime, DistanceRuntim
 class FakeAstraSensors:
     def __init__(self):
         self.calls = 0
+        self.reference_timestamp = None
 
-    def get_astra_target_distance(self, bbox, width, height, *, target_id=None):
+    def get_astra_target_distance(
+        self,
+        bbox,
+        width,
+        height,
+        *,
+        target_id=None,
+        reference_timestamp=None,
+    ):
         self.calls += 1
+        self.reference_timestamp = reference_timestamp
         assert bbox == (100.0, 40.0, 300.0, 440.0)
         assert (width, height, target_id) == (640, 480, 9)
         return SimpleNamespace(
@@ -63,11 +73,17 @@ def main() -> int:
         frame_height=480,
         target_distance_m=1.5,
         brake_distance_m=0.8,
+        capture_timestamp=123.456,
     )
     if state.source != "vision_depth" or state.source_detail != "depth_matched":
         raise AssertionError(f"Depth source was not selected: {state}")
     if state.used_distance_m != 1.72 or state.raw_distance_m != 1.70:
         raise AssertionError(f"Depth distance fields were not propagated: {state}")
+    if sensors.reference_timestamp != 123.456:
+        raise AssertionError(
+            "visual RGB capture timestamp must reach the Astra measurement: "
+            f"{sensors.reference_timestamp}"
+        )
     recent = runtime.get_recent_vision_depth_state(
         target_distance_m=1.5,
         brake_distance_m=0.8,

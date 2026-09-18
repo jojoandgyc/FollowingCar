@@ -5,7 +5,12 @@ receive tracked person records out.
 """
 
 from .frames import FramePacket
-from .pipeline import RKNNVisionConfig, RKNNVisionPipeline, SearchCandidateEvidence
+from .pipeline import (
+    RKNNVisionConfig,
+    RKNNVisionPipeline,
+    SearchCandidateEvidence,
+    cluster_probe_detections,
+)
 from .tracker import TrackRecord
 from .yolo11 import Detection
 
@@ -15,5 +20,6 @@ __all__ = [
     "RKNNVisionConfig",
     "RKNNVisionPipeline",
     "SearchCandidateEvidence",
+    "cluster_probe_detections",
     "TrackRecord",
 ]

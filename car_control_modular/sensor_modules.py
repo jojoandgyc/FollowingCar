@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import logging
+import os
 import threading
 import time
 from typing import Any, List, Optional, Tuple
@@ -60,6 +61,7 @@ class SensorRuntimeConfig:
     astra_depth_large_bbox_guard_max_distance_m: float = 2.50
     astra_depth_max_distance_jump_m: float = 0.80
     astra_depth_jump_confirm_frames: int = 2
+    astra_depth_max_unconfirmed_jump_rate_m_s: float = 3.0
     astra_depth_near_guard_distance_m: float = 1.80
     astra_depth_near_far_jump_confirm_frames: int = 5
     astra_depth_anchor_strict_age_sec: float = 0.60
@@ -162,6 +164,9 @@ class SensorRuntime:
                     ),
                     max_distance_jump_m=float(c.astra_depth_max_distance_jump_m),
                     jump_confirm_frames=int(c.astra_depth_jump_confirm_frames),
+                    max_unconfirmed_jump_rate_m_s=float(
+                        c.astra_depth_max_unconfirmed_jump_rate_m_s
+                    ),
                     near_guard_distance_m=float(c.astra_depth_near_guard_distance_m),
                     near_far_jump_confirm_frames=int(
                         c.astra_depth_near_far_jump_confirm_frames
@@ -181,6 +186,10 @@ class SensorRuntime:
                         c.astra_depth_encoder_wheel_circumference_m
                     ),
                     log_every_sec=float(c.astra_depth_log_every_sec),
+                    diagnostics_dir=(os.path.join(os.environ["FOLLOW_LOG_DIR"], "depth_diagnostics")
+                        if os.environ.get("FOLLOW_LOG_DIR")
+                        and os.environ.get("FOLLOW_DEPTH_DIAGNOSTICS_ENABLE", "1").lower()
+                        not in {"0", "false", "no"} else ""),
                 ),
                 logger=self.logger,
             )
@@ -279,6 +288,8 @@ class SensorRuntime:
         target_id: Optional[int] = None,
         use_latest_depth: bool = False,
         steering_feedback=None,
+        reference_timestamp: Optional[float] = None,
+        evidence_capture_frame_id: Optional[int] = None,
     ) -> AstraDepthMeasurement:
         runtime = self.astra_depth
         if not self.config.astra_depth_enable or runtime is None:
@@ -290,6 +301,8 @@ class SensorRuntime:
             target_id=target_id,
             use_latest_depth=bool(use_latest_depth),
             steering_feedback=steering_feedback,
+            reference_timestamp=reference_timestamp,
+            evidence_capture_frame_id=evidence_capture_frame_id,
         )
 
     def _start_mmwave_cache_thread(self) -> None:

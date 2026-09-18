@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
+import json
+import logging
 import math
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -212,6 +216,7 @@ def _assert_controlled_handoff_requires_consecutive_matches() -> None:
             exclusive_uid_claim_frames=15,
             controlled_handoff_enable=True,
             controlled_handoff_confirm_frames=3,
+            controlled_handoff_instant_threshold=0.0,
             controlled_handoff_threshold=0.30,
             controlled_handoff_min_old_track_gap_frames=2,
         )
@@ -231,6 +236,62 @@ def _assert_controlled_handoff_requires_consecutive_matches() -> None:
     if state["last_assignments"]["2"]["reason"] != "controlled_handoff":
         raise AssertionError(f"expected controlled_handoff reason, got {state['last_assignments']['2']}")
 
+
+def _assert_center_jump_releases_stale_claim() -> None:
+    bank = IdentityBank(
+        IdentityBankConfig(
+            min_confidence=0.65,
+            new_identity_confirm_frames=1,
+            controlled_handoff_enable=True,
+            controlled_handoff_confirm_frames=1,
+            controlled_handoff_threshold=0.30,
+            controlled_handoff_min_old_track_gap_frames=2,
+        )
+    )
+    feature = _unit([1.0, 0.0, 0.0])
+    uid = bank.assign(track_id=1, feature=feature, confidence=0.9, area=1000, frame_index=1)
+    rejected = bank.assign(
+        track_id=1,
+        feature=feature,
+        confidence=0.9,
+        area=1000,
+        frame_index=2,
+        bbox_quality_ok=False,
+        bbox_quality_reason="identity_center_jump>0.30",
+        bbox_quality_tier="reject",
+    )
+    if rejected != 0:
+        raise AssertionError(f"center-jumped mapped track must be withheld, got {rejected}")
+    state = bank.debug_state()
+    if state["track_to_uid"].get("1") is not None:
+        raise AssertionError(f"center-jumped track must release stale UID claim, got {state}")
+    handed_off = bank.assign(
+        track_id=2,
+        feature=feature,
+        confidence=0.9,
+        area=1000,
+        frame_index=3,
+    )
+    if handed_off != 0:
+        raise AssertionError("a released UID without geometric reference must still wait")
+    handed_off = bank.assign(
+        track_id=2, feature=feature, confidence=0.9, area=1000, frame_index=4,
+    )
+    if handed_off != uid:
+        raise AssertionError(f"released UID should be eligible after confirmation, got {handed_off}")
+    swapped = bank.assign(
+        track_id=3,
+        feature=feature,
+        confidence=0.9,
+        area=1000,
+        frame_index=5,
+        bbox_quality_ok=False,
+        bbox_quality_reason="identity_swap_competing_track",
+        bbox_quality_tier="reject",
+    )
+    if swapped != 0:
+        raise AssertionError(f"competing-track swap evidence must stay unassigned, got {swapped}")
+
     late_bank = IdentityBank(
         IdentityBankConfig(
             match_threshold=0.32,
@@ -240,6 +301,7 @@ def _assert_controlled_handoff_requires_consecutive_matches() -> None:
             exclusive_uid_claim_frames=2,
             controlled_handoff_enable=True,
             controlled_handoff_confirm_frames=3,
+            controlled_handoff_instant_threshold=0.0,
             controlled_handoff_threshold=0.30,
             controlled_handoff_min_old_track_gap_frames=2,
         )
@@ -271,7 +333,7 @@ def _preferred_search_bank(target_distance: float, best_distance: float):
             preferred_search_reacquire_enable=True,
             preferred_search_reacquire_threshold=0.36,
             preferred_search_reacquire_max_disadvantage=0.15,
-            preferred_search_reacquire_confirm_frames=2,
+            preferred_search_reacquire_confirm_frames=3,
         )
     )
     preferred_uid = bank.assign(
@@ -295,8 +357,35 @@ def _preferred_search_bank(target_distance: float, best_distance: float):
 
 def _assert_preferred_search_reacquire_rules() -> None:
     query = _unit([1.0, 0.0, 0.0])
+    instant_strong, instant_strong_uid, _ = _preferred_search_bank(0.10, 0.21)
+    instant_strong_result = instant_strong.assign(
+        track_id=3,
+        feature=query,
+        confidence=0.9,
+        area=1000,
+        frame_index=5,
+        candidate_count=1,
+        preferred_uid=instant_strong_uid,
+        preferred_candidate_ok=True,
+    )
+    if instant_strong_result != 0:
+        raise AssertionError(
+            "preferred search distance <= 0.15 without geometry must not be instant, "
+            f"got {instant_strong_result}"
+        )
+    for frame_index in (6, 7):
+        instant_strong_result = instant_strong.assign(
+            track_id=3, feature=query, confidence=0.9, area=1000,
+            frame_index=frame_index, preferred_uid=instant_strong_uid,
+            preferred_candidate_ok=True,
+        )
+    if instant_strong_result != 0:
+        raise AssertionError("missing geometry must never bind a preferred search UID")
+    if instant_strong.last_assignments[3]["instant_reacquire_allowed"]:
+        raise AssertionError("ordinary confirmation must not advertise instant permission")
+
     instant_bank, instant_uid, _ = _preferred_search_bank(0.25, 0.21)
-    instant = instant_bank.assign(
+    instant_wait = instant_bank.assign(
         track_id=3,
         feature=query,
         confidence=0.9,
@@ -306,9 +395,30 @@ def _assert_preferred_search_reacquire_rules() -> None:
         preferred_uid=instant_uid,
         preferred_candidate_ok=True,
     )
-    if instant != instant_uid:
+    instant_second = instant_bank.assign(
+        track_id=3,
+        feature=query,
+        confidence=0.9,
+        area=1000,
+        frame_index=6,
+        candidate_count=1,
+        preferred_uid=instant_uid,
+        preferred_candidate_ok=True,
+    )
+    instant_recovered = instant_bank.assign(
+        track_id=3,
+        feature=query,
+        confidence=0.9,
+        area=1000,
+        frame_index=7,
+        candidate_count=1,
+        preferred_uid=instant_uid,
+        preferred_candidate_ok=True,
+    )
+    if instant_wait != 0 or instant_second != 0 or instant_recovered != 0:
         raise AssertionError(
-            f"a unique strong search match must recover in one frame, got {instant}"
+            "a unique strong search match without geometry must remain unassigned, "
+            f"got {instant_wait}, {instant_second}, {instant_recovered}"
         )
 
     bank, preferred_uid, _ = _preferred_search_bank(0.35, 0.21)
@@ -321,8 +431,9 @@ def _assert_preferred_search_reacquire_rules() -> None:
         candidate_count=2,
         preferred_uid=preferred_uid,
         preferred_candidate_ok=True,
+        sample_metadata={"candidate_score_gap": 0.40},
     )
-    recovered = bank.assign(
+    recovered_wait = bank.assign(
         track_id=3,
         feature=query,
         confidence=0.9,
@@ -331,12 +442,84 @@ def _assert_preferred_search_reacquire_rules() -> None:
         candidate_count=2,
         preferred_uid=preferred_uid,
         preferred_candidate_ok=True,
+        sample_metadata={"candidate_score_gap": 0.40},
+    )
+    recovered = bank.assign(
+        track_id=3,
+        feature=query,
+        confidence=0.9,
+        area=1000,
+        frame_index=7,
+        candidate_count=2,
+        preferred_uid=preferred_uid,
+        preferred_candidate_ok=True,
+        sample_metadata={"candidate_score_gap": 0.40},
     )
     state = bank.debug_state()
-    if wait != 0 or recovered != preferred_uid:
-        raise AssertionError(f"preferred search reacquire must wait two frames, got {wait}, {recovered}")
-    if state["last_assignments"]["3"]["reason"] != "preferred_search_reacquire":
+    if wait != 0 or recovered_wait != 0 or recovered != 0:
+        raise AssertionError(
+            "preferred search reacquire without geometry must remain unassigned, "
+            f"got {wait}, {recovered_wait}, {recovered}"
+        )
+    if state["last_assignments"]["3"]["reason"] != "preferred_search_reacquire_geometry_reject":
         raise AssertionError(f"unexpected preferred reacquire result: {state['last_assignments']['3']}")
+
+    # Search reacquisition must survive a one-frame DeepSORT raw-track
+    # replacement.  The spatial continuity check prevents an unrelated
+    # person from inheriting the pending confirmation streak.
+    bridged, bridged_uid, _ = _preferred_search_bank(0.35, 0.21)
+    bridged_first = bridged.assign(
+        track_id=3,
+        feature=query,
+        confidence=0.9,
+        area=1000,
+        frame_index=5,
+        candidate_count=1,
+        preferred_uid=bridged_uid,
+        preferred_candidate_ok=True,
+        sample_metadata={"center_x_ratio": 0.78},
+    )
+    bridged_weak = bridged.assign(
+        track_id=3,
+        feature=query,
+        confidence=0.9,
+        area=1000,
+        frame_index=6,
+        candidate_count=1,
+        preferred_uid=bridged_uid,
+        preferred_candidate_ok=True,
+        bbox_quality_ok=True,
+        bbox_quality_tier="weak",
+        bbox_quality_reason="edge_touch=1",
+        sample_metadata={"center_x_ratio": 0.79},
+    )
+    bridged_wait = bridged.assign(
+        track_id=4,
+        feature=query,
+        confidence=0.9,
+        area=1000,
+        frame_index=7,
+        candidate_count=1,
+        preferred_uid=bridged_uid,
+        preferred_candidate_ok=True,
+        sample_metadata={"center_x_ratio": 0.80},
+    )
+    bridged_recovered = bridged.assign(
+        track_id=4,
+        feature=query,
+        confidence=0.9,
+        area=1000,
+        frame_index=8,
+        candidate_count=1,
+        preferred_uid=bridged_uid,
+        preferred_candidate_ok=True,
+        sample_metadata={"center_x_ratio": 0.81},
+    )
+    if bridged_first != 0 or bridged_weak != 0 or bridged_wait != 0 or bridged_recovered != 0:
+        raise AssertionError(
+            "preferred search reacquire without positive geometry must remain unassigned, "
+            f"got {bridged_first}, {bridged_weak}, {bridged_wait}, {bridged_recovered}"
+        )
 
     wrong_side, wrong_uid, _ = _preferred_search_bank(0.35, 0.21)
     wrong_side.assign(
@@ -397,7 +580,7 @@ def _assert_preferred_search_reacquire_rules() -> None:
             preferred_search_reacquire_enable=True,
             preferred_search_reacquire_threshold=0.36,
             preferred_search_reacquire_max_disadvantage=0.15,
-            preferred_search_reacquire_confirm_frames=2,
+            preferred_search_reacquire_confirm_frames=3,
         )
     )
     strict_uid = strict_bank.assign(
@@ -443,6 +626,155 @@ def _assert_preferred_search_reacquire_rules() -> None:
     )
     if weak_result == weak_uid:
         raise AssertionError("preferred uid more than 0.15 behind the best identity must be rejected")
+
+
+def _assert_search_candidate_competition_uses_confidence_gap() -> None:
+    """Low-confidence detector fragments must not block a strong locked UID."""
+    bank = IdentityBank(
+        IdentityBankConfig(
+            new_identity_confirm_frames=1,
+            preferred_search_reacquire_enable=True,
+            preferred_search_reacquire_min_score_gap=0.25,
+        )
+    )
+    feature = _unit([1.0, 0.0, 0.0])
+    uid = bank.assign(
+        track_id=1,
+        feature=feature,
+        confidence=0.9,
+        area=1000,
+        frame_index=1,
+    )
+    accepted = bank._preferred_search_reacquire_candidate(
+        feature=feature,
+        partial_feature=None,
+        preferred_uid=uid,
+        candidate_ok=True,
+        candidate_count=2,
+        sample_metadata={"candidate_score_gap": 0.60},
+    )
+    if accepted is None:
+        raise AssertionError("a clearly stronger candidate should pass competition gating")
+    rejected = bank._preferred_search_reacquire_candidate(
+        feature=feature,
+        partial_feature=None,
+        preferred_uid=uid,
+        candidate_ok=True,
+        candidate_count=2,
+        sample_metadata={"candidate_score_gap": 0.08},
+    )
+    if rejected is not None:
+        raise AssertionError("close-confidence candidates must remain gated")
+
+    opposite_override = bank._preferred_search_reacquire_candidate(
+        feature=feature,
+        partial_feature=None,
+        preferred_uid=uid,
+        candidate_ok=False,
+        candidate_count=2,
+        sample_metadata={
+            "candidate_score_gap": 0.08,
+            "bbox_quality_tier": "strong",
+            "search_reacquire_context_active": True,
+            "search_direction_compatible": False,
+        },
+    )
+    if opposite_override is None or opposite_override[-1] != "strong":
+        raise AssertionError(
+            "a strong opposite-side active-UID match should enter local confirmation"
+        )
+
+
+def _assert_preferred_search_blocks_global_fallback() -> None:
+    """A search candidate must not inherit a UID through normal handoff."""
+    bank = IdentityBank(
+        IdentityBankConfig(
+            match_threshold=0.30,
+            reacquire_threshold=0.30,
+            new_identity_confirm_frames=1,
+            controlled_handoff_enable=True,
+            controlled_handoff_confirm_frames=2,
+            controlled_handoff_threshold=0.30,
+            controlled_handoff_min_old_track_gap_frames=1,
+            preferred_search_reacquire_enable=True,
+            preferred_search_reacquire_threshold=0.10,
+            preferred_search_reacquire_max_disadvantage=0.05,
+            preferred_search_reacquire_confirm_frames=2,
+        )
+    )
+    preferred_uid = bank.assign(
+        track_id=1,
+        feature=_unit([1.0, 0.0, 0.0]),
+        confidence=0.9,
+        area=1000,
+        frame_index=1,
+    )
+    result = bank.assign(
+        track_id=2,
+        feature=_unit([1.0, 0.0, 0.0]),
+        confidence=0.9,
+        area=1000,
+        frame_index=5,
+        candidate_count=2,
+        preferred_uid=preferred_uid,
+        preferred_candidate_ok=False,
+    )
+    state = bank.debug_state()
+    if result != 0:
+        raise AssertionError(
+            "active preferred search must reject a global controlled handoff, "
+            f"got uid={result}, state={state}"
+        )
+    if state["last_assignments"]["2"]["reason"] != "preferred_search_reacquire_rejected":
+        raise AssertionError(f"expected preferred-search rejection, got {state}")
+
+
+def _assert_partial_search_reacquire_uses_torso_descriptor() -> None:
+    """A partial view may use its separate torso descriptor, never the full gallery threshold."""
+    bank = IdentityBank(
+        IdentityBankConfig(
+            match_threshold=0.20,
+            update_threshold=0.20,
+            min_confidence=0.65,
+            new_identity_confirm_frames=1,
+            controlled_handoff_enable=False,
+            preferred_search_reacquire_enable=True,
+            preferred_search_reacquire_threshold=0.20,
+            partial_appearance_enable=True,
+            partial_match_threshold=0.34,
+        )
+    )
+    uid = bank.assign(
+        track_id=1,
+        feature=_unit([1.0, 0.0, 0.0]),
+        partial_feature=_unit([1.0, 0.0, 0.0]),
+        confidence=0.9,
+        area=1000,
+        frame_index=1,
+    )
+    candidate = bank.assign(
+        track_id=2,
+        feature=_unit([0.0, 1.0, 0.0]),
+        # Above the full-body 0.20 threshold but inside the partial torso
+        # threshold, reproducing a clipped-person observation.
+        partial_feature=_unit([0.76, 0.65, 0.0]),
+        confidence=0.9,
+        area=1000,
+        frame_index=2,
+        candidate_count=1,
+        preferred_uid=uid,
+        preferred_candidate_ok=True,
+        sample_metadata={"partial_observation": True},
+    )
+    if candidate != uid:
+        raise AssertionError(f"partial search candidate should keep uid {uid}, got {candidate}")
+    assignment = bank.last_assignments[2]
+    if assignment["reason"] != "preferred_search_reacquire":
+        raise AssertionError(f"expected partial preferred handoff, got {assignment}")
+    if assignment["match_source"] != "partial":
+        raise AssertionError(f"expected partial match source, got {assignment}")
+    if assignment["bank_updated"]:
+        raise AssertionError("partial handoff must not update the full-body gallery")
 
 
 def _assert_gallery_keeps_diverse_templates() -> None:
@@ -590,6 +922,472 @@ def _assert_weak_gallery_is_separate_and_control_safe() -> None:
         raise AssertionError("tiny/area-collapse fragments must never enter either identity gallery")
 
 
+def _geometry_metadata(track_id, bbox, frame_index=1, detector_bbox=None, capture_timestamp=None):
+    x1, y1, x2, y2 = bbox
+    metadata = {
+        "track_id": track_id,
+        "bbox": list(bbox),
+        "center_x_ratio": (x1 + x2) / 1280.0,
+        "area_ratio": (x2 - x1) * (y2 - y1) / (640.0 * 480.0),
+        "control_frame_id": frame_index,
+        "capture_frame_id": frame_index * 2,
+        "is_fresh": True,
+    }
+    if capture_timestamp is not None:
+        metadata["capture_timestamp"] = float(capture_timestamp)
+    if detector_bbox is not None:
+        x1, y1, x2, y2 = detector_bbox
+        metadata.update({
+            "detector_bbox": list(detector_bbox),
+            "detector_center_x_ratio": (x1 + x2) / 1280.0,
+            "detector_area_ratio": (x2 - x1) * (y2 - y1) / (640.0 * 480.0),
+        })
+    return metadata
+
+
+def _geometry_bank(**overrides):
+    config = {
+        "min_confidence": 0.60,
+        "update_interval": 1,
+        "controlled_handoff_enable": True,
+        "controlled_handoff_min_old_track_gap_frames": 1,
+        "controlled_handoff_confirm_frames": 2,
+        "preferred_search_reacquire_confirm_frames": 2,
+    }
+    config.update(overrides)
+    return IdentityBank(IdentityBankConfig(**config))
+
+
+def _assert_handoff_geometry_rejects_implausible_reentry() -> None:
+    anchor = _unit([1.0, 0.0, 0.0])
+    old_bbox = [268.0, 0.0, 588.2, 479.0]
+    new_bbox = [380.5, 187.1, 458.3, 401.5]
+    bank = _geometry_bank()
+    uid = bank.assign(
+        track_id=79, feature=anchor, confidence=0.844, area=153375,
+        frame_index=867, sample_metadata=_geometry_metadata(79, old_bbox, 867),
+    )
+    reference = dict(bank.identities[uid].last_strong_observation)
+    for frame_index in (874, 875, 876):
+        result = bank.assign(
+            track_id=78, feature=_x_axis_feature_at_distance(0.037),
+            confidence=0.622, area=16670, frame_index=frame_index,
+            preferred_uid=uid, preferred_candidate_ok=True,
+            sample_metadata=_geometry_metadata(78, new_bbox, frame_index),
+        )
+        assignment = bank.last_assignments[78]
+        if result != 0 or assignment["reason"] != "handoff_geometry_reject":
+            raise AssertionError(f"the small .037 candidate must not inherit U1: {assignment}")
+        if assignment["reacquire_geometry_ok"] is not False or assignment["instant_reacquire_allowed"]:
+            raise AssertionError("a short-gap area collapse must remain a hard rejection")
+        if bank.identities[uid].last_strong_observation != reference:
+            raise AssertionError("rejected observations must not become the next geometric reference")
+        if len(bank.identities[uid].features) != 1 or 78 in bank.pending_handoffs:
+            raise AssertionError("a repeated rejected box must neither update the gallery nor build a streak")
+        evidence = assignment["match_evidence"]
+        if evidence["winner"]["metadata"]["track_id"] != 79:
+            raise AssertionError("the rejected candidate must retain the actual matched template provenance")
+
+    # A weak-tier internal mapping must not bypass the same strong handoff guard.
+    bank.track_to_uid[78] = uid
+    result = bank.assign(
+        track_id=78, feature=anchor, confidence=0.9, area=16670, frame_index=877,
+        preferred_uid=uid, preferred_candidate_ok=True,
+        sample_metadata=_geometry_metadata(78, new_bbox, 877),
+    )
+    if result != 0 or bank.identities[uid].last_strong_observation != reference:
+        raise AssertionError("a weak-only mapping cannot turn a geometric rejection into a strong observation")
+
+    jump_bank = _geometry_bank()
+    jump_uid = jump_bank.assign(
+        track_id=1, feature=anchor, confidence=0.9, area=10000, frame_index=1,
+        sample_metadata=_geometry_metadata(1, [50, 100, 150, 300]),
+    )
+    jumped = jump_bank.assign(
+        track_id=2, feature=anchor, confidence=0.9, area=10000, frame_index=5,
+        preferred_uid=jump_uid, preferred_candidate_ok=True,
+        sample_metadata=_geometry_metadata(2, [480, 100, 580, 300], 5),
+    )
+    if jumped != 0 or jump_bank.last_assignments[2]["reacquire_geometry_reason"] != "center_jump":
+        raise AssertionError("a strong-looking query on the other side must not bypass UID geometry")
+
+
+def _assert_instant_handoff_requires_trusted_geometry() -> None:
+    anchor = _unit([1.0, 0.0, 0.0])
+    bbox = [200, 40, 400, 440]
+    bank = _geometry_bank()
+    seed_metadata = _geometry_metadata(1, bbox, 1)
+    uid = bank.assign(
+        track_id=1, feature=anchor, confidence=0.9, area=80000,
+        frame_index=1, sample_metadata=seed_metadata,
+    )
+    result = bank.assign(
+        track_id=2, feature=_x_axis_feature_at_distance(0.037), confidence=0.9,
+        area=78000, frame_index=5, preferred_uid=uid, preferred_candidate_ok=True,
+        sample_metadata=_geometry_metadata(2, [205, 45, 405, 435], 5),
+    )
+    assignment = bank.last_assignments[2]
+    if result != uid or not assignment["instant_reacquire_allowed"]:
+        raise AssertionError(f"a recent continuous strong observation should allow instant identity handoff: {assignment}")
+    if assignment["reacquire_geometry_ok"] is not True:
+        raise AssertionError("instant permission must include explicit positive geometry evidence")
+    evidence = assignment["match_evidence"]
+    if len(bank.identities[uid].features) != 1 or assignment["bank_updated"]:
+        raise AssertionError("successful identity handoff must not immediately learn the reacquired crop")
+    if not assignment["template_update_quarantined"]:
+        raise AssertionError("instant identity confirmation still requires template quarantine")
+    if evidence["winner"]["metadata"]["frame_index"] != 1 or evidence["winner"]["index"] != 0:
+        raise AssertionError("winning evidence must refer to the frozen, pre-handoff gallery")
+    if abs(evidence["anchor_distance"] - 0.037) > 1e-5:
+        raise AssertionError("anchor distance must describe the pre-update initial template")
+    if evidence["anchor_metadata"]["control_frame_id"] != 1:
+        raise AssertionError("the initial anchor must carry its image provenance")
+    seed_metadata["bbox"][0] = 9999
+    if evidence["winner"]["metadata"]["bbox"][0] != 200:
+        raise AssertionError("evidence must not alias mutable sample metadata")
+
+    for scenario in ("missing_reference", "missing_current"):
+        fallback = _geometry_bank(
+            controlled_handoff_confirm_frames=1,
+            preferred_search_reacquire_confirm_frames=1,
+        )
+        fallback_uid = fallback.assign(
+            track_id=1, feature=anchor, confidence=0.9, area=80000, frame_index=1,
+            sample_metadata=None if scenario == "missing_reference" else _geometry_metadata(1, bbox),
+        )
+        first_frame = 20 if scenario == "stale_reference" else 5
+        first = fallback.assign(
+            track_id=2, feature=anchor, confidence=0.9, area=80000,
+            frame_index=first_frame, preferred_uid=fallback_uid, preferred_candidate_ok=True,
+            sample_metadata=None if scenario == "missing_current" else _geometry_metadata(2, bbox, first_frame),
+        )
+        if first != 0 or fallback.last_assignments[2]["reacquire_geometry_ok"] is not None:
+            raise AssertionError(f"{scenario} must disable single-frame handoff")
+        second = fallback.assign(
+            track_id=2, feature=anchor, confidence=0.9, area=80000,
+            frame_index=first_frame + 1, preferred_uid=fallback_uid, preferred_candidate_ok=True,
+            sample_metadata=None if scenario == "missing_current" else _geometry_metadata(2, bbox, first_frame + 1),
+        )
+        if second != 0 or fallback.last_assignments[2]["reason"] != "preferred_search_reacquire_geometry_reject":
+            raise AssertionError(f"{scenario} must never bind a preferred search UID without positive geometry")
+
+    # Once the original geometry reference is stale, a strong sole candidate
+    # enters an independent local observation chain.  It binds only on the
+    # second consecutive frame and promotes that frame to the new reference.
+    late = _geometry_bank(
+        preferred_search_reacquire_confirm_frames=1,
+        preferred_search_reacquire_late_candidate_enable=True,
+    )
+    late_uid = late.assign(
+        track_id=1, feature=anchor, confidence=0.9, area=80000, frame_index=1,
+        sample_metadata=_geometry_metadata(1, bbox, 1, capture_timestamp=1.0),
+    )
+    late_first = late.assign(
+        track_id=2, feature=anchor, confidence=0.9, area=80000, frame_index=20,
+        preferred_uid=late_uid, preferred_candidate_ok=True,
+        sample_metadata=_geometry_metadata(2, bbox, 20, capture_timestamp=10.0),
+    )
+    if late_first != 0 or late.last_assignments[2]["reason"] != "preferred_search_late_candidate_wait":
+        raise AssertionError(f"stale candidate must start a late observation chain: {late.last_assignments[2]}")
+    late_second = late.assign(
+        track_id=2, feature=anchor, confidence=0.9, area=80000, frame_index=21,
+        preferred_uid=late_uid, preferred_candidate_ok=True,
+        sample_metadata=_geometry_metadata(2, bbox, 21, capture_timestamp=10.1),
+    )
+    if late_second != late_uid or late.last_assignments[2]["reason"] != "preferred_search_late_reacquire":
+        raise AssertionError(f"two local observations should bind the preferred UID: {late.last_assignments[2]}")
+    if late.last_assignments[2]["reacquire_geometry_reason"] != "late_candidate_local_continuity":
+        raise AssertionError("late handoff must report local continuity evidence")
+    if late.identities[late_uid].last_strong_observation["frame_index"] != 21:
+        raise AssertionError("late handoff must promote the confirmed candidate to the geometry reference")
+
+    # A skipped frame cannot complete the chain, and multiple candidates remain
+    # ambiguous even if their appearance matches the preferred UID.
+    late_gap = _geometry_bank(preferred_search_reacquire_late_candidate_enable=True)
+    gap_uid = late_gap.assign(
+        track_id=1, feature=anchor, confidence=0.9, area=80000, frame_index=1,
+        sample_metadata=_geometry_metadata(1, bbox, 1),
+    )
+    gap_first = late_gap.assign(
+        track_id=2, feature=anchor, confidence=0.9, area=80000, frame_index=20,
+        preferred_uid=gap_uid, preferred_candidate_ok=True,
+        sample_metadata=_geometry_metadata(2, bbox, 20),
+    )
+    gap_reset = late_gap.assign(
+        track_id=2, feature=anchor, confidence=0.9, area=80000, frame_index=22,
+        preferred_uid=gap_uid, preferred_candidate_ok=True,
+        sample_metadata=_geometry_metadata(2, bbox, 22),
+    )
+    if gap_first != 0 or gap_reset != 0 or 2 in late_gap.track_to_uid:
+        raise AssertionError("late confirmation must require adjacent frames")
+
+
+def _assert_opposite_side_strong_search_candidate_uses_local_confirmation() -> None:
+    """A strong candidate may cross the frozen sweep side, but still needs two frames."""
+    anchor = _unit([1.0, 0.0, 0.0])
+    bank = _geometry_bank(
+        preferred_search_reacquire_max_age_sec=0.35,
+        preferred_search_reacquire_confirm_frames=2,
+    )
+    uid = bank.assign(
+        track_id=1,
+        feature=anchor,
+        confidence=0.9,
+        area=80000,
+        frame_index=1,
+        sample_metadata=_geometry_metadata(
+            1, [100, 40, 300, 440], 1, capture_timestamp=1.0
+        ),
+    )
+    candidate_metadata = {
+        **_geometry_metadata(
+            2, [500, 40, 700, 440], 20, capture_timestamp=2.0
+        ),
+        "bbox_quality_tier": "strong",
+        "search_reacquire_context_active": True,
+        "search_direction_compatible": False,
+        "candidate_count": 2,
+        "candidate_score_gap": 0.08,
+    }
+    first = bank.assign(
+        track_id=2,
+        feature=anchor,
+        confidence=0.9,
+        area=80000,
+        frame_index=20,
+        preferred_uid=uid,
+        preferred_candidate_ok=False,
+        sample_metadata=candidate_metadata,
+    )
+    if first != 0 or bank.last_assignments[2]["reason"] != "preferred_search_late_candidate_wait":
+        raise AssertionError(
+            "an opposite-side strong match must start local confirmation, got %s"
+            % bank.last_assignments[2]
+        )
+    candidate_metadata = {
+        **_geometry_metadata(
+            2, [510, 40, 710, 440], 21, capture_timestamp=2.1
+        ),
+        "bbox_quality_tier": "strong",
+        "search_reacquire_context_active": True,
+        "search_direction_compatible": False,
+        "candidate_count": 2,
+        "candidate_score_gap": 0.08,
+    }
+    second = bank.assign(
+        track_id=2,
+        feature=anchor,
+        confidence=0.9,
+        area=80000,
+        frame_index=21,
+        preferred_uid=uid,
+        preferred_candidate_ok=False,
+        sample_metadata=candidate_metadata,
+    )
+    if second != uid or bank.last_assignments[2]["reason"] != "preferred_search_late_reacquire":
+        raise AssertionError(
+            "two continuous opposite-side frames should confirm the UID, got %s"
+            % bank.last_assignments[2]
+        )
+
+    # The side exception must not widen the identity threshold.  A visually
+    # weak match remains rejected even when its box is geometrically valid.
+    weak = bank.assign(
+        track_id=3,
+        feature=_x_axis_feature_at_distance(0.28),
+        confidence=0.9,
+        area=80000,
+        frame_index=22,
+        preferred_uid=uid,
+        preferred_candidate_ok=False,
+        sample_metadata={
+            **_geometry_metadata(3, [520, 40, 720, 440], 22, capture_timestamp=2.2),
+            "bbox_quality_tier": "strong",
+            "search_reacquire_context_active": True,
+            "search_direction_compatible": False,
+        },
+    )
+    if weak != 0 or bank.last_assignments[3]["reason"] != "preferred_search_reacquire_rejected":
+        raise AssertionError(
+            "opposite-side candidates above the preferred distance threshold must reject"
+        )
+
+
+def _assert_detector_geometry_and_rejected_reference_integrity() -> None:
+    anchor = _unit([1.0, 0.0, 0.0])
+    display_bbox = [200, 40, 400, 440]
+    bank = _geometry_bank()
+    uid = bank.assign(
+        track_id=1, feature=anchor, confidence=0.9, area=80000, frame_index=1,
+        sample_metadata=_geometry_metadata(1, display_bbox, 1, [210, 50, 390, 430]),
+    )
+    result = bank.assign(
+        track_id=2, feature=anchor, confidence=0.9, area=80000, frame_index=5,
+        preferred_uid=uid, preferred_candidate_ok=True,
+        sample_metadata=_geometry_metadata(2, display_bbox, 5, [275, 200, 325, 300]),
+    )
+    if result != 0 or bank.last_assignments[2]["reacquire_geometry_reason"] != "area_change":
+        raise AssertionError("an unchanged Kalman display box must not hide a shrunken feature crop")
+    if bank.last_assignments[2]["reacquire_geometry"]["reference"]["geometry_source"] != "detector":
+        raise AssertionError("the reference must prefer detector geometry whenever available")
+
+    reference = dict(bank.identities[uid].last_strong_observation)
+    for frame_index, tier, feature in (
+        (6, "weak", anchor), (7, "reject", anchor), (8, "strong", _x_axis_feature_at_distance(0.8)),
+    ):
+        result = bank.assign(
+            track_id=1, feature=feature, confidence=0.9, area=80000, frame_index=frame_index,
+            bbox_quality_ok=tier == "strong", bbox_quality_tier=tier,
+            bbox_quality_reason="" if tier == "strong" else "edge_touch>2",
+            sample_metadata=_geometry_metadata(1, display_bbox, frame_index, [210, 50, 390, 430]),
+        )
+        if result != 0 or bank.identities[uid].last_strong_observation != reference:
+            raise AssertionError("weak/quality/appearance rejections must not refresh the trusted reference")
+        if bank.last_assignments[1]["match_evidence"] is None:
+            raise AssertionError("mapped rejections must retain their feature-match evidence")
+
+    mapped = _geometry_bank()
+    mapped_uid = mapped.assign(
+        track_id=1, feature=anchor, confidence=0.9, area=80000, frame_index=1,
+        sample_metadata=_geometry_metadata(1, display_bbox),
+    )
+    trusted_reference = dict(mapped.identities[mapped_uid].last_strong_observation)
+    mapped_result = mapped.assign(
+        track_id=1, feature=_x_axis_feature_at_distance(0.037), confidence=0.9,
+        area=5000, frame_index=5, sample_metadata=_geometry_metadata(1, [275, 200, 325, 300], 5),
+    )
+    assignment = mapped.last_assignments[1]
+    if mapped_result != mapped_uid or assignment["reason"] != "skip_update_geometry":
+        raise AssertionError("ordinary mapped output may be retained, but anomalous geometry must block learning")
+    if assignment["bank_updated"] or len(mapped.identities[mapped_uid].features) != 1:
+        raise AssertionError("a geometry-rejected mapped query must not become a strong template")
+    if mapped.identities[mapped_uid].last_strong_observation != trusted_reference:
+        raise AssertionError("a geometry-rejected mapped query must not replace the trusted reference")
+
+
+def _assert_match_evidence_tracks_actual_uid_and_weak_winner() -> None:
+    query = _unit([1.0, 0.0, 0.0])
+    bank, preferred_uid, best_uid = _preferred_search_bank(0.25, 0.21)
+    bank.assign(
+        track_id=3, feature=query, confidence=0.9, area=1000, frame_index=5,
+        preferred_uid=preferred_uid, preferred_candidate_ok=True,
+    )
+    assignment = bank.last_assignments[3]
+    evidence = assignment["match_evidence"]
+    if assignment["best_uid"] != best_uid or evidence["matched_uid"] != preferred_uid:
+        raise AssertionError("preferred evidence must describe the selected UID, not the global nearest UID")
+    if abs(evidence["anchor_distance"] - 0.25) > 1e-5:
+        raise AssertionError("the preferred UID initial-anchor distance is wrong")
+    rejected_bank, rejected_uid, nearest_uid = _preferred_search_bank(0.37, 0.21)
+    rejected_bank.assign(
+        track_id=3, feature=query, confidence=0.9, area=1000, frame_index=5,
+        preferred_uid=rejected_uid, preferred_candidate_ok=True,
+    )
+    rejected = rejected_bank.last_assignments[3]
+    if rejected["best_uid"] != nearest_uid or rejected["match_evidence"]["matched_uid"] != rejected_uid:
+        raise AssertionError("a rejected preferred candidate still needs the locked UID evidence")
+    if abs(rejected["distance"] - 0.37) > 1e-5 or abs(rejected["second_distance"] - 0.21) > 1e-5:
+        raise AssertionError("rejected preferred distances must not be mislabeled with the global winner")
+
+    weak_bank = _geometry_bank()
+    uid = weak_bank.assign(
+        track_id=1, feature=_x_axis_feature_at_distance(0.2), confidence=0.9,
+        area=1000, frame_index=1,
+    )
+    entry = weak_bank.identities[uid]
+    entry.add_weak(query, 2, 8, diversity_min_distance=0.0, metadata={"track_id": 10, "quality_weight": 0.0})
+    entry.add_weak(
+        _x_axis_feature_at_distance(0.01), 3, 8, diversity_min_distance=0.0,
+        metadata={"track_id": 11, "quality_weight": 1.0},
+    )
+    weak_bank.assign(
+        track_id=1, feature=query, confidence=0.9, area=1000, frame_index=4,
+        bbox_quality_ok=False, bbox_quality_tier="weak", bbox_quality_reason="aspect<0.18",
+    )
+    evidence = weak_bank.last_assignments[1]["match_evidence"]
+    winner = evidence["winner"]
+    if winner["tier"] != "weak" or winner["index"] != 1 or winner["metadata"]["track_id"] != 11:
+        raise AssertionError("the weak winner must include its quality penalty, not just raw cosine distance")
+    if abs(evidence["weak_distance"]) > 1e-5 or abs(evidence["weak_weighted_distance"] - 0.01) > 1e-5:
+        raise AssertionError("raw and penalized weak distances must be separately visible")
+    if len(evidence["nearest_samples"]) > 3:
+        raise AssertionError("match evidence must keep at most three neighbours")
+
+    replacing = _geometry_bank(max_features=2)
+    replacing_uid = replacing.assign(
+        track_id=1, feature=query, confidence=0.9, area=1000, frame_index=1,
+    )
+    replacing.assign(
+        track_id=1, feature=_x_axis_feature_at_distance(0.05), confidence=0.9,
+        area=1000, frame_index=2,
+    )
+    replacing.assign(
+        track_id=1, feature=_x_axis_feature_at_distance(0.20), confidence=0.9,
+        area=1000, frame_index=3,
+    )
+    replaced_evidence = replacing.last_assignments[1]["match_evidence"]
+    if not replacing.last_assignments[1]["bank_updated"]:
+        raise AssertionError("the replacement test must exercise a real gallery change")
+    if replacing.identities[replacing_uid].feature_metadata[1]["frame_index"] != 3:
+        raise AssertionError("the redundant non-anchor should have been replaced on frame 3")
+    if replaced_evidence["winner"]["metadata"]["frame_index"] != 2:
+        raise AssertionError("winner metadata must survive replacement of its gallery slot")
+
+
+def _assert_match_evidence_logging_is_sampled_and_vector_free() -> None:
+    bank = _geometry_bank(update_interval=5)
+    feature = _unit([1.0, 0.0, 0.0])
+    bbox = [200, 40, 400, 440]
+    bank.assign(
+        track_id=1, feature=feature, confidence=0.9, area=80000, frame_index=1,
+        sample_metadata=_geometry_metadata(1, bbox),
+    )
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    log = logging.getLogger("PersonTracker")
+    previous_level = log.level
+    log.setLevel(logging.INFO)
+    log.addHandler(handler)
+    try:
+        for frame_index in (2, 3, 5):
+            metadata = _geometry_metadata(1, bbox, frame_index)
+            metadata["feature_vector"] = np.arange(512)
+            bank.assign(
+                track_id=1, feature=feature, confidence=0.9, area=80000,
+                frame_index=frame_index, bbox_quality_ok=frame_index != 3,
+                bbox_quality_reason="edge_touch>2" if frame_index == 3 else "",
+                sample_metadata=metadata,
+            )
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(previous_level)
+    records = [
+        json.loads(line.split("reid_match_evidence ", 1)[1])
+        for line in stream.getvalue().splitlines() if "reid_match_evidence " in line
+    ]
+    if [record["frame_index"] for record in records] != [3, 5]:
+        raise AssertionError("ordinary mapped evidence must be sampled, but quality rejection must be logged")
+    if "feature_vector" in stream.getvalue() or not all(record["match_evidence"] for record in records):
+        raise AssertionError("parseable evidence must include provenance without serializing feature vectors")
+
+    nonfinite = _geometry_metadata(1, bbox, 10)
+    nonfinite["capture_timestamp"] = float("nan")
+    nonfinite["detector_confidence"] = float("inf")
+    result = bank.assign(
+        track_id=1, feature=feature, confidence=0.9, area=80000,
+        frame_index=10, sample_metadata=nonfinite,
+    )
+    if result != 1:
+        raise AssertionError("non-finite diagnostic metadata must not interrupt a valid assignment")
+    with patch("rk_vision.identity_bank.json.dumps", side_effect=TypeError("diagnostic serialization")):
+        result = bank.assign(
+            track_id=1, feature=feature, confidence=0.9, area=80000,
+            frame_index=15, sample_metadata=_geometry_metadata(1, bbox, 15),
+        )
+    if result != 1:
+        raise AssertionError("diagnostic serialization errors must not interrupt the tracking path")
+
+
 def main() -> int:
     bank = IdentityBank(
         IdentityBankConfig(
@@ -675,9 +1473,19 @@ def main() -> int:
     _assert_reacquire_uses_last_seen_frame()
     _assert_exclusive_claim_and_mapped_quality_guards()
     _assert_controlled_handoff_requires_consecutive_matches()
+    _assert_center_jump_releases_stale_claim()
     _assert_preferred_search_reacquire_rules()
+    _assert_search_candidate_competition_uses_confidence_gap()
+    _assert_preferred_search_blocks_global_fallback()
+    _assert_partial_search_reacquire_uses_torso_descriptor()
     _assert_gallery_keeps_diverse_templates()
     _assert_weak_gallery_is_separate_and_control_safe()
+    _assert_handoff_geometry_rejects_implausible_reentry()
+    _assert_instant_handoff_requires_trusted_geometry()
+    _assert_opposite_side_strong_search_candidate_uses_local_confirmation()
+    _assert_detector_geometry_and_rejected_reference_integrity()
+    _assert_match_evidence_tracks_actual_uid_and_weak_winner()
+    _assert_match_evidence_logging_is_sampled_and_vector_free()
     return 0
 
 

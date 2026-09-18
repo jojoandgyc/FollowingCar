@@ -23,7 +23,136 @@ from car_control_modular.control_types import (
 from car_control_modular.controllers import FollowPolicyConfig, FollowSafetyController
 
 
+def check_lateral_refresh_policy() -> None:
+    cfg = FollowPolicyConfig(
+        visible_steering_pid_enable=True,
+        visible_steering_pid_camera_hfov_deg=60.0,
+        visible_steering_pid_camera_latency_sec=0.0,
+        visible_steering_pid_deadband_deg=3.0,
+        visible_steering_pid_outer_kp_per_sec=1.50,
+        visible_steering_pid_outer_kd_sec=0.0,
+        visible_steering_pid_rate_kp_rpm_per_dps=0.32,
+        visible_steering_pid_rate_ki_rpm_per_deg=0.0,
+        visible_steering_pid_error_filter_alpha=1.0,
+        visible_steering_pid_target_rate_feedforward_gain=0.30,
+        visible_steering_pid_target_rate_feedforward_max_dps=8.0,
+        visible_steering_pid_target_speed_match_max_closing_dps=8.0,
+        visible_steering_pid_startup_kick_error_deg=0.0,
+        visible_steering_pid_startup_kick_rpm=3.0,
+        visible_steering_pid_startup_kick_max_sec=0.10,
+        visible_steering_pid_startup_kick_release_yaw_rate_dps=2.0,
+        center_left_ratio=0.45,
+        center_right_ratio=0.55,
+        steer_release_left_ratio=0.47,
+        steer_release_right_ratio=0.53,
+        parked_recenter_min_rpm=5,
+        parked_recenter_max_rpm=14,
+        near_distance_rotation_only_max_rpm=10,
+        near_distance_disable_rate_feedforward=True,
+    )
+
+    def parked_sample(controller, x_ratio, now, *, yaw=0.0, rate=None, limit=10.0):
+        cx = x_ratio * 640.0
+        target = PersonTarget((cx - 40, 80, cx + 40, 430), 501, 0.9, 28000)
+        action = controller._pid_action_for_parked_target(
+            target,
+            SensorFrame(
+                width=640,
+                height=480,
+                persons=[target],
+                distance_m=1.50,
+                steering_feedback=SteeringFeedback(
+                    timestamp=now, yaw_rate_right_dps=yaw, trustworthy=True,
+                ),
+            ),
+            now,
+            "right" if x_ratio > 0.5 else "left",
+            target_image_rate_dps=rate,
+            max_correction_rpm=limit,
+            near_distance_mode=True,
+        )
+        return action, controller.last_steering_pid_result
+
+    # A near-mode decision and later encoder ticks must keep the same
+    # feedforward and closing-rate policy. Exercise each side and an image
+    # rate that would otherwise activate each global constraint.
+    for side in (-1, 1):
+        for image_rate in (0.0, 10.0):
+            controller = FollowSafetyController(cfg)
+            x_ratio = 0.5 + side * 0.25
+            _action, initial = parked_sample(
+                controller, x_ratio, 10.0, rate=side * image_rate,
+            )
+            assert initial is not None
+            for tick in (10.04, 10.08, 10.12):
+                result = controller.refresh_parked_lateral_pid(
+                    x_ratio=x_ratio,
+                    base_rpm=initial.base_rpm,
+                    feedback=SteeringFeedback(
+                        timestamp=tick, yaw_rate_right_dps=0.0, trustworthy=True,
+                    ),
+                    now=tick,
+                    target_image_rate_dps=side * image_rate,
+                    max_correction_rpm=initial.correction_limit_rpm,
+                    near_distance_mode=True,
+                )
+                assert result.target_rate_feedforward_dps == 0.0, result
+                assert not result.target_speed_match_limited, result
+                assert result.desired_yaw_rate_dps == initial.desired_yaw_rate_dps, result
+            # Explicit hold remains zero for this same bbox, even after the
+            # kick timeout. A fresh nonzero intent can subsequently start.
+            for tick in (10.16, 10.30):
+                held = controller.refresh_parked_lateral_pid(
+                    x_ratio=x_ratio, base_rpm=17, feedback=None, now=tick,
+                    target_image_rate_dps=side * 10.0,
+                    near_distance_mode=True, hold_zero=True,
+                )
+                assert held.correction_rpm == 0 and not held.startup_kick_active, held
+            resumed = controller.refresh_parked_lateral_pid(
+                x_ratio=x_ratio, base_rpm=17, feedback=None, now=10.34,
+                near_distance_mode=True,
+            )
+            assert resumed.correction_rpm * side > 0, resumed
+
+    # Outward image motion can select a side while the near-mode position
+    # loop requests zero. That is not permission for a startup kick.
+    controller = FollowSafetyController(cfg)
+    action, centered = parked_sample(controller, 0.54, 20.0, rate=8.0)
+    assert action is None and centered is not None, (action, centered)
+    assert centered.desired_yaw_rate_dps == 0.0 and centered.correction_rpm == 0, centered
+    assert not centered.startup_kick_active, centered
+    centered_refresh = controller.refresh_parked_lateral_pid(
+        x_ratio=0.54, base_rpm=17, feedback=None, now=20.04,
+        target_image_rate_dps=8.0, near_distance_mode=True,
+    )
+    assert centered_refresh.correction_rpm == 0 and not centered_refresh.startup_kick_active
+    ordinary_refresh = FollowSafetyController(cfg).refresh_parked_lateral_pid(
+        x_ratio=0.75, base_rpm=17, feedback=None, now=21.0,
+        target_image_rate_dps=10.0,
+    )
+    assert ordinary_refresh.target_rate_feedforward_dps == 3.0, ordinary_refresh
+    # At 15 degrees the approach phase allows 12 dps relative closing speed;
+    # target rate 10 + closing 12 = 22, so the 21 dps PID need not be clipped.
+    assert abs(ordinary_refresh.target_speed_match_limit_dps - 22.0) < 1e-6, ordinary_refresh
+    assert abs(ordinary_refresh.desired_yaw_rate_dps) <= 22.0, ordinary_refresh
+
+    # The 5 RPM launch floor ends as soon as the encoder confirms motion;
+    # fine tracking retains 1 RPM and even launch must respect a 2 RPM cap.
+    for yaw, limit, expected in ((0.0, 10.0, 5), (2.5, 10.0, 1), (0.0, 2.0, 2)):
+        controller = FollowSafetyController(cfg)
+        action, initial = parked_sample(controller, 0.58, 30.0, yaw=yaw, limit=limit)
+        assert action is not None and initial.correction_rpm == expected, (action, initial)
+        refreshed = controller.refresh_parked_lateral_pid(
+            x_ratio=0.58, base_rpm=initial.base_rpm,
+            feedback=SteeringFeedback(timestamp=30.04, yaw_rate_right_dps=yaw, trustworthy=True),
+            now=30.04, max_correction_rpm=initial.correction_limit_rpm,
+            near_distance_mode=True,
+        )
+        assert refreshed.correction_rpm == expected, refreshed
+
+
 def main() -> int:
+    check_lateral_refresh_policy()
     cfg = FollowPolicyConfig(
         max_forward_percent=20,
         forward_speed_le_1_3_percent=12,
@@ -933,10 +1062,10 @@ def main() -> int:
         tracking_floor is None
         or tracking_floor.kind != "rotate_right"
         or tracking_floor_result is None
-        or tracking_floor_result.correction_rpm != 4
+        or tracking_floor_result.correction_rpm != 1
     ):
         raise AssertionError(
-            "the 4rpm floor must remain active for a same-direction tracking command: "
+            "ordinary tracking must retain the PID's 1 RPM output without a launch floor: "
             f"{tracking_floor}, {tracking_floor_result}"
         )
 
@@ -3025,6 +3154,72 @@ def main() -> int:
     if "steer_right" not in replay_kinds or "steer_left" not in replay_kinds:
         raise AssertionError(f"cross-center replay should retain low-speed correction on both sides: {replay_kinds}")
 
+    # A target that has just entered the center band must not trigger a
+    # counter-steer solely because the encoder still reports residual yaw.
+    # The latest camera position wins; lateral output resumes only after the
+    # target leaves the band.
+    center_hold_controller = FollowSafetyController(
+        FollowPolicyConfig(
+            visible_steering_pid_enable=True,
+            visible_steering_pid_deadband_deg=0.0,
+            visible_steering_pid_visual_direction_guard_enabled=False,
+            visible_steering_pid_startup_kick_error_deg=0.0,
+            visible_steering_pid_startup_kick_rpm=3.0,
+            visible_steering_pid_startup_kick_max_sec=0.10,
+            initial_target_confirm_frames=1,
+            distance_parking_enable=False,
+            center_left_ratio=0.45,
+            center_right_ratio=0.55,
+            steer_release_left_ratio=0.45,
+            steer_release_right_ratio=0.55,
+        )
+    )
+    center_hold_target = PersonTarget(
+        (292, 120, 392, 430), track_id=23, confidence=0.9, area=31000
+    )
+    center_hold_action = center_hold_controller._pid_action_for_visible_target(
+        center_hold_target,
+        SensorFrame(
+            width=640,
+            height=480,
+            persons=[center_hold_target],
+            distance_m=2.0,
+            steering_feedback=SteeringFeedback(
+                timestamp=time.monotonic(),
+                yaw_rate_right_dps=-12.0,
+                trustworthy=True,
+            ),
+        ),
+        time.monotonic(),
+    )
+    if (
+        center_hold_action is None
+        or center_hold_action.kind != "forward"
+        or center_hold_action.steer_correction_rpm != 0
+        or center_hold_action.reason != "visual_pid_center_hold"
+    ):
+        raise AssertionError(
+            "center-band target must suppress residual-yaw counter-steer: "
+            f"{center_hold_action}, result={center_hold_controller.last_steering_pid_result}"
+        )
+    if center_hold_controller.last_steering_pid_result.startup_kick_active:
+        raise AssertionError("initial center hold must not start a kick")
+    for tick in (40.0, 40.04, 40.16):
+        held = center_hold_controller.refresh_visible_lateral_pid(
+            x_ratio=342.0 / 640.0,
+            base_rpm=20,
+            feedback=SteeringFeedback(timestamp=tick, yaw_rate_right_dps=-12.0, trustworthy=True),
+            now=tick,
+            target_image_rate_dps=8.0,
+        )
+        if held.correction_rpm != 0 or held.startup_kick_active:
+            raise AssertionError(f"center refresh must retain zero despite startup/image motion: {held}")
+    held_outside = center_hold_controller.refresh_visible_lateral_pid(
+        x_ratio=0.70, base_rpm=20, feedback=None, now=40.20, hold_zero=True,
+    )
+    if held_outside.correction_rpm != 0 or held_outside.startup_kick_active:
+        raise AssertionError(f"explicit visible zero intent must survive refresh: {held_outside}")
+
     no_distance_history_controller = FollowSafetyController(
         FollowPolicyConfig(
             center_left_ratio=0.42,
@@ -3479,6 +3674,65 @@ def main() -> int:
             "short missing Depth must keep the current visual action: "
             f"{missing_depth_noop}"
         )
+
+    # A fused hold with an encoder-predicted distance may continue briefly at
+    # the conservative depth hold speed, without resetting the PID immediately.
+    hold_controller = FollowSafetyController(depth_only_cfg)
+    hold_controller.active_target_id = 31
+    hold_controller._has_seen_person = True
+    hold_controller.decide(90, depth_only_frame(2.20), longitudinal_only=True)
+    held_frame = SensorFrame(
+        width=640,
+        height=480,
+        persons=[depth_person],
+        obstacles=ObstacleState(),
+        distance_m=2.18,
+        distance_state=DistanceState(
+            source="vision_depth",
+            used_distance_m=2.18,
+            source_detail="insufficient_depth_pixels_fused_visual_encoder_hold",
+            sample_age_sec=0.05,
+            fusion_confidence=0.46,
+        ),
+    )
+    short_hold = hold_controller.decide(91, held_frame, longitudinal_only=True)
+    if (
+        not short_hold.actions
+        or short_hold.actions[0].kind != "forward"
+        or short_hold.actions[0].speed_percent > 20
+        or short_hold.reason != "longitudinal_distance_short_hold"
+    ):
+        raise AssertionError(f"short fused Depth hold should keep a capped forward action: {short_hold}")
+
+    # A rate-guarded jump must not feed its fused distance into the normal PID,
+    # but it may use the last trusted range for the same short capped hold.
+    jump_hold_frame = replace(
+        held_frame,
+        distance_m=3.02,
+        distance_state=replace(
+            held_frame.distance_state,
+            used_distance_m=3.02,
+            source_detail="distance_jump_rate_guard_hold_fused_visual_encoder_hold",
+            fusion_confidence=0.53,
+        ),
+    )
+    jump_hold = hold_controller.decide(92, jump_hold_frame, longitudinal_only=True)
+    if (
+        not jump_hold.actions
+        or jump_hold.actions[0].kind != "forward"
+        or jump_hold.actions[0].speed_percent > 20
+        or jump_hold.reason != "longitudinal_distance_short_hold"
+    ):
+        raise AssertionError(
+            "rate-guarded fused distance must use only capped last-range hold: "
+            f"{jump_hold}"
+        )
+    if abs(float(hold_controller._last_target_distance_m) - 2.20) > 1e-6:
+        raise AssertionError(
+            "held/fused depth must not replace the last trusted distance anchor: "
+            f"{hold_controller._last_target_distance_m}"
+        )
+
     forward_depth_only._last_target_distance_at = time.monotonic() - 1.0
     missing_depth_stop = forward_depth_only.decide(
         92,

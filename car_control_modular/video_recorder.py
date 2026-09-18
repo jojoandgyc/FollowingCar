@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+
+from .video_follow_telemetry import FollowRecordingView
+from .video_depth_overlay import DepthVideoView, draw_depth_overlay
 
 
 @dataclass(frozen=True)
@@ -19,6 +24,13 @@ class VideoRecorderConfig:
     # Detection metadata arrives after the camera frame has been captured.
     # Waiting happens only in the recorder thread, never in control or capture.
     overlay_wait_sec: float = 0.25
+    # Diagnostic text is translucent so the camera image remains visible when
+    # several labels occupy the same area.
+    overlay_text_alpha: float = 0.62
+    # Only the video worker uses this encoder; never changes global OpenCV
+    # thread settings shared by the control/vision pipeline.
+    fast_mjpeg: bool = True
+    jpeg_quality: int = 90
 
 
 @dataclass(frozen=True)
@@ -28,6 +40,48 @@ class _QueuedFrame:
     control_frame_id: Optional[int]
     monotonic_sec: float
     unix_sec: float
+    wheel_feedback: Any = None
+    follow_snapshot: Any = None
+    linear_timing: Any = None
+
+
+@dataclass(frozen=True)
+class VideoWheelOverlay:
+    left_rpm: Optional[float] = None
+    right_rpm: Optional[float] = None
+    sample_timestamp: Optional[float] = None
+    age_ms: Optional[float] = None
+    status: str = "missing"
+    yaw_rate_dps: Optional[float] = None
+
+    @classmethod
+    def from_feedback(cls, feedback, capture_timestamp):
+        if feedback is None:
+            return cls()
+        try:
+            stamp = float(feedback.timestamp)
+            left = float(feedback.left_forward_rpm)
+            right = float(feedback.right_forward_rpm)
+            age = (float(capture_timestamp)-stamp)*1000.
+            if not all(math.isfinite(v) for v in (stamp, left, right, age)) or stamp <= 0:
+                return cls(status="invalid")
+            # Never paint a later sample onto an earlier captured image.
+            if age < 0:
+                return cls(sample_timestamp=stamp, age_ms=age, status="future")
+            status = ("untrusted" if not feedback.trustworthy else
+                      "stale" if age > 150. else "fresh")
+            yaw = getattr(feedback, 'yaw_rate_right_dps', None)
+            yaw = None if yaw is None or not math.isfinite(float(yaw)) else float(yaw)
+            return cls(left, right, stamp, age, status, yaw)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return cls(status="invalid")
+
+    def label(self):
+        values = ("L n/a  R n/a" if self.left_rpm is None or self.right_rpm is None else
+                  f"L {self.left_rpm:+.1f}  R {self.right_rpm:+.1f}")
+        age = "n/a" if self.age_ms is None else f"{self.age_ms:.0f}ms"
+        yaw = 'n/a' if self.yaw_rate_dps is None else f'{self.yaw_rate_dps:+.1f}'
+        return f"WHEEL {values} RPM  {self.status.upper()} AGE {age} YAW {yaw}dps"
 
 
 @dataclass(frozen=True)
@@ -65,6 +119,9 @@ class VideoControlOverlay:
     requested_rpm: int = 0
     yaw_rate_dps: Optional[float] = None
     result_age_ms: float = 0.0
+    target_distance_m: Optional[float] = None
+    distance_source: str = "none"
+    distance_detail: str = ""
     search_state: str = "none"
     search_direction: Optional[str] = None
     decision_reason: str = "none"
@@ -86,6 +143,7 @@ class AsyncVideoRecorder:
         *,
         cv2_module: Any,
         logger: Optional[logging.Logger] = None,
+        depth_sample_provider=None,
     ) -> None:
         self.config = config
         self._cv2 = cv2_module
@@ -106,6 +164,12 @@ class AsyncVideoRecorder:
         self._overlays: dict[int, VideoFrameOverlay] = {}
         self._submitted_capture_ids: set[int] = set()
         self._written_capture_ids: set[int] = set()
+        self._sharpness_error_logged = False
+        self._depth_sample_provider = depth_sample_provider
+        self._depth_overlay_error_logged = False
+        self._recording_timings = deque(maxlen=120)
+        self._recording_timing_last_log = 0.0
+        self._last_seen_capture_id = None
 
     @property
     def index_path(self) -> str:
@@ -136,6 +200,9 @@ class AsyncVideoRecorder:
         control_frame_index: Optional[int] = None,
         monotonic_sec: Optional[float] = None,
         unix_sec: Optional[float] = None,
+        wheel_feedback: Any = None,
+        follow_snapshot: Any = None,
+        linear_timing: Any = None,
     ) -> bool:
         if self._closing.is_set() or self._error is not None:
             return False
@@ -144,13 +211,21 @@ class AsyncVideoRecorder:
             if control_frame_index is None:
                 raise ValueError("capture_frame_id is required")
             capture_frame_id = int(control_frame_index)
+        self._last_seen_capture_id = int(capture_frame_id)
+        # Skip the RGB copy when already full. Capture never waits for encode.
+        if self._queue.full():
+            return self._drop_frame(int(capture_frame_id))
         item = _QueuedFrame(
             image=image.copy(),
             capture_frame_id=int(capture_frame_id),
             control_frame_id=(None if control_frame_id is None else int(control_frame_id)),
             monotonic_sec=float(time.monotonic() if monotonic_sec is None else monotonic_sec),
             unix_sec=float(time.time() if unix_sec is None else unix_sec),
+            wheel_feedback=wheel_feedback,
+            follow_snapshot=follow_snapshot,
+            linear_timing=linear_timing,
         )
+        self._last_seen_capture_id = int(item.capture_frame_id)
         with self._overlay_condition:
             self._submitted_capture_ids.add(int(item.capture_frame_id))
         try:
@@ -160,17 +235,16 @@ class AsyncVideoRecorder:
         except queue.Full:
             with self._overlay_condition:
                 self._submitted_capture_ids.discard(int(item.capture_frame_id))
-            self._dropped += 1
-            now = time.monotonic()
-            if now - self._last_drop_log_ts >= 1.0:
-                self._last_drop_log_ts = now
-                self._logger.warning(
-                    "Camera recorder queue full: dropped=%d queued=%d output=%s",
-                    self._dropped,
-                    self._queue.qsize(),
-                    self.config.output_path,
-                )
-            return False
+            return self._drop_frame(int(item.capture_frame_id))
+
+    def _drop_frame(self, capture_id):
+        self._dropped += 1
+        now = time.monotonic()
+        if now-self._last_drop_log_ts >= 1.:
+            self._last_drop_log_ts = now
+            self._logger.warning("Camera recorder queue full: dropped=%d queued=%d capture=%d output=%s",
+                                 self._dropped, self._queue.qsize(), capture_id, self.config.output_path)
+        return False
 
     def update_overlay(
         self,
@@ -247,12 +321,16 @@ class AsyncVideoRecorder:
     def _run(self) -> None:
         writer = None
         index_file = None
+        first_capture_timestamp = None
+        previous_capture_id = None
+        backend = "opencv"
         try:
             while not self._closing.is_set() or not self._queue.empty():
                 try:
                     item = self._queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
+                dequeue_time = time.monotonic()
 
                 if writer is None:
                     height, width = int(item.image.shape[0]), int(item.image.shape[1])
@@ -261,12 +339,23 @@ class AsyncVideoRecorder:
                     fourcc = str(self.config.fourcc or "MJPG").upper()
                     if len(fourcc) != 4:
                         raise ValueError(f"video recorder fourcc must have four characters: {fourcc!r}")
-                    writer = self._cv2.VideoWriter(
-                        str(output_path),
-                        self._cv2.VideoWriter_fourcc(*fourcc),
-                        max(1.0, float(self.config.fps)),
-                        (width, height),
-                    )
+                    if (self.config.fast_mjpeg and fourcc == "MJPG"
+                            and output_path.suffix.lower() == ".avi"
+                            and hasattr(self._cv2, "imencode")):
+                        try:
+                            from .fast_mjpeg_writer import FastMjpegWriter
+                            writer = FastMjpegWriter(output_path, max(1., float(self.config.fps)),
+                                                     (width,height), self._cv2, self.config.jpeg_quality)
+                            backend = writer.backend_name
+                        except Exception as exc:
+                            self._logger.warning("Fast JPEG recorder unavailable, using OpenCV: %s", exc)
+                    if writer is None:
+                        writer = self._cv2.VideoWriter(
+                            str(output_path),
+                            self._cv2.VideoWriter_fourcc(*fourcc),
+                            max(1.0, float(self.config.fps)),
+                            (width, height),
+                        )
                     if not writer.isOpened():
                         raise RuntimeError(f"failed to open camera video output: {output_path}")
                     index_file = open(self.index_path, "w", newline="", buffering=1, encoding="utf-8")
@@ -284,7 +373,26 @@ class AsyncVideoRecorder:
                             "requested_rpm",
                             "yaw_rate_dps",
                             "result_age_ms",
+                            "target_distance_m",
+                            "distance_source",
+                            "distance_detail",
                             "decision_reason",
+                            "sharpness",
+                            "wheel_left_forward_rpm",
+                            "wheel_right_forward_rpm",
+                            "wheel_feedback_monotonic_sec",
+                            "wheel_feedback_age_ms",
+                            "wheel_feedback_status",
+                            "wheel_feedback_yaw_rate_dps",
+                            *FollowRecordingView.csv_columns(),
+                            "depth_overlay_status", "depth_overlay_skew_ms",
+                            "depth_overlay_sample_timestamp", "depth_overlay_uid", "depth_overlay_detail",
+                            "depth_overlay_roi_capture_id",
+                            "depth_overlay_regions_json",
+                            "recording_time_sec", "recording_capture_gap",
+                            "recording_queue_age_ms", "recording_wait_ms", "recording_sharpness_ms",
+                            "recording_prepare_ms", "recording_draw_ms", "recording_encode_write_ms",
+                            "recording_queue_size", "recording_dropped_total", "recording_backend",
                         ]
                     )
                     self._logger.info(
@@ -296,20 +404,37 @@ class AsyncVideoRecorder:
                         float(self.config.fps),
                         fourcc,
                     )
+                    first_capture_timestamp = item.monotonic_sec
+                    self._logger.info("Camera recording backend=%s jpeg_quality=%d text=LINE_8",
+                                      backend, self.config.jpeg_quality)
 
                 video_frame_number = self._written + 1
+                wait_start = time.monotonic()
                 overlay = self._wait_for_overlay(
                     item.capture_frame_id,
                     item.monotonic_sec,
                 )
-                writer.write(
-                    self._annotate_frame(
-                        item.image,
-                        video_frame_number,
-                        item.capture_frame_id,
-                        overlay,
-                    )
+                wait_end = time.monotonic()
+                sharpness = self._measure_sharpness(item.image)
+                sharpness_end = time.monotonic()
+                wheels = VideoWheelOverlay.from_feedback(item.wheel_feedback, item.monotonic_sec)
+                follow = FollowRecordingView.from_snapshot(
+                    item.follow_snapshot, item.linear_timing, item.monotonic_sec)
+                depth_view = self._depth_view(item.capture_frame_id, item.monotonic_sec,
+                                              overlay.control.selected_target_id)
+                prepare_end = time.monotonic()
+                annotated = self._annotate_frame(
+                    item.image, video_frame_number, item.capture_frame_id, overlay,
+                    sharpness=sharpness, wheels=wheels, follow=follow, depth_view=depth_view,
+                    capture_elapsed_sec=item.monotonic_sec-first_capture_timestamp,
                 )
+                draw_end = time.monotonic()
+                writer.write(annotated)
+                encode_end = time.monotonic()
+                timings = [(dequeue_time-item.monotonic_sec)*1000,
+                           (wait_end-wait_start)*1000, (sharpness_end-wait_end)*1000,
+                           (prepare_end-sharpness_end)*1000, (draw_end-prepare_end)*1000,
+                           (encode_end-draw_end)*1000]
                 control = overlay.control
                 csv_writer.writerow(
                     [
@@ -328,9 +453,29 @@ class AsyncVideoRecorder:
                         control.requested_rpm,
                         "" if control.yaw_rate_dps is None else f"{control.yaw_rate_dps:.3f}",
                         f"{control.result_age_ms:.3f}",
+                        "" if control.target_distance_m is None else f"{control.target_distance_m:.3f}",
+                        control.distance_source,
+                        control.distance_detail,
                         control.decision_reason,
+                        "" if sharpness is None else f"{sharpness:.3f}",
+                        "" if wheels.left_rpm is None else f"{wheels.left_rpm:.3f}",
+                        "" if wheels.right_rpm is None else f"{wheels.right_rpm:.3f}",
+                        "" if wheels.sample_timestamp is None else f"{wheels.sample_timestamp:.6f}",
+                        "" if wheels.age_ms is None else f"{wheels.age_ms:.3f}",
+                        wheels.status,
+                        "" if wheels.yaw_rate_dps is None else f"{wheels.yaw_rate_dps:.3f}",
+                        *follow.csv_values(),
+                        *depth_view.csv_values(),
+                        f"{item.monotonic_sec-first_capture_timestamp:.6f}",
+                        0 if previous_capture_id is None else max(0,item.capture_frame_id-previous_capture_id-1),
+                        *(f"{v:.3f}" for v in timings), self._queue.qsize(), self._dropped, backend,
                     ]
                 )
+                self._recording_timings.append((*timings, (time.monotonic()-encode_end)*1000))
+                if encode_end-self._recording_timing_last_log >= 5.:
+                    self._recording_timing_last_log = encode_end
+                    self._log_recording_timings(backend)
+                previous_capture_id = item.capture_frame_id
                 self._written += 1
                 with self._overlay_condition:
                     self._written_capture_ids.add(int(item.capture_frame_id))
@@ -342,10 +487,15 @@ class AsyncVideoRecorder:
             self._logger.error("Camera recording disabled after writer failure: %s", exc)
         finally:
             if writer is not None:
-                writer.release()
+                try:
+                    writer.release()
+                except Exception as exc:
+                    self._error = self._error or exc
+                    self._logger.error("Camera recorder finalize failed: %s", exc)
             if index_file is not None:
                 index_file.close()
             self._closed.set()
+            self._log_recording_timings(backend)
             self._logger.info(
                 "Camera recording closed: submitted=%d written=%d dropped=%d output=%s",
                 self._submitted,
@@ -353,6 +503,32 @@ class AsyncVideoRecorder:
                 self._dropped,
                 self.config.output_path,
             )
+            self._logger.info("Camera recording capture range: last_seen=%s last_written=%s",
+                              self._last_seen_capture_id, previous_capture_id)
+
+    def _log_recording_timings(self, backend):
+        if not self._recording_timings:
+            return
+        names = ("queue_age", "wait", "sharpness", "prepare", "draw", "encode_write", "csv")
+        parts = []
+        for i, name in enumerate(names):
+            values = sorted(row[i] for row in self._recording_timings)
+            parts.append("%s_ms(avg=%.2f,p95=%.2f,max=%.2f)" % (
+                name, sum(values)/len(values), values[min(len(values)-1,int(.95*len(values)))], values[-1]))
+        self._logger.info("Camera recording timing: backend=%s n=%d queued=%d dropped=%d %s",
+                          backend, len(self._recording_timings), self._queue.qsize(), self._dropped, " ".join(parts))
+
+    def _depth_view(self, capture_id, timestamp, target_id):
+        if self._depth_sample_provider is None:
+            return DepthVideoView("disabled")
+        try:
+            sample = self._depth_sample_provider(capture_id, timestamp)
+            return DepthVideoView.from_sample(sample, capture_id, timestamp, target_id)
+        except Exception as exc:
+            if not self._depth_overlay_error_logged:
+                self._logger.warning("Video depth overlay unavailable: %s", exc)
+                self._depth_overlay_error_logged = True
+            return DepthVideoView("unavailable")
 
     def _wait_for_overlay(
         self,
@@ -374,6 +550,31 @@ class AsyncVideoRecorder:
                 self._overlay_condition.wait(timeout=remaining)
             return self._overlays.pop(capture_id, VideoFrameOverlay())
 
+    def _measure_sharpness(self, image: Any) -> Optional[float]:
+        """Measure the unannotated BGR frame only in the recorder worker."""
+        try:
+            channels = int(image.shape[2]) if len(image.shape) >= 3 else 1
+            if channels == 1:
+                gray = image
+            else:
+                code = self._cv2.COLOR_BGRA2GRAY if channels == 4 else self._cv2.COLOR_BGR2GRAY
+                gray = self._cv2.cvtColor(image, code)
+            height, width = gray.shape[:2]
+            if width > 320:
+                gray = self._cv2.resize(
+                    gray,
+                    (320, max(1, int(round(height * 320.0 / width)))),
+                    interpolation=self._cv2.INTER_AREA,
+                )
+            laplacian = self._cv2.Laplacian(gray, self._cv2.CV_32F)
+            _, stddev = self._cv2.meanStdDev(laplacian)
+            return float(stddev[0][0]) ** 2
+        except Exception as exc:
+            if not self._sharpness_error_logged:
+                self._logger.warning("Camera sharpness diagnostic unavailable: %s", exc)
+                self._sharpness_error_logged = True
+            return None
+
     def _draw_text_box(
         self,
         image: Any,
@@ -386,9 +587,12 @@ class AsyncVideoRecorder:
         foreground: tuple[int, int, int],
         background: tuple[int, int, int],
         thickness: int = 1,
+        max_width: Optional[int] = None,
     ) -> int:
         height, width = int(image.shape[0]), int(image.shape[1])
         available = max(1, width - max(0, int(x)) - 4)
+        if max_width is not None:
+            available = min(available, max(1, int(max_width)))
         rendered = str(text)
         while rendered:
             (text_width, text_height), baseline = self._cv2.getTextSize(
@@ -405,31 +609,42 @@ class AsyncVideoRecorder:
             rendered = rendered[:-2].rstrip() + "~"
         if not rendered:
             return int(y)
-        bottom = min(height - 1, int(y) + 3)
-        # Keep the video visible behind diagnostics.  The dark outline is a
-        # text stroke, not a filled label background, so it remains readable
-        # over both bright and dark parts of the camera image.
         outline_thickness = max(2, int(thickness) + 2)
+        label_x = max(0, int(x))
+        label_y = int(y)
+        left = max(0, label_x - outline_thickness)
+        right = min(width, label_x + text_width + outline_thickness + 2)
+        top = max(0, label_y - text_height - outline_thickness - 2)
+        bottom = min(height, label_y + baseline + outline_thickness + 2)
+        if right <= left or bottom <= top:
+            return int(y)
+        # Blend only the small text region, leaving box/ruler geometry solid.
+        # All pixel operations run in the recorder worker.
+        region = image[top:bottom, left:right]
+        text_layer = region.copy()
+        origin = (label_x - left, label_y - top)
         self._cv2.putText(
-            image,
+            text_layer,
             rendered,
-            (max(0, int(x)), int(y)),
+            origin,
             font,
             scale,
             (0, 0, 0),
             outline_thickness,
-            self._cv2.LINE_AA,
+            self._cv2.LINE_8,
         )
         self._cv2.putText(
-            image,
+            text_layer,
             rendered,
-            (max(0, int(x)), int(y)),
+            origin,
             font,
             scale,
             foreground,
             thickness,
-            self._cv2.LINE_AA,
+            self._cv2.LINE_8,
         )
+        alpha = max(0.0, min(1.0, float(self.config.overlay_text_alpha)))
+        self._cv2.addWeighted(text_layer, alpha, region, 1.0 - alpha, 0.0, dst=region)
         return bottom
 
     @staticmethod
@@ -451,9 +666,22 @@ class AsyncVideoRecorder:
         frame_number: int,
         capture_frame_id: int,
         overlay: VideoFrameOverlay,
+        *,
+        sharpness: Optional[float] = None,
+        wheels: VideoWheelOverlay = VideoWheelOverlay(),
+        follow: FollowRecordingView = FollowRecordingView(),
+        depth_view: DepthVideoView = DepthVideoView("disabled"),
+        capture_elapsed_sec: Optional[float] = None,
     ) -> Any:
         """Draw diagnostics on a copy in the recorder thread."""
         annotated = image.copy()
+        if depth_view.status != "disabled":
+            try:
+                draw_depth_overlay(annotated, depth_view, self._cv2)
+            except Exception as exc:
+                if not self._depth_overlay_error_logged:
+                    self._logger.warning("Video depth drawing skipped: %s", exc)
+                    self._depth_overlay_error_logged = True
         height, width = int(annotated.shape[0]), int(annotated.shape[1])
         ruler_height = max(34, int(round(height * 0.065)))
         ruler_top = max(0, height - ruler_height)
@@ -463,9 +691,11 @@ class AsyncVideoRecorder:
             f"VIDEO {int(frame_number):06d}  CAP {int(capture_frame_id):06d}  "
             f"CTRL {control_id}"
         )
+        if capture_elapsed_sec is not None:
+            label += f"  T+{capture_elapsed_sec:.3f}s"
         font = self._cv2.FONT_HERSHEY_SIMPLEX
-        scale = max(0.45, min(0.9, width / 900.0))
-        thickness = max(1, int(round(scale * 2.0)))
+        scale = max(0.32, min(0.62, width / 1400.0))
+        thickness = max(1, int(round(scale * 1.7)))
         (text_width, text_height), baseline = self._cv2.getTextSize(
             label,
             font,
@@ -486,35 +716,24 @@ class AsyncVideoRecorder:
             (label_width, label_height), label_baseline = self._cv2.getTextSize(
                 det_label,
                 font,
-                max(0.4, min(0.7, scale * 0.85)),
+                max(0.30, min(0.52, scale * 0.82)),
                 1,
             )
             label_x = x1
             label_y = max(label_height + label_baseline + 2, y1)
-            label_x2 = min(width - 1, label_x + label_width + 6)
-            label_y1 = max(0, label_y - label_height - label_baseline - 4)
-            self._cv2.putText(
+            self._draw_text_box(
                 annotated,
                 det_label,
-                (label_x, label_y),
-                font,
-                max(0.4, min(0.7, scale * 0.85)),
-                (0, 255, 0),
-                2,
-                self._cv2.LINE_AA,
-            )
-            self._cv2.putText(
-                annotated,
-                det_label,
-                (label_x, label_y),
-                font,
-                max(0.4, min(0.7, scale * 0.85)),
-                (0, 0, 0),
-                1,
-                self._cv2.LINE_AA,
+                x=label_x,
+                y=label_y,
+                font=font,
+                scale=max(0.30, min(0.52, scale * 0.82)),
+                foreground=(0, 255, 0),
+                background=(0, 0, 0),
             )
 
-        track_scale = max(0.36, min(0.58, scale * 0.72))
+        track_scale = max(0.28, min(0.42, scale * 0.70))
+        active_bbox: Optional[tuple[int, int, int, int]] = None
         for track in overlay.tracks:
             clipped = self._clipped_bbox(track.bbox, width, height)
             if clipped is None:
@@ -528,6 +747,8 @@ class AsyncVideoRecorder:
                 color,
                 4 if track.active_target else 1,
             )
+            if track.active_target:
+                active_bbox = clipped
             uid_text = f"U{track.reid_uid}"
             if track.mapped_uid > 0 and track.mapped_uid != track.reid_uid:
                 uid_text += f">M{track.mapped_uid}"
@@ -563,11 +784,27 @@ class AsyncVideoRecorder:
                 )
                 self._cv2.rectangle(annotated, (x1, y1), (x2, y2), candidate_color, 3)
 
-        status_scale = max(0.36, min(0.58, scale * 0.70))
-        status_y = margin + text_height + baseline + 22
+        status_scale = max(0.28, min(0.42, scale * 0.66))
+        # Reserve a separate line below CAP/CTRL for the right-side clarity
+        # readout; status text begins below it to avoid overlay collisions.
+        quality_scale = max(0.28, min(0.42, scale * 0.78))
+        quality_label = "SHARP n/a" if sharpness is None else f"SHARP {sharpness:.1f}"
+        (quality_width, quality_height), quality_baseline = self._cv2.getTextSize(
+            quality_label, font, quality_scale, 1
+        )
+        quality_y = y + baseline + quality_height + 5
+        status_y = quality_y + quality_baseline + 16
         active_text = "none" if control.active_target_id is None else str(control.active_target_id)
         selected_text = "none" if control.selected_target_id is None else str(control.selected_target_id)
         yaw_text = "none" if control.yaw_rate_dps is None else f"{control.yaw_rate_dps:+.1f}dps"
+        distance_text = (
+            "none"
+            if control.target_distance_m is None
+            else f"{float(control.target_distance_m):.2f}m"
+        )
+        distance_source = str(control.distance_source or "none")
+        if control.distance_detail:
+            distance_source += f"/{control.distance_detail}"
         search_text = control.search_state
         if control.search_direction:
             search_text += f"/{control.search_direction}"
@@ -586,8 +823,10 @@ class AsyncVideoRecorder:
             candidate_text,
             f"MOTOR {control.action_name}  CMD {control.requested_rpm:+d}RPM  "
             f"YAW {yaw_text}  AGE {control.result_age_ms:.1f}ms",
+            wheels.label(),
+            *((f"DIST {distance_text}  SRC {distance_source}",) if active_bbox is None else ()),
             f"DEC {control.decision_reason}",
-            "BLUE=ACTIVE TARGET  MAGENTA=OTHER CONTROL CANDIDATE",
+            "BLUE=ACTIVE  MAGENTA=CONTROL CANDIDATE",
         )
         for status_line in status_lines:
             self._draw_text_box(
@@ -600,29 +839,77 @@ class AsyncVideoRecorder:
                 foreground=(0, 255, 0),
                 background=(0, 0, 0),
             )
-            status_y += max(15, int(round(21 * status_scale / 0.45)))
+            status_y += max(12, int(round(17 * status_scale / 0.35)))
+
+        # Keep the new diagnostics near the bottom, separate from the existing
+        # identity/search panel. Avoid covering the torso with five more lines.
+        follow_lines = follow.labels()
+        follow_step = max(12, int(round(17 * status_scale / 0.35)))
+        follow_y = max(status_y + 5, ruler_top - len(follow_lines)*follow_step - 8)
+        for follow_line in follow_lines:
+            self._draw_text_box(
+                annotated, follow_line, x=margin, y=follow_y, font=font,
+                scale=status_scale, foreground=(0, 255, 255), background=(0, 0, 0),
+            )
+            follow_y += follow_step
+
+        if active_bbox is not None:
+            x1, y1, x2, y2 = active_bbox
+            box_width = max(1, x2 - x1 - 8)
+            box_height = max(1, y2 - y1)
+            distance_line = f"DIST {distance_text}"
+            source_line = f"SRC {distance_source}"
+            inner_scale = max(0.24, min(0.40, scale * 0.62))
+            line_step = max(11, int(round(15 * inner_scale / 0.30)))
+            first_y = y1 + max(13, int(round(15 * inner_scale)))
+            if first_y + line_step > y2 - 3:
+                first_y = max(13, y2 - 3)
+            self._draw_text_box(
+                annotated,
+                distance_line,
+                x=x1 + 4,
+                y=first_y,
+                font=font,
+                scale=inner_scale,
+                foreground=(0, 255, 0),
+                background=(255, 80, 0),
+                max_width=box_width,
+            )
+            if box_height >= line_step + 20:
+                self._draw_text_box(
+                    annotated,
+                    source_line,
+                    x=x1 + 4,
+                    y=min(y2 - 3, first_y + line_step),
+                    font=font,
+                    scale=inner_scale,
+                    foreground=(0, 255, 0),
+                    background=(255, 80, 0),
+                    max_width=box_width,
+                )
 
         # Draw the frame identity last so raw detector labels can never cover
         # the capture/control timeline needed for log correlation.
-        self._cv2.putText(
+        self._draw_text_box(
             annotated,
             label,
-            (x, y),
-            font,
-            scale,
-            (0, 255, 0),
-            thickness + 2,
-            self._cv2.LINE_AA,
+            x=x,
+            y=y,
+            font=font,
+            scale=scale,
+            foreground=(0, 255, 0),
+            background=(0, 0, 0),
+            thickness=thickness,
         )
-        self._cv2.putText(
+        self._draw_text_box(
             annotated,
-            label,
-            (x, y),
-            font,
-            scale,
-            (0, 255, 0),
-            thickness,
-            self._cv2.LINE_AA,
+            quality_label,
+            x=max(0, width - quality_width - margin),
+            y=quality_y,
+            font=font,
+            scale=quality_scale,
+            foreground=(160, 255, 255),
+            background=(0, 0, 0),
         )
 
         ruler_y = ruler_top + max(8, ruler_height // 3)
@@ -647,16 +934,16 @@ class AsyncVideoRecorder:
                 ruler_scale,
                 1,
             )
-            label_x = max(0, min(width - tick_width, tick_x - tick_width // 2))
+            label_x = max(0, min(width - tick_width - 4, tick_x - tick_width // 2))
             label_y = min(height - 3, ruler_y + tick_height + tick_text_height + 2)
-            self._cv2.putText(
+            self._draw_text_box(
                 annotated,
                 tick_label,
-                (label_x, label_y),
-                font,
-                ruler_scale,
-                tick_color,
-                1,
-                self._cv2.LINE_AA,
+                x=label_x,
+                y=label_y,
+                font=font,
+                scale=ruler_scale,
+                foreground=tick_color,
+                background=(0, 0, 0),
             )
         return annotated

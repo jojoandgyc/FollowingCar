@@ -28,6 +28,10 @@ class DirectionEvidence:
     result_age_ms: float = 0.0
     reason: str = "none"
     frame_width: int = 0
+    # Number of usable person candidates in this capture image.  A value
+    # greater than one means detector-only evidence cannot disambiguate the
+    # locked person and must not be used for historical direction recovery.
+    candidate_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -240,6 +244,7 @@ class DirectionInferencePool:
                 result_age_ms=result_age_ms(),
                 reason="detector_below_area",
                 frame_width=int(task.frame.shape[1]),
+                candidate_count=0,
             )
         persons = usable_persons
         selected = max(persons, key=lambda item: (float(item.score), float(item.area)))
@@ -257,6 +262,7 @@ class DirectionInferencePool:
             result_age_ms=result_age_ms(),
             reason=person_reason,
             frame_width=int(task.frame.shape[1]),
+            candidate_count=len(persons),
         )
 
     def _publish(self, evidence: DirectionEvidence) -> None:

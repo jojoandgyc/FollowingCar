@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from .control_types import SteeringFeedback
+from .longitudinal_approach import ApproachConfig, approach_reference
+from .distance_pi import DistancePiConfig, DistancePiController
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,8 @@ class DistancePidConfig:
     ki_rpm_per_m_s: float = 1.5
     kd_rpm_s_per_m: float = 6.0
     integral_limit_m_s: float = 1.5
+    # Opt-in positive-error capacity. Reverse/at-setpoint keeps legacy limit.
+    forward_integral_limit_m_s: float = 0.0
     deadband_m: float = 0.005
     min_forward_output_rpm: float = 20.0
     max_forward_output_rpm: float = 100.0
@@ -33,6 +37,8 @@ class DistancePidConfig:
     # default so existing unit-test/config callers retain the original loop.
     output_rise_rpm_per_sec: float = 0.0
     output_fall_rpm_per_sec: float = 0.0
+    approach_profile: Optional[ApproachConfig] = None
+    pi_profile: Optional[DistancePiConfig] = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +56,26 @@ class DistancePidResult:
     unslewed_output_rpm: float
     measurement_jump_clamped: bool
     output_slew_limited: bool
+    tracking_base_rpm: float = 0.0
+    integral_cap_rpm: float = 0.0
+    approach_mode: str = "legacy_pid"
+    approach_cap_rpm: Optional[float] = None
+    approach_closing_m_s: float = 0.0
+    approach_braking_distance_m: float = 0.0
+    distance_only_rpm: Optional[float] = None
+    approach_delay_sec: float = 0.0
+    pi_integral_m_s: float = 0.0
+    pi_status: str = "disabled"
+    pi_brake_source: str = "none"
+    pi_sample_dt_sec: float = 0.0
+    pi_integral_frozen: bool = False
+    pi_demand_rpm: float = 0.0
+    pi_launch_floor_rpm: float = 0.0
+    pi_total_demand_rpm: float = 0.0
+    pi_software_rise_bypassed: bool = False
+    pi_demand_limit_reason: str = "none"
+    pi_motion_origin_ts: Optional[float] = None
+    pi_motion_uncertainty_m_s: float = 0.
 
 
 class LongitudinalDistancePid:
@@ -69,6 +95,10 @@ class LongitudinalDistancePid:
         self._last_nonzero_sign = 0
         self._last_output_rpm: Optional[float] = None
         self.last_result: Optional[DistancePidResult] = None
+        self._integral_before_update = 0.0
+        self._limit_feedback_ts: Optional[float] = None
+        self._distance_pi = None if config.pi_profile is None else DistancePiController(config.pi_profile)
+        self._pi_forward_active = False
 
     def reset(self) -> None:
         self._last_ts = None
@@ -78,6 +108,67 @@ class LongitudinalDistancePid:
         self._last_nonzero_sign = 0
         self._last_output_rpm = None
         self.last_result = None
+        self._integral_before_update = 0.0
+        self._limit_feedback_ts = None
+        if self._distance_pi is not None:
+            self._distance_pi.reset()
+        self._pi_forward_active = False
+
+    def invalidate_motion_memory(self):
+        if self._distance_pi is not None:
+            self._distance_pi.invalidate_motion_memory()
+
+    def suspend(self, now: float, reason: str, *, retain: bool = True,
+                reset_execution: bool = False) -> None:
+        if self._distance_pi is not None:
+            self._distance_pi.suspend(now, reason, retain=retain,
+                                      reset_execution=reset_execution)
+
+    def reject_output(self, sample_timestamp: float) -> bool:
+        if self._distance_pi is not None and self._pi_forward_active:
+            changed = self._distance_pi.reject_output(sample_timestamp)
+            if changed:
+                self._sync_pi_feedback()
+            return changed
+        return False
+
+    def _sync_pi_feedback(self) -> None:
+        r = self._distance_pi.last_result
+        if self.last_result is not None and r is not None:
+            self.last_result = replace(
+                self.last_result, output_rpm=int(r.output_rpm), distance_only_rpm=r.output_rpm,
+                i_rpm=r.integral_m_s*60./self.config.pi_profile.wheel_circumference_m,
+                pi_integral_m_s=r.integral_m_s, pi_integral_frozen=r.integral_frozen,
+            )
+
+    def accept_output_limit(self, sample_timestamp: float, approved_rpm: float) -> bool:
+        """Freeze this sample's windup when the outer safety/cap reduced drive.
+
+        This is approved command feedback, NOT measured wheel velocity. Never
+        changes an issued command, nor integrates/replays a physical sample.
+        """
+        if self._distance_pi is not None and self._pi_forward_active:
+            changed = self._distance_pi.accept_output_limit(
+                sample_timestamp, approved_rpm,
+                quantization_rpm=max(0., self.config.max_forward_output_rpm/100.),
+            )
+            if changed:
+                self._last_output_rpm = self._distance_pi._last_output_rpm
+                self._sync_pi_feedback()
+            return changed
+        result = self.last_result
+        if (result is None or self._last_ts != sample_timestamp
+                or self._limit_feedback_ts == sample_timestamp
+                or not math.isfinite(approved_rpm) or approved_rpm < 0.0
+                or result.output_rpm <= approved_rpm or result.output_rpm <= 0):
+            return False
+        self._limit_feedback_ts = sample_timestamp
+        if result.error_m > 0 and self._integral_m_s > self._integral_before_update:
+            self._integral_m_s = self._integral_before_update
+        # Next sample's slew starts at the approved command, not a larger
+        # pre-cap request which the wheels were never asked to execute.
+        self._last_output_rpm = approved_rpm
+        return True
 
     @staticmethod
     def _clip(value: float, limit: float) -> float:
@@ -90,6 +181,15 @@ class LongitudinalDistancePid:
         target_distance_m: float,
         *,
         now: Optional[float] = None,
+        tracking_base_rpm: Optional[float] = None,
+        measurement_age_sec: float = 0.0,
+        braking_range_rate_m_s: Optional[float] = None,
+        raw_closure_valid: bool = False,
+        allow_motion_memory: bool = False,
+        braking_raw_distance_m: Optional[float] = None,
+        ego_forward_rpm: Optional[float] = None,
+        execution_now: Optional[float] = None,
+        forward_control: bool = True,
     ) -> DistancePidResult:
         c = self.config
         now = time.monotonic() if now is None else float(now)
@@ -98,6 +198,65 @@ class LongitudinalDistancePid:
         target = float(target_distance_m)
         if not math.isfinite(actual) or not math.isfinite(target):
             raise ValueError("distance PID requires finite distances")
+        if tracking_base_rpm is not None and (
+            not math.isfinite(float(tracking_base_rpm)) or float(tracking_base_rpm) < 0.0
+        ):
+            raise ValueError("tracking base must be a finite nonnegative RPM")
+        if braking_range_rate_m_s is not None and not math.isfinite(braking_range_rate_m_s):
+            raise ValueError("braking rate must be finite")
+        if self._distance_pi is not None and forward_control:
+            if not self._pi_forward_active:
+                self.reset()
+                self._pi_forward_active = True
+            execution_time = now + measurement_age_sec if execution_now is None else float(execution_now)
+            jump = bool(self.last_result is not None and self._last_ts is not None
+                        and now > self._last_ts and c.max_measurement_jump_m > 0
+                        and abs(actual-self.last_result.actual_distance_m) > c.max_measurement_jump_m)
+            result = self._distance_pi.update(
+                actual, target, sample_timestamp=now, execution_now=execution_time,
+                deadband_m=c.deadband_m, max_output_rpm=c.max_forward_output_rpm,
+                rise_rpm_per_sec=c.output_rise_rpm_per_sec,
+                fall_rpm_per_sec=c.output_fall_rpm_per_sec,
+                ego_forward_rpm=ego_forward_rpm, range_rate_m_s=braking_range_rate_m_s,
+                raw_closure_valid=raw_closure_valid, measurement_jump_clamped=jump,
+                allow_motion_memory=allow_motion_memory,
+                raw_distance_m=braking_raw_distance_m,
+            )
+            scale = 60./c.pi_profile.wheel_circumference_m
+            if result.status == "duplicate" and self.last_result is not None:
+                return replace(self.last_result, output_rpm=int(result.output_rpm),
+                               distance_only_rpm=result.output_rpm,
+                               i_rpm=result.integral_m_s*scale,
+                               pi_integral_m_s=result.integral_m_s,
+                               pi_status="duplicate", pi_sample_dt_sec=0., pi_integral_frozen=True)
+            answer = DistancePidResult(
+                raw_actual, actual, target, result.error_m,
+                braking_range_rate_m_s if raw_closure_valid and braking_range_rate_m_s is not None else 0.,
+                0., result.p_m_s*scale, result.integral_m_s*scale, 0.,
+                int(result.output_rpm), result.unslewed_output_rpm, jump, result.slew_limited,
+                integral_cap_rpm=c.pi_profile.integral_max_m_s*scale,
+                approach_mode="distance_pi", approach_cap_rpm=result.cap_rpm,
+                approach_closing_m_s=result.closing_m_s,
+                approach_braking_distance_m=result.braking_distance_m,
+                distance_only_rpm=result.output_rpm, approach_delay_sec=result.delay_sec,
+                pi_integral_m_s=result.integral_m_s, pi_status=result.status,
+                pi_brake_source=result.brake_source, pi_sample_dt_sec=result.sample_dt_sec,
+                pi_integral_frozen=result.integral_frozen,
+                pi_demand_rpm=result.pi_demand_rpm, pi_launch_floor_rpm=result.launch_floor_rpm,
+                pi_total_demand_rpm=result.demand_rpm,
+                pi_software_rise_bypassed=result.software_rise_bypassed,
+                pi_demand_limit_reason=result.demand_limit_reason,
+                pi_motion_origin_ts=result.motion_origin_ts,
+                pi_motion_uncertainty_m_s=result.motion_uncertainty_m_s,
+            )
+            if result.status not in {"stale_sample", "out_of_order", "execution_out_of_order",
+                                     "suspended_duplicate", "measurement_jump", "continuation_only"}:
+                self.last_result = answer
+                self._last_ts = now
+                self._last_output_rpm = result.output_rpm
+            return answer
+        if self._distance_pi is not None and self._pi_forward_active:
+            self.reset()
         if (
             self.last_result is not None
             and self._last_ts is not None
@@ -107,6 +266,7 @@ class LongitudinalDistancePid:
         ):
             return self.last_result
 
+        self._integral_before_update = self._integral_m_s
         measurement_jump_clamped = False
         max_jump = max(0.0, float(c.max_measurement_jump_m))
         if (
@@ -139,7 +299,57 @@ class LongitudinalDistancePid:
         )
 
         deadband = max(0.0, float(c.deadband_m))
-        if abs(error) <= deadband:
+        integral_limit = float(c.integral_limit_m_s)
+        if error > deadband:
+            integral_limit = max(integral_limit, float(c.forward_integral_limit_m_s))
+        approach = None
+        range_only = None
+        if c.approach_profile is not None and (error >= -deadband or tracking_base_rpm is not None):
+            # Replace forward PID, do not add another boost on top of P/I/D.
+            # Runtime supplies a physical RAW-depth regression (or an explicit
+            # conservative encoder fallback). Filtered-position steps are NOT
+            # a closing-speed measurement. Standalone callers may supply an
+            # ideal distance signal; retain their original derivative behavior.
+            rate = (min(raw_rate, self._filtered_error_rate_m_s)
+                    if braking_range_rate_m_s is None else braking_range_rate_m_s)
+            approach = approach_reference(
+                c.approach_profile, error_m=error, deadband_m=deadband,
+                tracking_base_rpm=tracking_base_rpm, range_rate_m_s=rate,
+                max_output_rpm=max(0., float(c.max_forward_output_rpm)),
+                measurement_age_sec=measurement_age_sec,
+                raw_closure_valid=raw_closure_valid,
+            )
+            range_only = approach_reference(
+                c.approach_profile, error_m=error, deadband_m=deadband,
+                tracking_base_rpm=None, range_rate_m_s=rate,
+                max_output_rpm=max(0., float(c.max_forward_output_rpm)),
+                measurement_age_sec=measurement_age_sec,
+                raw_closure_valid=raw_closure_valid,
+            )
+            self._integral_m_s = 0.0
+            self._last_nonzero_sign = 1 if approach.output_rpm > 0 else 0
+            p_rpm, i_rpm, d_rpm = approach.correction_rpm, 0., 0.
+            output_rpm = int(math.floor(approach.output_rpm + 1e-9))
+            # A new controller/UID also starts with bounded acceleration.
+            if self._last_output_rpm is None:
+                self._last_output_rpm = 0.0
+        elif tracking_base_rpm is not None:
+            # A moving person needs a nonzero matching velocity even at zero
+            # range error. This replaces the launch bias, never adds it twice.
+            # This branch can slow forward motion but cannot authorize reverse.
+            self._last_nonzero_sign = 1
+            correction_error = 0.0 if abs(error) <= deadband else error
+            self._integral_m_s = self._clip(
+                self._integral_m_s + correction_error * dt, integral_limit
+            )
+            p_rpm = float(c.kp_rpm_per_m) * correction_error
+            i_rpm = float(c.ki_rpm_per_m_s) * self._integral_m_s
+            d_rpm = float(c.kd_rpm_s_per_m) * self._filtered_error_rate_m_s
+            maximum = max(0.0, float(c.max_forward_output_rpm))
+            output_rpm = int(round(max(0.0, min(
+                maximum, float(tracking_base_rpm) + p_rpm + i_rpm + d_rpm
+            ))))
+        elif abs(error) <= deadband:
             self._integral_m_s = 0.0
             self._last_nonzero_sign = 0
             output_rpm = 0
@@ -152,7 +362,7 @@ class LongitudinalDistancePid:
             self._last_nonzero_sign = direction
             self._integral_m_s = self._clip(
                 self._integral_m_s + error * dt,
-                float(c.integral_limit_m_s),
+                integral_limit,
             )
             p_rpm = float(c.kp_rpm_per_m) * error
             i_rpm = float(c.ki_rpm_per_m_s) * self._integral_m_s
@@ -195,6 +405,10 @@ class LongitudinalDistancePid:
             ):
                 output_rpm = int(round(previous_output + math.copysign(limit, float(output_rpm) - previous_output)))
                 output_slew_limited = True
+        if approach is not None:
+            # A comfort fall-slew must never lift output above the newly
+            # calculated braking envelope (or keep a stopped target moving).
+            output_rpm = min(output_rpm, int(math.floor(approach.cap_rpm + 1e-9)))
         # A true deadband request is an explicit stop and must not be delayed
         # by the comfort slew limiter; safety and distance hysteresis own the
         # decision to stop.
@@ -214,6 +428,14 @@ class LongitudinalDistancePid:
             unslewed_output_rpm=unslewed_output_rpm,
             measurement_jump_clamped=measurement_jump_clamped,
             output_slew_limited=output_slew_limited,
+            tracking_base_rpm=0.0 if tracking_base_rpm is None else float(tracking_base_rpm),
+            integral_cap_rpm=0. if approach is not None else abs(float(c.ki_rpm_per_m_s) * integral_limit),
+            approach_mode="legacy_pid" if approach is None else approach.mode,
+            approach_cap_rpm=None if approach is None else approach.cap_rpm,
+            approach_closing_m_s=0. if approach is None else approach.closing_speed_m_s,
+            approach_braking_distance_m=0. if approach is None else approach.braking_distance_m,
+            distance_only_rpm=None if range_only is None else min(max(0, output_rpm), range_only.output_rpm),
+            approach_delay_sec=0. if approach is None else c.approach_profile.response_delay_sec + measurement_age_sec,
         )
         self.last_result = result
         return result
@@ -366,6 +588,9 @@ class VisualSteeringPid:
         self._startup_kick_direction = 0
         self._startup_kick_started_at: Optional[float] = None
         self._startup_kick_armed = True
+        self._last_requested_direction = 0
+        self._reversal_settle_active = False
+        self._reversal_settle_quiet_frames = 0
         self.last_result: Optional[VisualSteeringPidResult] = None
 
     def reset(self) -> None:
@@ -377,6 +602,9 @@ class VisualSteeringPid:
         self._startup_kick_direction = 0
         self._startup_kick_started_at = None
         self._startup_kick_armed = True
+        self._last_requested_direction = 0
+        self._reversal_settle_active = False
+        self._reversal_settle_quiet_frames = 0
         self.last_result = None
 
     @staticmethod
@@ -394,6 +622,8 @@ class VisualSteeringPid:
         target_image_rate_dps: Optional[float] = None,
         max_correction_override_rpm: Optional[float] = None,
         visual_age_sec: Optional[float] = None,
+        target_rate_feedforward_max_dps_override: Optional[float] = None,
+        target_speed_match_max_closing_dps_override: Optional[float] = None,
     ) -> VisualSteeringPidResult:
         c = self.config
         now = time.monotonic() if now is None else float(now)
@@ -535,7 +765,14 @@ class VisualSteeringPid:
             target_rate_feedforward = (
                 self._clip(
                     max(0.0, float(c.target_rate_feedforward_gain)) * image_rate,
-                    max(0.0, float(c.target_rate_feedforward_max_dps)),
+                    max(
+                        0.0,
+                        float(
+                            c.target_rate_feedforward_max_dps
+                            if target_rate_feedforward_max_dps_override is None
+                            else target_rate_feedforward_max_dps_override
+                        ),
+                    ),
                 )
                 if requested_direction != 0
                 else 0.0
@@ -580,14 +817,68 @@ class VisualSteeringPid:
         else:
             desired_rate = 0.0
         desired_rate = self._clip(desired_rate, yaw_rate_limit)
+
+        # Do not immediately re-apply a direction that has just been
+        # abandoned while the chassis is still rotating that same way. This
+        # is the small stateful part of the outer loop that prevents a
+        # delayed vision sign change from turning inertia into a limit cycle.
+        reversal_settle_hold = False
+        settle_threshold = max(0.0, float(c.opposite_yaw_brake_threshold_dps))
+        if requested_direction == 0:
+            self._last_requested_direction = 0
+            self._reversal_settle_active = False
+            self._reversal_settle_quiet_frames = 0
+        else:
+            direction_changed = bool(
+                self._last_requested_direction != 0
+                and requested_direction != self._last_requested_direction
+            )
+            if (
+                direction_changed
+                and feedback_used
+                and measured_rate * requested_direction > 0.0
+                and abs(measured_rate) >= settle_threshold
+            ):
+                self._reversal_settle_active = True
+                self._reversal_settle_quiet_frames = 0
+            if self._reversal_settle_active:
+                if (
+                    not feedback_used
+                    or measured_rate * requested_direction <= 0.0
+                    or abs(measured_rate) < settle_threshold
+                ):
+                    self._reversal_settle_quiet_frames += 1
+                    if self._reversal_settle_quiet_frames >= 2:
+                        self._reversal_settle_active = False
+                        self._reversal_settle_quiet_frames = 0
+                else:
+                    self._reversal_settle_quiet_frames = 0
+                reversal_settle_hold = self._reversal_settle_active
+            self._last_requested_direction = requested_direction
         target_speed_match_limited = False
         target_speed_match_limit = yaw_rate_limit
-        max_closing_rate = max(0.0, float(c.target_speed_match_max_closing_dps))
+        max_closing_rate = max(
+            0.0,
+            float(
+                c.target_speed_match_max_closing_dps
+                if target_speed_match_max_closing_dps_override is None
+                else target_speed_match_max_closing_dps_override
+            ),
+        )
         if (
             max_closing_rate > 0.0
             and target_rate_valid
             and requested_direction != 0
         ):
+            # Existing small/large-error bands also define the approach phase.
+            # At large error allow at most 1.5x closing speed (8 -> 12 dps);
+            # current visual error restores the near-center limit immediately,
+            # even if the filtered error still lags. RPM/yaw/braking caps remain.
+            if target_speed_match_max_closing_dps_override is None:
+                approach_blend = max(0.0, min(1.0, (
+                    min(abs(visual_error_deg), abs(self._filtered_error_deg)) - small_error
+                ) / (large_error - small_error)))
+                max_closing_rate *= 1.0 + 0.5 * approach_blend
             # target_bearing_rate is the target's estimated world rate:
             # camera-relative bbox rate + measured chassis yaw. Permit a
             # bounded same-side excess so the aim line can converge without
@@ -978,6 +1269,11 @@ class VisualSteeringPid:
         ):
             output = 0.0
             self._rate_integral_deg *= 0.5
+        if reversal_settle_hold:
+            output = 0.0
+            self._rate_integral_deg = 0.0
+            output_floor_rpm = 0.0
+            output_floor_reason = "reversal_settle"
         correction_rpm = int(round(output))
 
         result = VisualSteeringPidResult(

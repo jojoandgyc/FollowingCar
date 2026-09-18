@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, replace
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from .frames import FramePacket, numpy_from_frame
 from .reid import OSNetConfig, OSNetRKNNExtractor
+from .reid_diagnostics import ReIDDiagnosticsWriter
 from .tracker import DeepSortTracker, DeepSortTrackerConfig, TrackRecord
 from .yolo11 import Detection, YOLO11Config, YOLO11RKNNDetector
 
@@ -17,6 +18,154 @@ class SearchCandidateEvidence:
 
     formal_persons: Tuple[Detection, ...] = ()
     probe_persons: Tuple[Detection, ...] = ()
+    # Raw probe boxes remain available through the detector for video/debug
+    # output; this describes the conservative clustering decision exposed to
+    # the search gate.
+    probe_cluster_diagnostics: Tuple[dict, ...] = ()
+
+
+def _bbox_iou(first: Tuple[float, float, float, float], second: Tuple[float, float, float, float]) -> float:
+    """Return IoU for detector boxes without pulling a CV dependency into the pipeline."""
+    x1 = max(float(first[0]), float(second[0]))
+    y1 = max(float(first[1]), float(second[1]))
+    x2 = min(float(first[2]), float(second[2]))
+    y2 = min(float(first[3]), float(second[3]))
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    first_area = max(0.0, float(first[2]) - float(first[0])) * max(
+        0.0, float(first[3]) - float(first[1])
+    )
+    second_area = max(0.0, float(second[2]) - float(second[0])) * max(
+        0.0, float(second[3]) - float(second[1])
+    )
+    union = first_area + second_area - intersection
+    return 0.0 if union <= 0.0 else intersection / union
+
+
+def _probe_boxes_should_cluster(
+    first: Detection,
+    second: Detection,
+    *,
+    iou_threshold: float,
+    center_distance_ratio: float,
+) -> bool:
+    """Recognize overlapping fragments of one detector hypothesis.
+
+    Low-confidence YOLO decoding can emit boxes with slightly different
+    extents for the same person. IoU handles normal overlap; the center/height
+    fallback handles a narrow fragment nested in a much wider hypothesis.
+    It deliberately does not use score, so two nearby people are not merged
+    merely because one has a higher confidence.
+    """
+    first_box = tuple(float(value) for value in first.bbox)
+    second_box = tuple(float(value) for value in second.bbox)
+    if _bbox_iou(first_box, second_box) >= max(0.0, float(iou_threshold)):
+        return True
+    first_width = max(0.0, first_box[2] - first_box[0])
+    first_height = max(0.0, first_box[3] - first_box[1])
+    second_width = max(0.0, second_box[2] - second_box[0])
+    second_height = max(0.0, second_box[3] - second_box[1])
+    if min(first_width, first_height, second_width, second_height) <= 0.0:
+        return False
+    first_center = (
+        (first_box[0] + first_box[2]) * 0.5,
+        (first_box[1] + first_box[3]) * 0.5,
+    )
+    second_center = (
+        (second_box[0] + second_box[2]) * 0.5,
+        (second_box[1] + second_box[3]) * 0.5,
+    )
+    center_distance = (
+        (first_center[0] - second_center[0]) ** 2
+        + (first_center[1] - second_center[1]) ** 2
+    ) ** 0.5
+    scale = max(first_height, second_height, first_width, second_width, 1.0)
+    vertical_overlap = max(
+        0.0,
+        min(first_box[3], second_box[3]) - max(first_box[1], second_box[1]),
+    )
+    vertical_overlap /= max(min(first_height, second_height), 1e-6)
+    return (
+        center_distance <= max(0.0, float(center_distance_ratio)) * scale
+        and vertical_overlap >= 0.55
+    )
+
+
+def cluster_probe_detections(
+    detections: Sequence[Detection],
+    *,
+    person_class_id: int = 0,
+    iou_threshold: float = 0.45,
+    center_distance_ratio: float = 0.18,
+    min_score_gap: float = 0.03,
+) -> Tuple[Tuple[Detection, ...], Tuple[dict, ...]]:
+    """Collapse overlapping below-threshold boxes into conservative candidates.
+
+    The returned detections contain at most one representative when a single
+    cluster is unambiguous. If multiple spatial clusters compete with a small
+    confidence gap, no probe is exposed to control/ReID. The second return
+    value is diagnostic metadata for the raw cluster structure.
+    """
+    candidates = [
+        detection
+        for detection in detections
+        if int(detection.class_id) == int(person_class_id)
+        and float(detection.score) > 0.0
+    ]
+    if not candidates:
+        return (), ()
+    ordered = sorted(candidates, key=lambda item: float(item.score), reverse=True)
+    clusters: List[List[Detection]] = []
+    for detection in ordered:
+        matching = [
+            index
+            for index, cluster in enumerate(clusters)
+            if any(
+                _probe_boxes_should_cluster(
+                    detection,
+                    member,
+                    iou_threshold=iou_threshold,
+                    center_distance_ratio=center_distance_ratio,
+                )
+                for member in cluster
+            )
+        ]
+        if not matching:
+            clusters.append([detection])
+            continue
+        target = matching[0]
+        clusters[target].append(detection)
+        # Connected components are useful for decoder fragments that form a
+        # chain of slightly shifted boxes. Merge all touched components.
+        for index in reversed(matching[1:]):
+            clusters[target].extend(clusters.pop(index))
+    clusters.sort(
+        key=lambda cluster: max(float(item.score) for item in cluster),
+        reverse=True,
+    )
+    representatives = [
+        max(cluster, key=lambda item: float(item.score)) for cluster in clusters
+    ]
+    cluster_scores = [float(item.score) for item in representatives]
+    score_gap = (
+        cluster_scores[0] - cluster_scores[1]
+        if len(cluster_scores) > 1
+        else cluster_scores[0]
+    )
+    ambiguous = len(representatives) > 1 and score_gap < max(0.0, float(min_score_gap))
+    metadata = tuple(
+        {
+            "cluster_index": int(index),
+            "member_count": int(len(cluster)),
+            "score": float(representative.score),
+            "bbox": [float(value) for value in representative.bbox],
+            "score_gap": float(score_gap),
+            "ambiguous": bool(ambiguous),
+        }
+        for index, (cluster, representative) in enumerate(zip(clusters, representatives))
+    )
+    if ambiguous:
+        return (), metadata
+    return (representatives[0],), metadata
 
 
 @dataclass(frozen=True)
@@ -27,6 +176,13 @@ class RKNNVisionConfig:
     person_class_id: int = 0
     conf_threshold: float = 0.25
     search_diagnostic_conf_threshold: float = 0.10
+    # Search-only low-confidence boxes are clustered before being exposed to
+    # the candidate gate. Formal detector output is never changed by these
+    # settings.
+    search_probe_cluster_enable: bool = True
+    search_probe_cluster_iou_threshold: float = 0.45
+    search_probe_cluster_center_distance_ratio: float = 0.18
+    search_probe_cluster_min_score_gap: float = 0.03
     nms_threshold: float = 0.45
     yolo_input_size: int = 640
     yolo_num_classes: int = 80
@@ -40,6 +196,13 @@ class RKNNVisionConfig:
     reid_normalize: str = "imagenet"
     reid_color_fusion_enable: bool = True
     reid_color_fusion_weight: float = 0.35
+    reid_partial_appearance_enable: bool = True
+    reid_partial_osnet_enable: bool = True
+    reid_diagnostics_enable: bool = False
+    reid_diagnostics_dir: str = ""
+    reid_diagnostics_max_samples: int = 2000
+    reid_diagnostics_queue_capacity: int = 16
+    reid_diagnostics_mapped_interval: int = 30
     frame_width: int = 1920
     frame_height: int = 1080
     hfov_deg: float = 90.0
@@ -75,6 +238,10 @@ class RKNNVisionConfig:
     identity_min_height_px: float = 0.0
     identity_max_single_frame_area_shrink_ratio: float = 0.30
     identity_area_shrink_max_gap_frames: int = 2
+    identity_max_center_jump_ratio: float = 0.30
+    identity_center_jump_max_gap_frames: int = 2
+    identity_swap_min_mapped_jump_ratio: float = 0.08
+    identity_swap_max_replacement_distance_ratio: float = 0.12
     identity_max_area_ratio: float = 0.75
     identity_max_width_ratio: float = 0.85
     identity_max_height_ratio: float = 1.00
@@ -96,14 +263,32 @@ class RKNNVisionConfig:
     identity_exclusive_uid_claim_enable: bool = True
     identity_exclusive_uid_claim_frames: int = 15
     identity_controlled_handoff_enable: bool = True
-    identity_controlled_handoff_confirm_frames: int = 3
+    identity_controlled_handoff_confirm_frames: int = 2
+    identity_controlled_handoff_instant_threshold: float = 0.15
     identity_controlled_handoff_threshold: float = 0.30
-    identity_controlled_handoff_min_old_track_gap_frames: int = 2
+    identity_controlled_handoff_min_old_track_gap_frames: int = 5
+    identity_handoff_geometry_max_gap_frames: int = 15
+    identity_handoff_geometry_max_center_jump_ratio: float = 0.25
+    identity_handoff_geometry_min_area_similarity: float = 0.35
     identity_preferred_search_reacquire_enable: bool = True
-    identity_preferred_search_reacquire_threshold: float = 0.36
-    identity_preferred_search_reacquire_max_disadvantage: float = 0.15
+    identity_preferred_search_reacquire_threshold: float = 0.20
+    identity_preferred_search_reacquire_max_disadvantage: float = 0.05
+    identity_preferred_search_reacquire_min_confidence: float = 0.50
+    identity_preferred_search_reacquire_observation_min_confidence: float = 0.25
+    identity_preferred_search_reacquire_max_age_sec: float = 0.35
+    identity_preferred_search_reacquire_late_candidate_enable: bool = True
     identity_preferred_search_reacquire_confirm_frames: int = 2
-    identity_preferred_search_reacquire_instant_threshold: float = 0.28
+    identity_preferred_search_reacquire_instant_threshold: float = 0.15
+    identity_preferred_search_reacquire_min_score_gap: float = 0.25
+    identity_preferred_search_soft_candidate_enable: bool = True
+    identity_preferred_search_soft_candidate_threshold: float = 0.30
+    identity_preferred_search_soft_min_score_gap: float = 0.15
+    identity_preferred_search_soft_min_area_ratio: float = 0.25
+    identity_preferred_search_soft_min_confidence: float = 0.80
+    identity_partial_appearance_enable: bool = True
+    identity_partial_match_threshold: float = 0.34
+    identity_partial_max_features: int = 8
+    identity_partial_update_threshold: float = 0.30
     identity_preferred_search_reacquire_side_ratio: float = 0.05
     identity_duplicate_box_suppression_enable: bool = True
     identity_duplicate_iou_threshold: float = 0.55
@@ -133,6 +318,21 @@ class RKNNVisionConfig:
             search_diagnostic_conf_threshold=float(
                 os.environ.get("RKNN_SEARCH_DIAGNOSTIC_CONF_THRESHOLD", "0.10")
             ),
+            search_probe_cluster_enable=os.environ.get(
+                "RKNN_SEARCH_PROBE_CLUSTER_ENABLE", "1"
+            ).strip()
+            != "0",
+            search_probe_cluster_iou_threshold=float(
+                os.environ.get("RKNN_SEARCH_PROBE_CLUSTER_IOU_THRESHOLD", "0.45")
+            ),
+            search_probe_cluster_center_distance_ratio=float(
+                os.environ.get(
+                    "RKNN_SEARCH_PROBE_CLUSTER_CENTER_DISTANCE_RATIO", "0.18"
+                )
+            ),
+            search_probe_cluster_min_score_gap=float(
+                os.environ.get("RKNN_SEARCH_PROBE_CLUSTER_MIN_SCORE_GAP", "0.03")
+            ),
             nms_threshold=float(os.environ.get("RKNN_YOLO_NMS_THRESHOLD", "0.45")),
             yolo_input_size=int(os.environ.get("RKNN_YOLO_INPUT_SIZE", "640")),
             yolo_num_classes=int(os.environ.get("RKNN_YOLO_NUM_CLASSES", "80")),
@@ -146,6 +346,16 @@ class RKNNVisionConfig:
             reid_normalize=os.environ.get("RKNN_REID_NORMALIZE", "imagenet").strip(),
             reid_color_fusion_enable=os.environ.get("RKNN_REID_COLOR_FUSION_ENABLE", "1").strip() != "0",
             reid_color_fusion_weight=float(os.environ.get("RKNN_REID_COLOR_FUSION_WEIGHT", "0.35")),
+            reid_partial_appearance_enable=os.environ.get("RKNN_REID_PARTIAL_APPEARANCE_ENABLE", "1").strip() != "0",
+            reid_partial_osnet_enable=os.environ.get("RKNN_REID_PARTIAL_OSNET_ENABLE", "1").strip() != "0",
+            reid_diagnostics_enable=os.environ.get("RKNN_REID_DIAGNOSTICS_ENABLE", "0").strip() != "0",
+            reid_diagnostics_dir=(
+                os.path.join(os.environ["FOLLOW_LOG_DIR"], "reid_diagnostics")
+                if os.environ.get("FOLLOW_LOG_DIR") else ""
+            ),
+            reid_diagnostics_max_samples=max(0, int(os.environ.get("RKNN_REID_DIAGNOSTICS_MAX_SAMPLES", "2000"))),
+            reid_diagnostics_queue_capacity=max(1, int(os.environ.get("RKNN_REID_DIAGNOSTICS_QUEUE_CAPACITY", "16"))),
+            reid_diagnostics_mapped_interval=max(1, int(os.environ.get("RKNN_REID_DIAGNOSTICS_MAPPED_INTERVAL", "30"))),
             frame_width=int(os.environ.get("VISION_FRAME_WIDTH", "1920")),
             frame_height=int(os.environ.get("VISION_FRAME_HEIGHT", "1080")),
             hfov_deg=float(os.environ.get("VISION_HFOV_DEG", "90.0")),
@@ -206,6 +416,19 @@ class RKNNVisionConfig:
                 1,
                 int(os.environ.get("Y8_IDENTITY_AREA_SHRINK_MAX_GAP_FRAMES", "2")),
             ),
+            identity_max_center_jump_ratio=float(
+                os.environ.get("Y8_IDENTITY_MAX_CENTER_JUMP_RATIO", "0.30")
+            ),
+            identity_center_jump_max_gap_frames=max(
+                1,
+                int(os.environ.get("Y8_IDENTITY_CENTER_JUMP_MAX_GAP_FRAMES", "2")),
+            ),
+            identity_swap_min_mapped_jump_ratio=float(
+                os.environ.get("Y8_IDENTITY_SWAP_MIN_MAPPED_JUMP_RATIO", "0.08")
+            ),
+            identity_swap_max_replacement_distance_ratio=float(
+                os.environ.get("Y8_IDENTITY_SWAP_MAX_REPLACEMENT_DISTANCE_RATIO", "0.12")
+            ),
             identity_max_area_ratio=float(os.environ.get("Y8_IDENTITY_MAX_AREA_RATIO", "0.75")),
             identity_max_width_ratio=float(os.environ.get("Y8_IDENTITY_MAX_WIDTH_RATIO", "0.85")),
             identity_max_height_ratio=float(os.environ.get("Y8_IDENTITY_MAX_HEIGHT_RATIO", "1.00")),
@@ -246,13 +469,25 @@ class RKNNVisionConfig:
             identity_controlled_handoff_enable=os.environ.get("Y8_IDENTITY_CONTROLLED_HANDOFF_ENABLE", "1").strip()
             != "0",
             identity_controlled_handoff_confirm_frames=max(
-                1, int(os.environ.get("Y8_IDENTITY_CONTROLLED_HANDOFF_CONFIRM_FRAMES", "3"))
+                1, int(os.environ.get("Y8_IDENTITY_CONTROLLED_HANDOFF_CONFIRM_FRAMES", "2"))
+            ),
+            identity_controlled_handoff_instant_threshold=float(
+                os.environ.get("Y8_IDENTITY_CONTROLLED_HANDOFF_INSTANT_THRESHOLD", "0.15")
             ),
             identity_controlled_handoff_threshold=float(
                 os.environ.get("Y8_IDENTITY_CONTROLLED_HANDOFF_THRESHOLD", "0.30")
             ),
             identity_controlled_handoff_min_old_track_gap_frames=max(
-                1, int(os.environ.get("Y8_IDENTITY_CONTROLLED_HANDOFF_MIN_OLD_TRACK_GAP_FRAMES", "2"))
+                1, int(os.environ.get("Y8_IDENTITY_CONTROLLED_HANDOFF_MIN_OLD_TRACK_GAP_FRAMES", "5"))
+            ),
+            identity_handoff_geometry_max_gap_frames=max(
+                1, int(os.environ.get("Y8_IDENTITY_HANDOFF_GEOMETRY_MAX_GAP_FRAMES", "15"))
+            ),
+            identity_handoff_geometry_max_center_jump_ratio=max(
+                0.0, min(1.0, float(os.environ.get("Y8_IDENTITY_HANDOFF_GEOMETRY_MAX_CENTER_JUMP_RATIO", "0.25")))
+            ),
+            identity_handoff_geometry_min_area_similarity=max(
+                0.0, min(1.0, float(os.environ.get("Y8_IDENTITY_HANDOFF_GEOMETRY_MIN_AREA_SIMILARITY", "0.35")))
             ),
             identity_preferred_search_reacquire_enable=os.environ.get(
                 "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_ENABLE",
@@ -260,23 +495,122 @@ class RKNNVisionConfig:
             ).strip()
             != "0",
             identity_preferred_search_reacquire_threshold=float(
-                os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_THRESHOLD", "0.36")
+                os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_THRESHOLD", "0.20")
             ),
             identity_preferred_search_reacquire_max_disadvantage=float(
-                os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MAX_DISADVANTAGE", "0.15")
+                os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MAX_DISADVANTAGE", "0.05")
             ),
+            identity_preferred_search_reacquire_min_confidence=max(
+                0.0,
+                min(
+                    1.0,
+                    float(os.environ.get(
+                        "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MIN_CONFIDENCE",
+                        "0.50",
+                    )),
+                ),
+            ),
+            identity_preferred_search_reacquire_observation_min_confidence=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        os.environ.get(
+                            "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_OBSERVATION_MIN_CONFIDENCE",
+                            "0.25",
+                        )
+                    ),
+                ),
+            ),
+            identity_preferred_search_reacquire_max_age_sec=max(
+                0.0,
+                float(os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MAX_AGE_SEC", "0.35")),
+            ),
+            identity_preferred_search_reacquire_late_candidate_enable=os.environ.get(
+                "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_LATE_CANDIDATE_ENABLE",
+                "1",
+            ).strip()
+            != "0",
             identity_preferred_search_reacquire_confirm_frames=max(
-                1,
+                2,
                 int(os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_CONFIRM_FRAMES", "2")),
             ),
             identity_preferred_search_reacquire_instant_threshold=float(
                 os.environ.get(
                     "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_INSTANT_THRESHOLD",
-                    "0.28",
+                    "0.15",
                 )
+            ),
+            identity_preferred_search_reacquire_min_score_gap=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        os.environ.get(
+                            "Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_MIN_SCORE_GAP",
+                            "0.25",
+                        )
+                    ),
+                ),
+            ),
+            identity_preferred_search_soft_candidate_enable=os.environ.get(
+                "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_CANDIDATE_ENABLE", "1"
+            ).strip() != "0",
+            identity_preferred_search_soft_candidate_threshold=max(
+                0.0,
+                float(
+                    os.environ.get(
+                        "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_CANDIDATE_THRESHOLD", "0.30"
+                    )
+                ),
+            ),
+            identity_preferred_search_soft_min_score_gap=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        os.environ.get(
+                            "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_MIN_SCORE_GAP", "0.15"
+                        )
+                    ),
+                ),
+            ),
+            identity_preferred_search_soft_min_area_ratio=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        os.environ.get(
+                            "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_MIN_AREA_RATIO", "0.25"
+                        )
+                    ),
+                ),
+            ),
+            identity_preferred_search_soft_min_confidence=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        os.environ.get(
+                            "Y8_IDENTITY_PREFERRED_SEARCH_SOFT_MIN_CONFIDENCE", "0.80"
+                        )
+                    ),
+                ),
             ),
             identity_preferred_search_reacquire_side_ratio=float(
                 os.environ.get("Y8_IDENTITY_PREFERRED_SEARCH_REACQUIRE_SIDE_RATIO", "0.05")
+            ),
+            identity_partial_appearance_enable=os.environ.get(
+                "Y8_IDENTITY_PARTIAL_APPEARANCE_ENABLE", "1"
+            ).strip() != "0",
+            identity_partial_match_threshold=float(
+                os.environ.get("Y8_IDENTITY_PARTIAL_MATCH_THRESHOLD", "0.34")
+            ),
+            identity_partial_max_features=max(
+                1, int(os.environ.get("Y8_IDENTITY_PARTIAL_MAX_FEATURES", "8"))
+            ),
+            identity_partial_update_threshold=float(
+                os.environ.get("Y8_IDENTITY_PARTIAL_UPDATE_THRESHOLD", "0.30")
             ),
             identity_duplicate_box_suppression_enable=os.environ.get(
                 "Y8_IDENTITY_DUPLICATE_BOX_SUPPRESSION_ENABLE",
@@ -353,6 +687,8 @@ class RKNNVisionPipeline:
                 normalize=self.config.reid_normalize,
                 color_fusion_enable=self.config.reid_color_fusion_enable,
                 color_fusion_weight=self.config.reid_color_fusion_weight,
+                partial_appearance_enable=self.config.reid_partial_appearance_enable,
+                partial_osnet_enable=self.config.reid_partial_osnet_enable,
                 target=self.config.target,
                 core_mask=self.config.core_mask,
                 backend=self.config.backend,
@@ -397,6 +733,10 @@ class RKNNVisionPipeline:
                 identity_area_shrink_max_gap_frames=(
                     self.config.identity_area_shrink_max_gap_frames
                 ),
+                identity_max_center_jump_ratio=self.config.identity_max_center_jump_ratio,
+                identity_center_jump_max_gap_frames=self.config.identity_center_jump_max_gap_frames,
+                identity_swap_min_mapped_jump_ratio=self.config.identity_swap_min_mapped_jump_ratio,
+                identity_swap_max_replacement_distance_ratio=self.config.identity_swap_max_replacement_distance_ratio,
                 identity_max_area_ratio=self.config.identity_max_area_ratio,
                 identity_max_width_ratio=self.config.identity_max_width_ratio,
                 identity_max_height_ratio=self.config.identity_max_height_ratio,
@@ -419,14 +759,34 @@ class RKNNVisionPipeline:
                 identity_exclusive_uid_claim_frames=self.config.identity_exclusive_uid_claim_frames,
                 identity_controlled_handoff_enable=self.config.identity_controlled_handoff_enable,
                 identity_controlled_handoff_confirm_frames=self.config.identity_controlled_handoff_confirm_frames,
+                identity_controlled_handoff_instant_threshold=self.config.identity_controlled_handoff_instant_threshold,
                 identity_controlled_handoff_threshold=self.config.identity_controlled_handoff_threshold,
                 identity_controlled_handoff_min_old_track_gap_frames=self.config.identity_controlled_handoff_min_old_track_gap_frames,
+                identity_handoff_geometry_max_gap_frames=self.config.identity_handoff_geometry_max_gap_frames,
+                identity_handoff_geometry_max_center_jump_ratio=self.config.identity_handoff_geometry_max_center_jump_ratio,
+                identity_handoff_geometry_min_area_similarity=self.config.identity_handoff_geometry_min_area_similarity,
                 identity_preferred_search_reacquire_enable=self.config.identity_preferred_search_reacquire_enable,
                 identity_preferred_search_reacquire_threshold=self.config.identity_preferred_search_reacquire_threshold,
                 identity_preferred_search_reacquire_max_disadvantage=self.config.identity_preferred_search_reacquire_max_disadvantage,
+                identity_preferred_search_reacquire_min_confidence=self.config.identity_preferred_search_reacquire_min_confidence,
+                identity_preferred_search_reacquire_observation_min_confidence=(
+                    self.config.identity_preferred_search_reacquire_observation_min_confidence
+                ),
+                identity_preferred_search_reacquire_max_age_sec=self.config.identity_preferred_search_reacquire_max_age_sec,
+                identity_preferred_search_reacquire_late_candidate_enable=self.config.identity_preferred_search_reacquire_late_candidate_enable,
                 identity_preferred_search_reacquire_confirm_frames=self.config.identity_preferred_search_reacquire_confirm_frames,
                 identity_preferred_search_reacquire_instant_threshold=self.config.identity_preferred_search_reacquire_instant_threshold,
+                identity_preferred_search_reacquire_min_score_gap=self.config.identity_preferred_search_reacquire_min_score_gap,
+                identity_preferred_search_soft_candidate_enable=self.config.identity_preferred_search_soft_candidate_enable,
+                identity_preferred_search_soft_candidate_threshold=self.config.identity_preferred_search_soft_candidate_threshold,
+                identity_preferred_search_soft_min_score_gap=self.config.identity_preferred_search_soft_min_score_gap,
+                identity_preferred_search_soft_min_area_ratio=self.config.identity_preferred_search_soft_min_area_ratio,
+                identity_preferred_search_soft_min_confidence=self.config.identity_preferred_search_soft_min_confidence,
                 identity_preferred_search_reacquire_side_ratio=self.config.identity_preferred_search_reacquire_side_ratio,
+                identity_partial_appearance_enable=self.config.identity_partial_appearance_enable,
+                identity_partial_match_threshold=self.config.identity_partial_match_threshold,
+                identity_partial_max_features=self.config.identity_partial_max_features,
+                identity_partial_update_threshold=self.config.identity_partial_update_threshold,
                 identity_duplicate_box_suppression_enable=self.config.identity_duplicate_box_suppression_enable,
                 identity_duplicate_iou_threshold=self.config.identity_duplicate_iou_threshold,
                 identity_duplicate_vertical_overlap_threshold=self.config.identity_duplicate_vertical_overlap_threshold,
@@ -438,7 +798,18 @@ class RKNNVisionPipeline:
             )
         )
         self.last_detections: List[Detection] = []
+        self._frame_context: dict = {}
+        self._reid_diagnostics = None
+        if self.config.reid_diagnostics_enable and self.config.reid_diagnostics_dir:
+            self._reid_diagnostics = ReIDDiagnosticsWriter(
+                self.config.reid_diagnostics_dir,
+                max_samples=self.config.reid_diagnostics_max_samples,
+                queue_capacity=self.config.reid_diagnostics_queue_capacity,
+                logger=self.logger,
+            )
         self.last_search_diagnostic_detections: List[Detection] = []
+        self.last_search_probe_clusters: List[Detection] = []
+        self.last_search_probe_cluster_diagnostics: Tuple[dict, ...] = ()
         self.last_search_candidate_evidence = SearchCandidateEvidence()
         self.last_predicted_reid_verifications: List[dict] = []
         self.last_frame_width = int(self.config.frame_width)
@@ -452,14 +823,55 @@ class RKNNVisionPipeline:
             "yolo_total": 0.0,
             "reid_preprocess": 0.0,
             "reid_inference": 0.0,
+            "reid_partial_inference": 0.0,
             "reid_postprocess": 0.0,
             "reid_total": 0.0,
             "tracker": 0.0,
             "total": 0.0,
         }
 
+    def _follow_size_candidates(self, detections, *, source: str):
+        """Filter control evidence, not the raw detector/recording output.
+
+        Apply the identity size limits before either ReID or search observation.
+        A track's expanded box, a high detector score, or a tiny ReID distance
+        must not grant a small raw detection permission to stop/redirect search.
+        """
+        accepted = []
+        for detection in detections:
+            x1, y1, x2, y2 = (float(v) for v in detection.bbox)
+            width, height = max(0.0, x2 - x1), max(0.0, y2 - y1)
+            area = width * height
+            limits = (
+                ("width", width, float(getattr(self.config, "identity_min_width_px", 0.0))),
+                ("height", height, float(getattr(self.config, "identity_min_height_px", 0.0))),
+                ("area", area, float(getattr(self.config, "identity_min_area", 0.0))),
+            )
+            reasons = [f"{name}<{limit:g}" for name, value, limit in limits if value < limit]
+            if not reasons:
+                accepted.append(detection)
+                continue
+            item = {
+                "source": source, "bbox": tuple(detection.bbox),
+                "width_px": width, "height_px": height, "area_px": area,
+                "score": float(detection.score), "reason": ",".join(reasons),
+            }
+            self.last_follow_size_rejections.append(item)
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.info(
+                    "follow_bbox_size_rejected capture_frame_id=%s source=%s "
+                    "bbox=%s width_px=%.2f height_px=%.2f area_px=%.2f "
+                    "score=%.3f reason=%s identity_allowed=False observation_allowed=False",
+                    getattr(self, "_frame_context", {}).get("capture_frame_id"),
+                    source, item["bbox"], width, height, area,
+                    item["score"], item["reason"],
+                )
+        return accepted
+
     def _record_detector_output(self, detections: List[Detection]) -> List[Detection]:
         self.last_detections = detections
+        self.last_follow_size_rejections = []
         self.last_search_diagnostic_detections = list(
             self.detector.last_search_diagnostic_detections
         )
@@ -469,15 +881,43 @@ class RKNNVisionPipeline:
             if int(det.class_id) == int(self.config.person_class_id)
             and float(det.score) >= float(self.config.conf_threshold)
         ]
-        probe_persons = tuple(
+        persons = self._follow_size_candidates(persons, source="formal")
+        raw_probe_persons = tuple(
             det
             for det in self.last_search_diagnostic_detections
             if int(det.class_id) == int(self.config.person_class_id)
             and float(det.score) < float(self.config.conf_threshold)
         )
+        # Filter before clustering so tiny fragments cannot suppress a valid
+        # candidate through cluster competition or grow into an eligible box.
+        raw_probe_persons = tuple(self._follow_size_candidates(raw_probe_persons, source="probe"))
+        if bool(getattr(self.config, "search_probe_cluster_enable", True)):
+            probe_persons, cluster_diagnostics = cluster_probe_detections(
+                raw_probe_persons,
+                person_class_id=int(self.config.person_class_id),
+                iou_threshold=float(
+                    getattr(self.config, "search_probe_cluster_iou_threshold", 0.45)
+                ),
+                center_distance_ratio=float(
+                    getattr(
+                        self.config,
+                        "search_probe_cluster_center_distance_ratio",
+                        0.18,
+                    )
+                ),
+                min_score_gap=float(
+                    getattr(self.config, "search_probe_cluster_min_score_gap", 0.03)
+                ),
+            )
+        else:
+            probe_persons = raw_probe_persons
+            cluster_diagnostics = ()
+        self.last_search_probe_clusters = list(probe_persons)
+        self.last_search_probe_cluster_diagnostics = tuple(cluster_diagnostics)
         self.last_search_candidate_evidence = SearchCandidateEvidence(
             formal_persons=tuple(persons),
             probe_persons=probe_persons,
+            probe_cluster_diagnostics=tuple(cluster_diagnostics),
         )
         return persons
 
@@ -511,6 +951,7 @@ class RKNNVisionPipeline:
             "yolo_total": float(yolo_timing.get("total", 0.0)),
             "reid_preprocess": 0.0,
             "reid_inference": 0.0,
+            "reid_partial_inference": 0.0,
             "reid_postprocess": 0.0,
             "reid_total": 0.0,
             "reid_detections": 0.0,
@@ -548,8 +989,23 @@ class RKNNVisionPipeline:
         detect_end = time.perf_counter()
         persons = self._record_detector_output(detections)
         features = self.reid.extract(packet, persons, fmt)
+        partial_features = list(getattr(self.reid, "last_partial_features", ()))
+        if len(partial_features) != len(persons):
+            partial_features = [None for _ in persons]
+        partial_feature_sources = list(
+            getattr(self.reid, "last_partial_feature_sources", ())
+        )
+        if len(partial_feature_sources) != len(persons):
+            partial_feature_sources = [None for _ in persons]
         reid_end = time.perf_counter()
-        records = self.tracker.update(persons, features, image_width=width, image_height=height)
+        records = self.tracker.update(
+            persons,
+            features,
+            partial_features=partial_features,
+            partial_feature_sources=partial_feature_sources,
+            image_width=width, image_height=height,
+            frame_context=self._frame_context,
+        )
         tracker_end = time.perf_counter()
         yolo_timing = self.detector.last_timing_ms
         reid_timing = dict(self.reid.last_timing_ms)
@@ -564,10 +1020,16 @@ class RKNNVisionPipeline:
             records, verify_timing = self._verify_predicted_records(packet, records, fmt)
         if self.config.identity_suppress_duplicate_uids and records:
             records = self._suppress_duplicate_reid_uids(records)
+        diagnostics_start = time.perf_counter()
+        self._record_reid_diagnostics(packet, fmt)
+        diagnostics_ms = _elapsed_ms(diagnostics_start, time.perf_counter())
         verify_end = time.perf_counter()
         combined_reid_timing = dict(reid_timing)
         if verify_timing is not None:
-            for key in ("preprocess", "inference", "postprocess", "total", "detections", "features"):
+            for key in (
+                "preprocess", "inference", "partial_inference", "postprocess",
+                "total", "detections", "features",
+            ):
                 combined_reid_timing[key] = float(combined_reid_timing.get(key, 0.0)) + float(verify_timing.get(key, 0.0))
         frame_wrap_ms = _elapsed_ms(frame_start, detect_end) - float(yolo_timing.get("total", 0.0))
         self.last_timing_ms = {
@@ -580,6 +1042,7 @@ class RKNNVisionPipeline:
             "yolo_total": float(yolo_timing.get("total", 0.0)),
             "reid_preprocess": float(combined_reid_timing.get("preprocess", 0.0)),
             "reid_inference": float(combined_reid_timing.get("inference", 0.0)),
+            "reid_partial_inference": float(combined_reid_timing.get("partial_inference", 0.0)),
             "reid_postprocess": float(combined_reid_timing.get("postprocess", 0.0)),
             "reid_total": float(combined_reid_timing.get("total", 0.0)),
             "reid_detections": float(combined_reid_timing.get("detections", 0.0)),
@@ -591,6 +1054,7 @@ class RKNNVisionPipeline:
             "reid_verify_detections": float((verify_timing or {}).get("detections", 0.0)),
             "reid_verify_features": float((verify_timing or {}).get("features", 0.0)),
             "tracker": _elapsed_ms(reid_end, tracker_end),
+            "reid_diagnostics": diagnostics_ms,
             "predicted_reid_verify": _elapsed_ms(verify_start, verify_end) if verify_timing is not None else 0.0,
             "total": _elapsed_ms(frame_start, verify_end),
         }
@@ -604,6 +1068,57 @@ class RKNNVisionPipeline:
                 len(records),
             )
         return records
+
+    def set_frame_context(
+        self,
+        *,
+        control_frame_id: int,
+        capture_frame_id: int,
+        capture_timestamp: float,
+        yaw_rate_dps: Optional[float] = None,
+        integrated_yaw_deg: Optional[float] = None,
+    ) -> None:
+        self._frame_context = {
+            "control_frame_id": int(control_frame_id),
+            "capture_frame_id": int(capture_frame_id),
+            "capture_timestamp": float(capture_timestamp),
+        }
+        if yaw_rate_dps is not None:
+            self._frame_context["yaw_rate_dps"] = float(yaw_rate_dps)
+        if integrated_yaw_deg is not None:
+            self._frame_context["integrated_yaw_deg"] = float(integrated_yaw_deg)
+
+    def _record_reid_diagnostics(self, frame: Any, frame_format: str) -> None:
+        writer = self._reid_diagnostics
+        if writer is None:
+            return
+        # The tracker carries detector indices through association and NMS;
+        # never infer the ReID crop from the expanded, filtered display box.
+        for observation in self.tracker.last_identity_observations:
+            assignment = observation["assignment"]
+            reason = str(assignment.get("reason", ""))
+            ordinary = reason in ("mapped", "skip_update_redundant", "skip_update_distance")
+            if (
+                ordinary
+                and not assignment.get("bank_updated", False)
+                and observation["frame_index"] % self.config.reid_diagnostics_mapped_interval != 0
+            ):
+                continue
+            metadata = dict(observation)
+            metadata.update(self._frame_context)
+            metadata.setdefault("control_frame_id", observation["frame_index"])
+            evidence = assignment.get("match_evidence") or {}
+            winner_metadata = (evidence.get("winner") or {}).get("metadata") or {}
+            anchor_metadata = evidence.get("anchor_metadata") or {}
+            metadata["matched_template_sample_path"] = writer.sample_path(
+                winner_metadata.get("control_frame_id", winner_metadata.get("frame_index")),
+                winner_metadata.get("track_id"),
+            )
+            metadata["anchor_sample_path"] = writer.sample_path(
+                anchor_metadata.get("control_frame_id", anchor_metadata.get("frame_index")),
+                anchor_metadata.get("track_id"),
+            )
+            writer.submit(frame, observation["detector_bbox"], metadata, frame_format=frame_format)
 
     def set_identity_reacquire_context(
         self,
@@ -623,6 +1138,8 @@ class RKNNVisionPipeline:
         self.detector.set_search_diagnostic_active(bool(enabled))
         if not enabled:
             self.last_search_candidate_evidence = SearchCandidateEvidence()
+            self.last_search_probe_clusters = []
+            self.last_search_probe_cluster_diagnostics = ()
 
     def get_search_candidate_evidence(self) -> SearchCandidateEvidence:
         """Return the latest immutable detector evidence for the control gate."""
@@ -683,7 +1200,14 @@ class RKNNVisionPipeline:
             )
             for rec in predicted
         ]
-        features = self.reid.extract(packet, detections, frame_format)
+        try:
+            features = self.reid.extract(
+                packet, detections, frame_format, compute_partial=False
+            )
+        except TypeError:
+            # Test/detector adapters predating the optional keyword still
+            # expose the original three-argument extractor API.
+            features = self.reid.extract(packet, detections, frame_format)
         threshold = float(self.config.predicted_reid_verify_threshold)
         verified_by_track = {}
         verification_items = []
@@ -753,6 +1277,16 @@ class RKNNVisionPipeline:
         self.reid.load()
 
     def close(self) -> None:
+        if self._reid_diagnostics is not None:
+            self._reid_diagnostics.close()
+            if self.logger is not None:
+                self.logger.info(
+                    "reid_diagnostics_summary written=%d dropped=%d failed=%d dir=%s",
+                    self._reid_diagnostics.written_samples,
+                    self._reid_diagnostics.dropped_samples,
+                    self._reid_diagnostics.failed_samples,
+                    self.config.reid_diagnostics_dir,
+                )
         self.detector.release()
         self.reid.release()
 

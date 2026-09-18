@@ -98,8 +98,12 @@ class KalmanFilter:
             projected_cov = projected_cov[:2, :2]
             measurements = measurements[:, :2]
         d = measurements - projected_mean
-        z = _solve_cholesky(projected_cov, d.T)
-        return np.sum(z * z, axis=0)
+        inverse_weighted_residual = _solve_cholesky(projected_cov, d.T)
+        # The shared solver returns S^-1 d, not the whitened residual L^-1 d.
+        # Squaring that result would apply the inverse covariance twice,
+        # weakening position/size gating while over-penalizing aspect changes.
+        # Keep the solver's full inverse-product contract used by update().
+        return np.sum(d.T * inverse_weighted_residual, axis=0)
 
 
 def _solve_cholesky(a, b):

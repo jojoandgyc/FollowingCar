@@ -197,6 +197,33 @@ def test_current_untracked_probe_cannot_reverse_active_search_without_continuity
     assert decision.reason == "search_right"
 
 
+def test_geometry_continuous_unconfirmed_candidate_cannot_reverse_active_search():
+    controller = _searching_controller(
+        "left",
+        search_cooldown=0,
+        search_candidate_untracked_min_score=0.10,
+    )
+    controller._candidate_geometry_anchor_bbox = controller._normalize_candidate_bbox(
+        (470.0, 40.0, 610.0, 440.0),
+        frame_width=640,
+    )
+    controller._candidate_geometry_anchor_capture_frame_id = 100
+
+    decision = controller.decide(
+        101,
+        _candidate_frame(
+            101,
+            (480.0, 42.0, 620.0, 442.0),
+            0.84,
+            active_target_match=False,
+        ),
+    )
+
+    assert controller.search_direction == "left"
+    assert decision.actions and decision.actions[0].kind == "rotate_left"
+    assert decision.reason == "search_left"
+
+
 def test_candidate_below_untracked_threshold_cannot_switch_search():
     controller = _searching_controller(
         "right",
@@ -298,6 +325,35 @@ def test_untracked_candidate_above_direction_threshold_cannot_override_history_d
     assert controller._lost_exit_direction == "right"
 
 
+def test_untracked_candidate_cannot_seed_geometry_for_later_opposite_switch():
+    controller = _searching_controller("right")
+
+    # Two detector-only boxes on the left may be visually continuous with one
+    # another, but that continuity is not evidence that they are the locked
+    # target. They must not redirect the active search sweep.
+    controller.note_search_candidate_evidence(
+        (60.0, 40.0, 180.0, 430.0),
+        frame_width=640,
+        confirmed=True,
+        source="formal",
+        candidate_score=0.84,
+        candidate_tracked=False,
+        capture_frame_id=100,
+    )
+    controller.note_search_candidate_evidence(
+        (70.0, 42.0, 190.0, 432.0),
+        frame_width=640,
+        confirmed=True,
+        source="formal",
+        candidate_score=0.86,
+        candidate_tracked=False,
+        capture_frame_id=101,
+    )
+
+    assert controller.search_direction == "right"
+    assert controller._lost_exit_direction == "right"
+
+
 def test_blocked_high_score_untracked_candidate_cannot_reverse_search():
     controller = _searching_controller("left")
 
@@ -315,6 +371,28 @@ def test_blocked_high_score_untracked_candidate_cannot_reverse_search():
     assert controller.search_state == "searching"
     assert controller.search_direction == "left"
     assert controller._lost_exit_direction == "left"
+
+
+def test_strong_reid_evidence_can_reverse_frozen_search_without_uid_binding():
+    controller = _searching_controller("left")
+
+    # The search gate has already completed its two-frame observation.  A
+    # fresh DeepSORT track can therefore redirect the sweep when the identity
+    # bank reports a strong match, even though the positive UID is not bound
+    # to that track yet.
+    controller.note_search_candidate_evidence(
+        (500.0, 40.0, 625.0, 430.0),
+        frame_width=640,
+        confirmed=False,
+        source="blocked",
+        candidate_score=0.84,
+        candidate_tracked=False,
+        candidate_identity_match=True,
+    )
+
+    assert controller.search_state == "searching"
+    assert controller.search_direction == "right"
+    assert controller._lost_exit_direction == "right"
 
 
 def test_discontinuous_opposite_person_keeps_last_target_exit_direction():

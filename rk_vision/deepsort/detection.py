@@ -12,6 +12,7 @@ class Detection:
         feature: Optional[Any],
         *,
         store_feature: bool = True,
+        source_detection_index: Optional[int] = None,
     ) -> None:
         np = _np()
         self.tlwh = np.asarray(tlwh, dtype="float32")
@@ -19,6 +20,7 @@ class Detection:
         self.cls = int(label)
         self.feature = None if feature is None else np.asarray(feature, dtype="float32").reshape(-1)
         self.store_feature = bool(store_feature)
+        self.source_detection_index = source_detection_index
 
     def to_tlbr(self):
         ret = self.tlwh.copy()

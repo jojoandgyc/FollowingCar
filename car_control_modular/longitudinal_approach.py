@@ -9,16 +9,26 @@ import math
 from typing import Optional
 
 
-def closure_rotation_bound(*, depth, bearing_deg, yaw_dps, geometry_age=0.):
-    """Upper bound on rotation's Z-rate in the existing <=15deg/s domain.
+def closure_rotation_bound(*, depth, bearing_deg, yaw_dps, geometry_age=0.,
+                           max_yaw_dps=15., turning_geometry_max_age_sec=.18):
+    """Upper bound on rotation's Z-rate, not target-velocity permission.
 
     Broader bearing is permitted for a conservative CLOSURE bound, not for
     target-speed matching. Includes bearing uncertainty since RGB capture.
     Near-axis pinhole/short-interval assumption; not a calibrated safety model.
     """
-    if not all(math.isfinite(v) for v in (depth, bearing_deg, yaw_dps, geometry_age)):
+    if not all(math.isfinite(v) for v in (depth, bearing_deg, yaw_dps, geometry_age,
+                                         max_yaw_dps, turning_geometry_max_age_sec)):
         return None
-    if depth <= 0 or abs(yaw_dps) > 15 or not -.02 <= geometry_age <= (.25 if abs(yaw_dps) <= 5 else .18):
+    # PI closure may retain a near-axis observation during a short wheel
+    # transient. Keep the legacy15 default and never widen the .25m/s spatial
+    # uncertainty budget or45deg projected bearing. PI may use the accepted
+    # 250ms ROI window, with its age included in the uncertainty calculation;
+    # legacy turning geometry still expires at180ms. Neither renews Depth.
+    if not 0 < max_yaw_dps <= 35 or not .18 <= turning_geometry_max_age_sec <= .25:
+        return None
+    if depth <= 0 or abs(yaw_dps) > max_yaw_dps or not -.02 <= geometry_age <= (
+            .25 if abs(yaw_dps) <= 5 else turning_geometry_max_age_sec):
         return None
     angle = abs(bearing_deg) + abs(yaw_dps) * abs(geometry_age)
     if angle > 45:

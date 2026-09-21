@@ -390,6 +390,7 @@ class FollowPolicyConfig:
     visible_motion_projection_gain: float = 0.80
     visible_motion_strong_ratio: float = 0.05
     visible_steering_pid_enable: bool = False
+    visible_steering_pid_forward_tracking_enable: bool = False
     visible_steering_pid_camera_hfov_deg: float = 90.0
     visible_steering_pid_camera_latency_sec: float = 0.13
     visible_steering_pid_deadband_deg: float = 1.2
@@ -588,6 +589,7 @@ class FollowSafetyController:
         self._distance_pi_motion_memory_allowed = False
         self._distance_pi_raw_distance_m = None
         self._closure_rejected_observation = None
+        self._closure_reject_log_key = None
         # Same physical input stream, separate qualifications. FF rejection
         # must not erase already-qualified closure evidence.
         self._matching_motion_window = RawDepthClosingWindow()
@@ -998,6 +1000,47 @@ class FollowSafetyController:
             self._target_direction_history.record_unknown(
                 int(capture_frame_id), float(timestamp), str(reason or "direction_classifier_unknown")
             )
+
+    def note_brake_hold_observation(self, frame: SensorFrame, target: PersonTarget) -> bool:
+        """Record already verified identity geometry, never a motion decision.
+
+        The caller performs the current-frame identity/quality gates. A stop
+        may inhibit actuators, but must not freeze the target's capture history.
+        """
+        if (not self.cfg.direction_history_enable
+                or self.active_target_id != target.track_id
+                or frame.capture_frame_id <= self._direction_latest_visible_capture_id):
+            return False
+        previous = [e for e in self._target_direction_history.entries
+                    if e.state == "visible" and e.target_id == target.track_id]
+        if previous and frame.capture_timestamp <= previous[-1].timestamp:
+            return False
+        self._record_target_direction_evidence(frame, target, reliable=True)
+        self.last_person_center_x = target.center[0]
+        return True
+
+    def invalidate_pre_brake_steering(self) -> None:
+        """Drop stale lateral output only; leave distance/safety authority alone."""
+        self._reset_visible_steer_memory()
+        self._reset_visible_motion()
+        self._visual_steering_pid.reset()
+        self._parked_recenter_pid.reset()
+        self.last_steering_pid_result = None
+
+    def resume_direction_after_brake_hold(self, uid: int, capture_frame_id: int) -> bool:
+        """Require a new normal decision, using the history collected at rest.
+
+        This releases no motor stop and grants no depth/identity authorization.
+        An unconfirmed candidate or a different UID cannot reset search state.
+        """
+        if (uid != self.active_target_id
+                or capture_frame_id != self._direction_latest_visible_capture_id):
+            return False
+        self.release_search_on_confirmed_target("brake_hold_trusted_observation")
+        self._lost_hint_source = "none"
+        self._lost_hint_confidence = 0.0
+        self.invalidate_pre_brake_steering()
+        return True
 
     def _record_target_direction_evidence(
         self,
@@ -1794,13 +1837,20 @@ class FollowSafetyController:
     def _observe_distance_closure(self, frame, target, uid, stamp, now, trusted):
         """Distance/braking evidence independent of target-speed eligibility."""
         w, fb = self._raw_closing_window, frame.steering_feedback
-        def reject_geometry():
+        def reject_geometry(reason):
+            key = (uid, stamp, reason)
+            if key != self._closure_reject_log_key:
+                logger.info(
+                    'distance_closure_rejected capture_frame_id=%s uid=%s sample_ts=%s '
+                    'reason=%s prior_samples=%s fallback=encoder_bound deadline_renewed=False',
+                    frame.capture_frame_id, uid, stamp, reason, len(w.samples))
+                self._closure_reject_log_key = key
             w.reset()
             self._distance_pid.invalidate_motion_memory()
         if not trusted:
             if (frame.distance_state.raw_distance_m is not None
                     or (w.samples and now-w.samples[-1][0] > w.max_gap_sec)):
-                reject_geometry()
+                reject_geometry('untrusted_depth_or_gap')
             return
         if self._closure_rejected_observation == (uid, stamp):
             # Multiple callers cannot turn the same rejected raw jump into
@@ -1812,13 +1862,13 @@ class FollowSafetyController:
                 or not 0 <= now-fb.timestamp <= .15 or abs(fb.timestamp-stamp) > .15
                 or not all(math.isfinite(v) and abs(v) <= self._longitudinal_feedforward.config.max_abs_ego_rpm
                            for v in (fb.left_forward_rpm,fb.right_forward_rpm))):
-            reject_geometry()
+            reject_geometry('encoder_invalid_or_unsynchronized')
             return
         yaw_values = [fb.yaw_rate_right_dps]
         if fb.raw_yaw_rate_right_dps is not None:
             yaw_values.append(fb.raw_yaw_rate_right_dps)
         if not all(math.isfinite(v) for v in yaw_values) or frame.width <= 0:
-            reject_geometry()
+            reject_geometry('invalid_yaw_or_image_geometry')
             return
         yaw = max(yaw_values,key=abs)
         obs = getattr(target,'depth_observation',None)
@@ -1826,21 +1876,31 @@ class FollowSafetyController:
         cx = target.center[0]
         if obs is not None:
             if obs.target_id != uid or obs.source != 'yolo_detector':
-                reject_geometry()
+                reject_geometry('geometry_identity_or_source')
                 return
             age = stamp-obs.capture_timestamp
             cx = .5*(obs.bbox[0]+obs.bbox[2])
         elif abs(yaw) > 5:
-            reject_geometry()
+            reject_geometry('missing_detector_geometry_while_turning')
             return
         fx = .5*frame.width/math.tan(math.radians(self.cfg.visible_steering_pid_camera_hfov_deg)*.5)
         bearing = math.degrees(math.atan((cx-.5*frame.width)/fx))
         raw = frame.distance_state.raw_distance_m
+        # Closure uses a WORST-CASE rotation magnitude, so raw/filtered yaw
+        # disagreement need not erase a usable near-axis depth window. This
+        # does not relax human-speed matching or authorize predicted depth.
+        max_closure_yaw = 35. if self.distance_pi_enabled else 15.
+        # Depth has ALREADY passed identity/ROI/freshness checks. Don't erase
+        # closure solely when yaw crosses 5dps and that ROI is 180--250ms old.
+        # Angular uncertainty still grows with age; .25m/s remains a hard veto.
+        geometry_max_age = .25 if self.distance_pi_enabled else .18
         bound = None if raw is None else closure_rotation_bound(
-            depth=raw,bearing_deg=bearing,yaw_dps=yaw,geometry_age=age)
+            depth=raw,bearing_deg=bearing,yaw_dps=yaw,geometry_age=age,
+            max_yaw_dps=max_closure_yaw, turning_geometry_max_age_sec=geometry_max_age)
         if bound is None:
-            reject_geometry()
+            reject_geometry('rotation_bound_or_geometry_age')
             return
+        self._closure_reject_log_key = None
         is_new = not w.samples or stamp > w.samples[-1][0]
         rate = w.update(uid=uid,stamp=stamp,raw=raw,rotation=bound)
         if w.samples and w.samples[-1][0] == stamp and rate is not None:
@@ -1861,9 +1921,12 @@ class FollowSafetyController:
         if is_new:
             logger.info(
                 'distance_closure capture_frame_id=%s uid=%s sample_ts=%s source=%s samples=%s '
-                'span_ms=%.1f rate=%s rotation_bound=%s bearing=%s max_gap_ms=%.0f ff_required=False deadline_renewed=False',
+                'span_ms=%.1f rate=%s rotation_bound=%s bearing=%s max_gap_ms=%.0f '
+                'yaw_bound_dps=%s geometry_age_ms=%.1f max_yaw_dps=%s geometry_limit_ms=%.0f '
+                'ff_required=False deadline_renewed=False',
                 frame.capture_frame_id,uid,stamp,self._braking_rate_source,len(w.samples),
-                w.span*1000,rate,bound,bearing,w.max_gap_sec*1000.)
+                w.span*1000,rate,bound,bearing,w.max_gap_sec*1000.,
+                yaw,age*1000.,max_closure_yaw,geometry_max_age*1000.)
 
     def _observe_longitudinal_motion(
         self, frame: SensorFrame, target: Optional[PersonTarget], *, allowed: bool = True
@@ -2443,6 +2506,7 @@ class FollowSafetyController:
                 # Read-time braking/identity vetoes need not have mutated the
                 # canonical tuple. Never continue a ramp solely on its clock.
                 self.suspend_longitudinal_authority(sample_now, "no_live_grant_before_pi")
+        previous_pi_result = self.last_distance_pid_result
         result = self._distance_pid.update(
             float(distance_m),
             float(self.cfg.target_distance_m),
@@ -2480,7 +2544,8 @@ class FollowSafetyController:
                 "software_rise_bypassed=%s demand_limit_reason=%s feedback_age_ms=%s "
                 "feedback_ts=%s depth_feedback_skew_ms=%s kp_per_sec=%.3f "
                 "launch_masks_pi=%s brake_limit_loss_rpm=%.2f motion_origin_ts=%s "
-                "motion_uncertainty_m_s=%.3f deadline_renewed=False",
+                "motion_uncertainty_m_s=%.3f brake_recovery_limited=%s "
+                "brake_recovery_anchor_rpm=%.2f deadline_renewed=False",
                 self.active_target_id, physical_stamp, result.error_m, result.p_rpm,
                 result.i_rpm, result.output_rpm, result.unslewed_output_rpm,
                 result.approach_cap_rpm, result.pi_status, self._braking_rate_source,
@@ -2497,7 +2562,22 @@ class FollowSafetyController:
                 result.pi_launch_floor_rpm > result.pi_demand_rpm,
                 max(0., result.pi_total_demand_rpm-result.approach_cap_rpm),
                 result.pi_motion_origin_ts, result.pi_motion_uncertainty_m_s,
+                result.pi_brake_recovery_limited, result.pi_brake_recovery_anchor_rpm,
             )
+            if (previous_pi_result is not None and previous_pi_result.approach_mode == 'distance_pi'
+                    and (previous_pi_result.pi_brake_source != result.pi_brake_source
+                         or abs(result.output_rpm-previous_pi_result.output_rpm) > 10)):
+                logger.info(
+                    'distance_brake_transition uid=%s sample_ts=%s previous_source=%s source=%s '
+                    'previous_rpm=%s request_rpm=%s delta_rpm=%s envelope_rpm=%s '
+                    'limit_reason=%s recovery_anchor_rpm=%.2f closure_source=%s '
+                    'motion_origin_ts=%s memory_allowed=%s depth_age_ms=%.1f deadline_renewed=False',
+                    self.active_target_id, physical_stamp, previous_pi_result.pi_brake_source,
+                    result.pi_brake_source, previous_pi_result.output_rpm, result.output_rpm,
+                    result.output_rpm-previous_pi_result.output_rpm, result.approach_cap_rpm,
+                    result.pi_demand_limit_reason, result.pi_brake_recovery_anchor_rpm,
+                    self._braking_rate_source, result.pi_motion_origin_ts,
+                    self._distance_pi_motion_memory_allowed, (sample_now-physical_stamp)*1000.)
         elif result.approach_mode != "legacy_pid":
             logger.info(
                 "longitudinal_approach uid=%s sample_ts=%s mode=%s distance_m=%.3f "
@@ -6424,6 +6504,7 @@ class FollowSafetyController:
         visual_age_sec: Optional[float] = None,
         near_distance_mode: bool = False,
         hold_zero: bool = False,
+        allow_forward_tracking: bool = True,
     ) -> VisualSteeringPidResult:
         """Apply the same yaw constraints on camera and encoder refresh ticks."""
         disable_rate_feedforward = bool(
@@ -6442,6 +6523,11 @@ class FollowSafetyController:
             ),
             target_speed_match_max_closing_dps_override=(
                 0.0 if disable_rate_feedforward or hold_zero else None
+            ),
+            forward_tracking=bool(
+                self.cfg.visible_steering_pid_forward_tracking_enable
+                and allow_forward_tracking and pid is self._visual_steering_pid
+                and not hold_zero and not near_distance_mode
             ),
         )
         near_center_zero = bool(
@@ -6504,6 +6590,7 @@ class FollowSafetyController:
         max_correction_rpm: Optional[float] = None,
         visual_age_sec: Optional[float] = None,
         hold_zero: bool = False,
+        allow_forward_tracking: bool = True,
     ) -> VisualSteeringPidResult:
         """Refresh the existing visible-target PID between detector results.
 
@@ -6521,6 +6608,7 @@ class FollowSafetyController:
             max_correction_rpm=max_correction_rpm,
             visual_age_sec=visual_age_sec,
             hold_zero=hold_zero or self._visible_pid_center_hold(x_ratio),
+            allow_forward_tracking=allow_forward_tracking,
         )
         guard_reason = self._pid_direction_guard_reason(
             float(x_ratio),

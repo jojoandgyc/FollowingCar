@@ -38,6 +38,10 @@ class SearchCandidateGateConfig:
     # new observation candidate; re-arm once, while ordinary coordinate drift
     # remains blocked by the missing-frame rule above.
     blocked_rearm_area_ratio: float = 3.0
+    # Runtime enables this observation-only filter; zero preserves standalone
+    # callers' legacy behavior. Full/partial identity matching is unaffected.
+    probe_edge_min_score: float = 0.0
+    probe_edge_center_ratio: float = 0.15
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,7 @@ class SearchCandidateGate:
         self._blocked_bbox: Optional[BBox] = None
         self._blocked_missing_frames = 0
         self._last_timestamp: Optional[float] = None
+        self.last_ignored_edge_probes: Tuple[CandidateObservation, ...] = ()
 
     @property
     def hold_active(self) -> bool:
@@ -91,6 +96,7 @@ class SearchCandidateGate:
         self._blocked_bbox = None
         self._blocked_missing_frames = 0
         self._last_timestamp = None
+        self.last_ignored_edge_probes = ()
 
     @staticmethod
     def _iou(first: BBox, second: BBox) -> float:
@@ -173,6 +179,24 @@ class SearchCandidateGate:
             return probe[0], "probe", False
         return None, "none", False
 
+    def _observation_probes(self, probes, *, width, preferred_bbox):
+        """Keep weak edge boxes as diagnostics, not stop/turn permissions.
+
+        preferred_bbox is supplied only by the runtime's current active/strong
+        identity path, never by the old exit-position geometry anchor.
+        """
+        accepted, ignored = [], []
+        margin = max(0.0, min(0.49, float(self.config.probe_edge_center_ratio)))
+        for item in probes:
+            center = (item.bbox[0] + item.bbox[2]) / (2.0 * max(1, width))
+            preferred = preferred_bbox is not None and self._iou(
+                preferred_bbox, item.bbox
+            ) >= max(0.5, float(self.config.consistency_iou))
+            weak_edge = (float(item.score) < float(self.config.probe_edge_min_score)
+                         and (center <= margin or center >= 1.0 - margin))
+            (ignored if weak_edge and not preferred else accepted).append(item)
+        return tuple(accepted), tuple(ignored)
+
     def _start_hold(
         self,
         candidate: CandidateObservation,
@@ -229,13 +253,16 @@ class SearchCandidateGate:
             min_score=self.config.probe_min_score,
             below_score=self.config.formal_min_score,
         )
+        probe, ignored = self._observation_probes(probe, width=width, preferred_bbox=preferred_bbox)
         candidate, source, preferred_match = self._select_current(
             formal,
             probe,
             preferred_bbox,
         )
         if candidate is None:
-            return SearchCandidateGateDecision(reason="no_candidate")
+            return SearchCandidateGateDecision(reason=(
+                "edge_low_score_probe_ignored" if ignored else "no_candidate"
+            ))
         return SearchCandidateGateDecision(
             source=source,
             reason=(
@@ -283,11 +310,34 @@ class SearchCandidateGate:
             min_score=self.config.probe_min_score,
             below_score=self.config.formal_min_score,
         )
+        probe, ignored = self._observation_probes(probe, width=width, preferred_bbox=preferred_bbox)
+        self.last_ignored_edge_probes = ignored
         current, current_source, preferred_match = self._select_current(
             formal,
             probe,
             preferred_bbox,
         )
+
+        # A previously eligible probe may degrade into a weak edge sliver.
+        # Release ITS observation immediately, but never cancel an unrelated
+        # formal/strong candidate's hold or any external safety hold.
+        cancelled = bool(
+            current is None and self.hold_active and self._hold_source == "probe"
+            and self._hold_bbox is not None
+            and any(self._iou(self._hold_bbox, item.bbox) >= float(self.config.consistency_iou)
+                    for item in ignored)
+        )
+        if cancelled:
+            self._hold_remaining = 0
+            self._hold_started_at = None
+            self._hold_bbox = None
+            self._hold_source = "none"
+        if current is None and ignored and not self.hold_active:
+            self._probe_bbox = None
+            self._probe_streak = 0
+            return SearchCandidateGateDecision(
+                reason="edge_low_score_probe_ignored", completed=cancelled,
+            )
 
         if self._hold_remaining > 0:
             # Keep the observation attached to the same moving person. The
@@ -431,14 +481,19 @@ class SearchCandidateGate:
             return SearchCandidateGateDecision(reason="no_candidate")
 
         candidate = current
-        if self._probe_bbox is not None and self._iou(
+        old_area = (0.0 if self._probe_bbox is None else
+                    (self._probe_bbox[2] - self._probe_bbox[0]) * (self._probe_bbox[3] - self._probe_bbox[1]))
+        new_area = (candidate.bbox[2] - candidate.bbox[0]) * (candidate.bbox[3] - candidate.bbox[1])
+        area_continuous = old_area > 0 and min(old_area, new_area) >= 0.5 * max(old_area, new_area)
+        if area_continuous and self._probe_bbox is not None and self._iou(
             self._probe_bbox, candidate.bbox
         ) >= float(self.config.consistency_iou):
             self._probe_streak += 1
         else:
             self._probe_streak = 1
         self._probe_bbox = candidate.bbox
-        if self._probe_streak < max(1, int(self.config.probe_confirm_frames)):
+        required_frames = 1 if preferred_match else max(1, int(self.config.probe_confirm_frames))
+        if self._probe_streak < required_frames:
             return SearchCandidateGateDecision(
                 source="probe",
                 reason=(

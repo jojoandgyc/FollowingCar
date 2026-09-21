@@ -93,7 +93,7 @@ def test_memory_cannot_hide_safety_or_identity_event(event):
     args = dict(valid=False, rate=-1.)
     if event == 'permission': args['allow'] = False
     if event == 'feedback': args['ego'] = None
-    if event == 'near': args['distance'] = 1.7
+    if event == 'near': args['distance'] = 1.52  # inside hold band, not an arbitrary 30cm cliff
     if event == 'jump': args['jump'] = True
     if event == 'safety': c.suspend(100.02, 'hazard', retain=False)
     if event == 'target': c.reset()

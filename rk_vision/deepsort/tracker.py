@@ -5,6 +5,7 @@ from typing import Callable, Optional, Sequence
 from . import iou_matching, kalman_filter, linear_assignment
 from .nn_matching import NearestNeighborDistanceMetric
 from .track import Track
+from ..stage_timing import StageTiming
 
 
 MatchValidator = Callable[[int, Optional[int]], bool]
@@ -38,7 +39,9 @@ class Tracker:
         *,
         match_validator: Optional[MatchValidator] = None,
     ) -> None:
+        timer = StageTiming()
         matches, unmatched_tracks, unmatched_detections = self._match(detections, match_validator)
+        timer.mark("match")
 
         for track_idx, detection_idx in matches:
             self.tracks[track_idx].update(self.kf, detections[detection_idx])
@@ -47,6 +50,7 @@ class Tracker:
         for detection_idx in unmatched_detections:
             self._initiate_track(detections[detection_idx])
         self.tracks = [track for track in self.tracks if not track.is_deleted()]
+        timer.mark("kalman_update")
 
         active_targets = [track.track_id for track in self.tracks if track.is_confirmed()]
         features = []
@@ -60,6 +64,8 @@ class Tracker:
                     targets.append(track.track_id)
             track.features = []
         self.metric.partial_fit(features, targets, active_targets)
+        timer.mark("metric_update")
+        self.last_timing_ms = timer.finish()
 
     def _match(self, detections: Sequence, match_validator: Optional[MatchValidator] = None):
         validation_results = {}

@@ -81,6 +81,8 @@ class DistancePiResult:
     demand_limit_reason: str = "none"
     motion_origin_ts: Optional[float] = None
     motion_uncertainty_m_s: float = 0.
+    brake_recovery_limited: bool = False
+    brake_recovery_anchor_rpm: float = 0.
 
 
 class DistancePiController:
@@ -102,8 +104,12 @@ class DistancePiController:
         self._stationary_samples = 0
         self.last_result = None
         self._motion_memory = None
+        self._brake_recovery_pending = False
 
     def invalidate_motion_memory(self):
+        if (self.config.motion_memory_sec > 0 and self.last_result is not None
+                and self.last_result.brake_source in {"raw_relative_motion", "relative_motion_memory"}):
+            self._brake_recovery_pending = True
         self._motion_memory = None
 
     def suspend(self, now: float, reason: str, *, retain: bool = True,
@@ -119,7 +125,7 @@ class DistancePiController:
             self._execution_suspended = True
             self._stationary_samples = 0
         if not retain:
-            self._motion_memory = None
+            self.invalidate_motion_memory()
 
     def accept_output_limit(self, sample_timestamp: float, approved_rpm: float,
                             *, quantization_rpm: float = 0.) -> bool:
@@ -206,7 +212,7 @@ class DistancePiController:
             # Rejection is not a new distance anchor: a repeated background
             # return must not become accepted merely by appearing twice here.
             self.suspend(execution_now, "measurement_jump", reset_execution=True)
-            self._motion_memory = None
+            self.invalidate_motion_memory()
             return DistancePiResult(sample_timestamp, error, integral_m_s=self.integral_m_s,
                                     status="measurement_jump")
         if self._last_target is not None and target_distance_m != self._last_target:
@@ -243,8 +249,9 @@ class DistancePiController:
             self._motion_memory = (sample_timestamp, float(range_rate_m_s), ego, raw_distance_m)
             motion_origin = sample_timestamp
         elif (c.motion_memory_sec > 0 and allow_motion_memory and not raw_closure_valid and ego_valid
-              and memory is not None and error > max(.30, deadband_m)
+              and memory is not None and error > deadband_m
               and raw_distance_m is not None and math.isfinite(raw_distance_m) and raw_distance_m > 0
+              and raw_distance_m-target_distance_m > deadband_m
               and memory[3] is not None and math.isfinite(memory[3]) and memory[3] > 0
               and 0 < execution_now-memory[0] <= c.motion_memory_sec):
             # Correct the old relative rate for measured car-speed changes.
@@ -262,6 +269,9 @@ class DistancePiController:
             memory_used = True
         else:
             self._motion_memory = None
+        if (not relative_valid and c.motion_memory_sec > 0 and self.last_result is not None
+                and self.last_result.brake_source in {"raw_relative_motion", "relative_motion_memory"}):
+            self._brake_recovery_pending = True
         finite_rate = range_rate_m_s is not None and math.isfinite(range_rate_m_s)
         rate = (range_rate_m_s if relative_valid or memory_used else
                 min(-ego, range_rate_m_s) if finite_rate else -ego)
@@ -339,8 +349,24 @@ class DistancePiController:
             output = max(output, anchor-fall_rpm_per_sec*slew_dt)
         # Comfort deceleration cannot override braking, true stop or saturation.
         output = max(0., min(output, cap)) if request > 0 else 0.
+        # Restored evidence must not turn launch into a one-sample low->high
+        # rebound. Only this transition uses the normal rise budget, not
+        # initial launch/continuous valid tracking. A tighter brake wins NOW.
+        # No fixed wait, 5RPM restart, or clock renewed by missing evidence.
+        brake_recovery_limited = False
+        recovery_anchor = 0.
+        if relative_valid and self._brake_recovery_pending:
+            recovery_anchor = min(self._approved_rpm, anchor) if recovering else self._approved_rpm
+            rise_budget = rise_rpm_per_sec if rise_rpm_per_sec > 0 else 240.
+            recovery_cap = recovery_anchor + rise_budget*min(slew_dt, c.fresh_update_max_age_sec)
+            brake_recovery_limited = output > recovery_cap+1e-9
+            output = min(output, recovery_cap)
+            # Repeated dropouts preserve progress, rather than restart a
+            # fixed low-speed stage. Downstream limits feed the next anchor.
+            self._brake_recovery_pending = brake_recovery_limited
         slew_limited = abs(output-request) > 1e-9
-        limit_reason = ("braking_envelope" if demand > cap+1e-9 and cap < max_output_rpm-1e-9
+        limit_reason = ("brake_evidence_recovery" if brake_recovery_limited else
+                        "braking_envelope" if demand > cap+1e-9 and cap < max_output_rpm-1e-9
                         else "total_rpm_cap" if demand > cap+1e-9
                         else "software_slew" if slew_limited else "none")
         if output < request-1e-9 and self.integral_m_s > self._integral_before_update:
@@ -358,7 +384,8 @@ class DistancePiController:
                                   "motion_unknown_bound" if motion_available and c.motion_memory_sec > 0 else
                                   "stationary_fallback" if motion_available else "missing_motion_evidence",
                                   slew_limited, frozen, pi_demand, launch_floor, demand,
-                                  launch_active, limit_reason, motion_origin, uncertainty)
+                                  launch_active and not brake_recovery_limited, limit_reason, motion_origin, uncertainty,
+                                  brake_recovery_limited, recovery_anchor)
         self._last_sample_ts, self._last_execution_ts = sample_timestamp, execution_now
         self._last_target = target_distance_m
         self._last_output_rpm = self._approved_rpm = self._sample_requested_rpm = output

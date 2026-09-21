@@ -22,7 +22,7 @@ class LateralControlIntent:
     base_percent: int
     base_rpm: int
     initial_correction_rpm: int
-    correction_limit_rpm: float
+    correction_limit_rpm: float  # Persistent policy ceiling; PID recomputes transient caps.
     confidence: float
     bbox_quality: str
     reason: str
@@ -38,6 +38,13 @@ class LateralControlIntent:
     # Whole-chassis NORMAL parking, only with zero longitudinal authority.
     # Unlike hold_zero, this survives old-frame refreshes and zero writes.
     park_requested: bool = False
+    nominal_valid_until: float = 0.0
+
+    def continuation_allowed(self, now: float, feedback) -> bool:
+        """Short forward-only bridge; feedback cannot extend either deadline."""
+        if self.nominal_valid_until <= 0.0 or now <= self.nominal_valid_until:
+            return True
+        return _forward_continuation_evidence(self, now, feedback)
 
     def age_sec(self, now: float) -> float:
         return max(0.0, float(now) - float(self.published_at))
@@ -95,6 +102,41 @@ class LateralIntentStore:
             previous = self._intent
             self._intent = None
             return previous
+
+
+def _forward_continuation_evidence(intent, now, feedback) -> bool:
+    if (intent.mode != "forward" or intent.bbox_quality != "reliable"
+            or intent.hold_zero or intent.park_requested or intent.near_distance_mode
+            or intent.base_rpm <= 0 or intent.capture_timestamp <= 0.0
+            or not 0.0 <= now - intent.capture_timestamp <= 0.35
+            or not intent.valid(now) or feedback is None or not feedback.trustworthy):
+        return False
+    yaw = float(feedback.yaw_rate_right_dps)
+    age = now - float(feedback.timestamp)
+    raw = getattr(feedback, "raw_yaw_rate_right_dps", None)
+    if (not math.isfinite(yaw) or not 0.0 <= age <= 0.10 or abs(yaw) > 20.0
+            or (raw is not None and (not math.isfinite(float(raw)) or abs(float(raw) - yaw) > 10.0))):
+        return False
+    # Stay well outside the center hold band even under a conservative image
+    # motion bound. Do not bridge an inward target about to cross the center.
+    rate = intent.target_image_rate_dps
+    if rate is not None and not math.isfinite(float(rate)):
+        return False
+    travel = max(abs(yaw), abs(rate or 0.0)) * max(0.0, now - intent.published_at) / 60.0
+    return abs(intent.x_ratio - 0.5) - travel > 0.10
+
+
+def with_forward_continuation(intent: LateralControlIntent, feedback) -> LateralControlIntent:
+    """Reserve at most 220ms after publication / 350ms after capture.
+
+    Admission and each fast tick require fresh cached encoder evidence. Neither
+    a duplicate image nor encoder refresh is allowed to move these deadlines.
+    This is lateral authority only; it cannot renew longitudinal authorization.
+    """
+    deadline = min(intent.published_at + 0.22, intent.capture_timestamp + 0.35)
+    if deadline <= intent.valid_until or not _forward_continuation_evidence(intent, intent.published_at, feedback):
+        return intent
+    return replace(intent, nominal_valid_until=intent.valid_until, valid_until=deadline)
 
 
 def slew_signed_rpm(

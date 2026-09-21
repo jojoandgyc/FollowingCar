@@ -14,8 +14,10 @@ from .action_queue_policy import should_drop_queued_action
 from .mssd_motor import MssdMotorBackend
 from .steering_pid import encoder_yaw_rate_right_dps
 from .wheel_zero_cross import WheelZeroCrossGuard
+from .wheel_response import WheelDifferentialResponse
 from .follow_wheel_clock import FollowWheelClock
 from .follow_distance_hold import FollowDistanceHold
+from .action_command import ActionCommandSnapshot, SearchReacquireBrakeRequest
 
 
 @dataclass(frozen=True)
@@ -168,6 +170,13 @@ class MotionActionRuntime:
         # only; it never authorizes a new forward command or keepalive.
         self._forward_coast_snapshot: Optional[tuple[int, bool]] = None
         self._near_yaw_park_applied = None
+        self._dispatch_context = threading.local()
+        self._current_action_snapshot = None
+        self._search_reacquire_brake_request = None
+        self._search_reacquire_brake_applied = None
+        self._search_reacquire_brake_sent_at = 0.0
+        self._search_reacquire_quiet_count = 0
+        self._search_reacquire_feedback_ts = 0.0
         if not hasattr(owner, "action_queue_lock"):
             owner.action_queue_lock = threading.Lock()
 
@@ -704,6 +713,8 @@ class MotionActionRuntime:
     def can_release_brake_hold(self, action: int) -> bool:
         owner = self.owner
         s = self.symbols
+        if self._search_reacquire_brake_request is not None:
+            return False
         if getattr(owner, "_near_yaw_park_request", None) is not None:
             # Only the observation producer may release this hold, after it
             # validates newer evidence. A queued action is not new evidence.
@@ -1251,6 +1262,7 @@ class MotionActionRuntime:
         s = self.symbols
         while not owner.action_stop_event.is_set():
             try:
+                self._dispatch_context.command = None
                 action_from_queue = False
                 self._service_follow_wheels()
                 self._service_yaw_pulses()
@@ -1304,12 +1316,15 @@ class MotionActionRuntime:
                     dequeue_ts = time.monotonic()
                     with owner.action_queue_lock:
                         park_generation = int(getattr(owner, "_near_yaw_park_generation", 0))
-                        action = owner.action_queue.get_nowait()
+                        queued_command = owner.action_queue.get_nowait()
+                        action = int(queued_command)
+                        command = queued_command if isinstance(queued_command, ActionCommandSnapshot) else None
                         queue_after_pop = list(owner.action_queue.queue)
+                    self._dispatch_context.command = command
                     action_from_queue = True
                     queue_age_ms = (
-                        (dequeue_ts - float(getattr(owner, "_last_action_queue_replace_ts", 0.0))) * 1000.0
-                        if float(getattr(owner, "_last_action_queue_replace_ts", 0.0)) > 0
+                        (dequeue_ts - float(command.enqueued_at if command else getattr(owner, "_last_action_queue_replace_ts", 0.0))) * 1000.0
+                        if float(command.enqueued_at if command else getattr(owner, "_last_action_queue_replace_ts", 0.0)) > 0
                         else -1.0
                     )
                     action_kind_age_ms = (
@@ -1319,13 +1334,13 @@ class MotionActionRuntime:
                     )
                     self.logger.info(
                         "action queue pop: seq=%d frame=%d reason=%s enqueue_frame=%d action=%s remaining=%d queue_after=%s queue_wait_ms=%.1f action_kind_age_ms=%.1f",
-                        int(getattr(owner, "_last_action_queue_seq", 0)),
+                        command.revision if command else int(getattr(owner, "_last_action_queue_seq", 0)),
                         int(getattr(owner, "frame_index", -1)),
-                        getattr(owner, "_last_action_queue_reason", ""),
-                        int(getattr(owner, "_last_action_queue_replace_frame", -1)),
+                        command.reason if command else getattr(owner, "_last_action_queue_reason", ""),
+                        command.control_frame if command else int(getattr(owner, "_last_action_queue_replace_frame", -1)),
                         s.action_names.get(action, str(action)),
                         len(queue_after_pop),
-                        [s.action_names.get(a, str(a)) for a in queue_after_pop],
+                        [s.action_names.get(int(a), str(a)) for a in queue_after_pop],
                         queue_age_ms,
                         action_kind_age_ms,
                     )
@@ -1343,6 +1358,8 @@ class MotionActionRuntime:
                         )
                         continue
                     with owner.command_lock:
+                        if not self._command_revision_write_allowed("queue_adopt"):
+                            continue
                         if not self._near_yaw_park_queue_action_allowed(action, park_generation):
                             if self.hard_stop_check(action):
                                 self.send_stop_with_brake_hold("hard_stop")
@@ -1409,7 +1426,7 @@ class MotionActionRuntime:
                                     self.logger.warning("停顿期 brake 失败: %s", exc)
                             try:
                                 with owner.action_queue_lock:
-                                    owner.action_queue.put_nowait(action)
+                                    owner.action_queue.put_nowait(queued_command)
                             except queue.Full:
                                 self.logger.warning("停顿期旋转命令回队失败(queue满)")
                             time.sleep(0.02)
@@ -1441,6 +1458,9 @@ class MotionActionRuntime:
                                     except Exception as exc:
                                         self.logger.warning("brake 保持态下再次锁轮失败: %s", exc)
                                 continue
+                        # Same-action refreshes also carry a new revision;
+                        # their subsequent keepalive must not retain the old one.
+                        self._current_action_snapshot = command
                         if action == owner.current_command:
                             if action in (s.forward, s.backward, s.steer_left, s.steer_right) or (
                                 action in (s.rotate_left, s.rotate_right)
@@ -1551,7 +1571,7 @@ class MotionActionRuntime:
                                 action_kind_age_ms,
                                 transition_needed,
                                 len(queue_after_pop),
-                                [s.action_names.get(a, str(a)) for a in queue_after_pop],
+                                [s.action_names.get(int(a), str(a)) for a in queue_after_pop],
                             )
                             transition_stop_ms = 0.0
                             if transition_needed:
@@ -1587,6 +1607,7 @@ class MotionActionRuntime:
                             if action in (s.forward, s.backward, s.steer_left, s.steer_right):
                                 owner._rotate_follows_previous_rotate = False
                             owner.current_command = action
+                            self._current_action_snapshot = command
                             if self.rotate_pulse_enabled(action):
                                 owner.command_start_time = None
                             else:
@@ -1720,6 +1741,8 @@ class MotionActionRuntime:
                                     self.send_stop_with_brake_hold("rotate_stale")
 
                 with owner.command_lock:
+                    if getattr(self._dispatch_context, "command", None) is None:
+                        self._dispatch_context.command = self._current_action_snapshot
                     if owner.current_command is not None and not owner.stop_action_execution and not owner.person_detected_flag:
                         if (
                             owner.current_command in (s.rotate_left, s.rotate_right)
@@ -1910,6 +1933,7 @@ class MotionActionRuntime:
         owner = self.owner
         s = self.symbols
         now_ts = time.monotonic()
+        command = getattr(self._dispatch_context, "command", None)
         timing_source = str(getattr(owner, "_last_motor_dispatch_source", "action_queue"))
         enqueue_ts = float(getattr(owner, "_last_action_queue_replace_ts", 0.0))
         enqueue_frame = int(getattr(owner, "_last_action_queue_replace_frame", -1))
@@ -1925,6 +1949,9 @@ class MotionActionRuntime:
                 enqueue_ts = direct_stop_ts
                 enqueue_frame = int(getattr(owner, "_last_stop_command_frame", -1))
                 timing_source = "direct_stop"
+        if command is not None:
+            enqueue_ts, enqueue_frame = command.enqueued_at, command.control_frame
+            timing_source = "command_snapshot"
         queue_to_dispatch_ms = (now_ts - enqueue_ts) * 1000.0 if enqueue_ts > 0 else -1.0
         last_dispatch_ts = float(getattr(owner, "_last_motor_dispatch_ts", 0.0))
         since_last_dispatch_ms = (now_ts - last_dispatch_ts) * 1000.0 if last_dispatch_ts > 0 else -1.0
@@ -1939,14 +1966,14 @@ class MotionActionRuntime:
             self._forward_coast_snapshot = None
         self.logger.info(
             "电机下发时序: 序号=%d 动作=%s 标签=%s source_module=%s reason=%s 依据控制帧=%d 依据采集帧=%d 决策采集帧=%d 入队控制帧=%d 当前控制帧=%d 计时来源=%s 排队到下发=%.1f毫秒 发送耗时=%.1f毫秒 距上次下发=%.1f毫秒 同动作刷新间隔=%.1f毫秒",
-            int(getattr(owner, "_last_action_queue_seq", 0)),
+            command.revision if command else int(getattr(owner, "_last_action_queue_seq", 0)),
             s.action_names.get(action, str(action)),
             label,
-            str(getattr(owner, "_last_command_source_module", "unknown")),
-            getattr(owner, "_last_action_queue_reason", ""),
-            int(getattr(owner, "_last_command_control_frame", -1)),
-            int(getattr(owner, "_last_command_capture_frame", -1)),
-            int(getattr(owner, "_last_decision_capture_frame", -1)),
+            command.source_module if command else str(getattr(owner, "_last_command_source_module", "unknown")),
+            command.reason if command else getattr(owner, "_last_action_queue_reason", ""),
+            command.control_frame if command else int(getattr(owner, "_last_command_control_frame", -1)),
+            command.capture_frame_id if command else int(getattr(owner, "_last_command_capture_frame", -1)),
+            command.capture_frame_id if command else int(getattr(owner, "_last_decision_capture_frame", -1)),
             enqueue_frame,
             int(getattr(owner, "frame_index", -1)),
             timing_source,
@@ -2046,6 +2073,10 @@ class MotionActionRuntime:
         exits that mode. Thus a stale zero is just as invalid as a stale turn.
         This check never releases a hold or performs nested motor I/O.
         """
+        if not self._command_revision_write_allowed(label):
+            return True
+        if self._search_reacquire_brake_request is not None:
+            return True
         request = getattr(self.owner, "_near_yaw_park_request", None)
         if request is None:
             return False
@@ -2058,6 +2089,146 @@ class MotionActionRuntime:
             )
         return True
 
+    def _command_revision_write_allowed(self, label: str) -> bool:
+        command = getattr(self._dispatch_context, "command", None)
+        if command is None or command.protected_stop:
+            return True
+        revision = int(getattr(self.owner, "_action_command_revision", 0))
+        if command.revision == revision:
+            return True
+        self.logger.info(
+            "action_revision_veto label=%s command_revision=%d current_revision=%d "
+            "capture_frame_id=%d reason=%s", label, command.revision, revision,
+            command.capture_frame_id, command.reason,
+        )
+        return False
+
+    def request_search_reacquire_brake(self, capture_id, capture_timestamp, reason):
+        """Publish a brake intent. Only the execution thread writes NORMAL."""
+        owner = self.owner
+        with owner.command_lock, owner.motor_io_lock, owner.action_queue_lock:
+            if (getattr(owner, "_explicit_stop_requested", False)
+                    or getattr(owner, "_runtime_shutdown_requested", False)
+                    or getattr(owner, "_near_yaw_park_request", None) is not None
+                    or str(getattr(owner, "_brake_hold_label", "")).startswith("safety")):
+                return False
+            if self._search_reacquire_brake_request is not None:
+                return True
+            self._search_reacquire_brake_request = SearchReacquireBrakeRequest(
+                int(capture_id), float(capture_timestamp), time.monotonic(), str(reason))
+            self._search_reacquire_brake_applied = None
+            self._search_reacquire_quiet_count = 0
+            self._search_reacquire_feedback_ts = 0.0
+            owner._action_command_revision = int(getattr(owner, "_action_command_revision", 0)) + 1
+            owner._near_yaw_park_generation = int(getattr(owner, "_near_yaw_park_generation", 0)) + 1
+            while True:
+                try:
+                    owner.action_queue.get_nowait()
+                except queue.Empty:
+                    break
+            owner.current_command = None
+            owner.command_start_time = None
+        self.logger.info("search_reacquire_brake_requested capture_frame_id=%s reason=%s",
+                         capture_id, reason)
+        return True
+
+    def search_reacquire_brake_pending(self):
+        """Called on new visual evidence; two NEW quiet feedbacks release only our hold."""
+        with self.owner.motor_io_lock:
+            request = self._search_reacquire_brake_request
+            if request is None:
+                return False
+            if (getattr(self.owner, "_explicit_stop_requested", False)
+                    or getattr(self.owner, "_runtime_shutdown_requested", False)
+                    or getattr(self.owner, "_near_yaw_park_request", None) is not None
+                    or str(getattr(self.owner, "_brake_hold_label", "")).startswith("safety")):
+                # A higher-priority owner replaces this episode. Never leave
+                # an unapplied request preventing safety/identity processing.
+                self._search_reacquire_brake_request = None
+                return False
+            if self._search_reacquire_brake_applied is not request:
+                return True
+            feedback = self.get_steering_feedback()  # cached, no serial read
+            now = time.monotonic()
+            stamp = getattr(feedback, "timestamp", 0.0)
+            yaw = getattr(feedback, "raw_yaw_rate_right_dps", None)
+            if yaw is None:
+                yaw = getattr(feedback, "yaw_rate_right_dps", None)
+            wheels = (getattr(feedback, "left_speed_rpm", None),
+                      getattr(feedback, "right_speed_rpm", None))
+            fresh = bool(feedback is not None and feedback.trustworthy
+                         and math.isfinite(stamp)
+                         and 0 <= now-stamp <= self.config.rotate_pulse_settle_feedback_stale_sec
+                         and stamp > self._search_reacquire_brake_sent_at)
+            quiet = bool(fresh and all(isinstance(v, (int, float)) and math.isfinite(v)
+                         and abs(v) <= self.config.rotate_pulse_settle_max_wheel_rpm for v in wheels)
+                         and isinstance(yaw, (int, float)) and math.isfinite(yaw)
+                         and abs(yaw) <= self.config.rotate_pulse_settle_max_yaw_rate_dps)
+            if not quiet:
+                self._search_reacquire_quiet_count = 0
+            if fresh and stamp > self._search_reacquire_feedback_ts:
+                gap = stamp-self._search_reacquire_feedback_ts
+                self._search_reacquire_feedback_ts = stamp
+                self._search_reacquire_quiet_count = (
+                    self._search_reacquire_quiet_count+1 if quiet and gap <= self.config.rotate_pulse_settle_feedback_stale_sec
+                    else 1 if quiet else 0)
+            if self._search_reacquire_quiet_count < 2:
+                return True
+            self._search_reacquire_brake_request = None
+            # Retire work published during settling. Leave NORMAL latched
+            # until the executor adopts a NEW decision and releases the hold;
+            # merely observing quiet encoders must not revive cached axes.
+            self.owner._action_command_revision = int(getattr(self.owner, "_action_command_revision", 0)) + 1
+            with self.owner.action_queue_lock:
+                protected = []
+                while True:
+                    try:
+                        item = self.owner.action_queue.get_nowait()
+                        if isinstance(item, ActionCommandSnapshot) and item.protected_stop:
+                            protected.append(item)
+                    except queue.Empty:
+                        break
+                for item in protected:
+                    self.owner.action_queue.put_nowait(item)
+            self.logger.info("search_reacquire_brake_settled capture_frame_id=%d elapsed_ms=%.1f "
+                             "wheels=%s yaw=%s old_authority_restored=False", request.capture_frame_id,
+                             (now-request.requested_at)*1000, wheels, yaw)
+            return False
+
+    def _service_search_reacquire_brake(self):
+        request = self._search_reacquire_brake_request
+        if request is None:
+            return False
+        if self.hard_stop_check(getattr(self.owner, "current_command", None)):
+            self.send_stop_with_brake_hold("hard_stop")
+            return True
+        if self._search_reacquire_brake_applied is request:
+            return True
+        self.cancel_yaw_pulses("search_reacquire_brake", send_zero=False)
+        owner = self.owner
+        with owner.motor_io_lock:
+            if request is not self._search_reacquire_brake_request:
+                return False
+            if (getattr(owner, "_explicit_stop_requested", False)
+                    or getattr(owner, "_runtime_shutdown_requested", False)
+                    or str(getattr(owner, "_brake_hold_label", "")).startswith("safety")
+                    or getattr(owner, "_near_yaw_park_request", None) is not None):
+                return True
+            self._follow_wheel_clock.reset()
+            self._visible_wheel_guard.reset()
+            owner._brake_hold_active = True
+            owner._brake_hold_stop_mode = "normal"
+            owner._brake_hold_label = "search_reacquire_brake"
+            owner._use_soft_stop_next = owner._soft_stop_active = False
+            self.backend.send_stop("search_reacquire_brake", mode="normal")
+            self._search_reacquire_brake_sent_at = time.monotonic()
+            owner._last_brake_hold_send_ts = time.time()
+            self._search_reacquire_brake_applied = request
+            self.logger.info("search_reacquire_brake_applied capture_frame_id=%d mode=normal "
+                             "request_age_ms=%.1f", request.capture_frame_id,
+                             (self._search_reacquire_brake_sent_at-request.requested_at)*1000)
+        return True
+
     def _service_near_yaw_park(self) -> bool:
         """Consume an explicit yaw-parking intent once, never a generic zero.
 
@@ -2068,7 +2239,8 @@ class MotionActionRuntime:
         request = getattr(owner, "_near_yaw_park_request", None)
         if request is None:
             self._near_yaw_park_applied = None
-            return False
+            return self._service_search_reacquire_brake()
+        self._search_reacquire_brake_request = None  # superseded, never replay after near park releases
         if self._near_yaw_park_applied is request:
             return True
         if self.hard_stop_check(getattr(owner, "current_command", None)):
@@ -2189,9 +2361,16 @@ class MotionActionRuntime:
                 or self.owner._follow_controller.active_target_id != uid):
             self.logger.info("visible_wheel_revoked uid=%s label=%s reason=authority_changed", uid, label)
             return
+        previous_pair = getattr(self._visible_wheel_guard, "last_output", None)
+        previous_sent = getattr(self._visible_wheel_guard, "last_sent", 0.0)
         self.backend.send_targets(applied[0] * ls, applied[1] * rs, label,
                                   max_target_override=max_target_override)
-        self._visible_wheel_guard.note_sent(applied, time.monotonic())
+        sent_at = time.monotonic()
+        if not hasattr(self, "_wheel_diff_response"):
+            self._wheel_diff_response = WheelDifferentialResponse()
+        response = self._wheel_diff_response.observe_and_note(
+            uid, applied, sent_at, previous_sent, feedback)
+        self._visible_wheel_guard.note_sent(applied, sent_at)
         self._visible_wheel_waiting = reason in {
             "cross_wait_zero", "cross_timeout_zero", "feedback_unavailable"
         }
@@ -2202,7 +2381,14 @@ class MotionActionRuntime:
             "visible_wheel_dispatch uid=%s label=%s base=%.1f yaw=%.1f "
             "requested_forward_rpm=%s applied_forward_rpm=%s reason=%s depth_fresh=%s "
             "feedback_forward_rpm=%s feedback_ts=%s cross_pending=%s cross_quiet_count=%s "
-            "cross_aligned_count=%s cross_full_reverse=%s",
+            "cross_aligned_count=%s cross_full_reverse=%s execution_base_loss_rpm=%.1f "
+            "forward_confirmed_handoff=%s obsolete_turn_handoff=%s "
+            "requested_diff_rpm=%.1f applied_diff_rpm=%.1f feedback_diff_rpm=%s "
+            "feedback_age_ms=%s feedback_trustworthy=%s previous_pair=%s "
+            "previous_sent_ts=%.6f sent_ts=%.6f feedback_after_previous_send_ms=%s "
+            "evidence_capture_frame_id=%s response_reference_diff_rpm=%s "
+            "response_reference_sent_ts=%s response_measured_diff_rpm=%s "
+            "response_sustained_ms=%s response_new_feedback=%s response_lagging=%s",
             uid, label, base, yaw, requested, applied, reason, linear is not None,
             None if feedback is None else (feedback.left_forward_rpm, feedback.right_forward_rpm),
             None if feedback is None else feedback.timestamp,
@@ -2210,6 +2396,19 @@ class MotionActionRuntime:
             getattr(self._visible_wheel_guard, "quiet_count", None),
             getattr(self._visible_wheel_guard, "aligned_count", None),
             getattr(self._visible_wheel_guard, "pending_full_reverse", None),
+            max(0., base - .5 * sum(applied)),
+            reason == "cross_confirmed_forward_handoff",
+            reason == "cross_obsolete_turn_forward_handoff",
+            requested[0] - requested[1], applied[0] - applied[1],
+            None if feedback is None else feedback.left_forward_rpm - feedback.right_forward_rpm,
+            None if feedback is None else round((now - feedback.timestamp) * 1000., 1),
+            False if feedback is None else feedback.trustworthy,
+            previous_pair, previous_sent,
+            sent_at,
+            None if feedback is None or previous_sent <= 0 else round((feedback.timestamp - previous_sent) * 1000., 1),
+            getattr(self.owner, "_last_command_capture_frame", 0),
+            response["reference_diff"], response["reference_sent"], response["measured_diff"],
+            response["sustained_ms"], response["new_feedback"], response["lagging"],
         )
         return True
 
@@ -2586,16 +2785,27 @@ class MotionActionRuntime:
             self.backend.send_diff(p1, m1_state, p2, m2_state, label)
         return True
 
-    def send_percent_brake(self, mode: Optional[str] = None, label: str = "brake") -> None:
+    def send_percent_brake(self, mode: Optional[str] = None, label: str = "brake") -> bool:
         with self.owner.motor_io_lock:
+            safety = mode == "emergency" or label.startswith("safety_")
+            if not safety and not self._command_revision_write_allowed(label):
+                return False
+            if (not safety and self._search_reacquire_brake_request is not None
+                    and label != "search_reacquire_brake"):
+                return False
+            if label == "search_reacquire_brake" and (
+                    self._search_reacquire_brake_request is None
+                    or getattr(self.owner, "_brake_hold_label", "") != "search_reacquire_brake"):
+                return False
             if label == "near_yaw_park" and (
                     getattr(self.owner, "_near_yaw_park_request", None) is None
                     or getattr(self.owner, "_brake_hold_label", "") != "near_yaw_park"):
                 # A queued hold refresh cannot re-park after fresh evidence
                 # released it, or replace a newer emergency stop.
-                return
+                return False
             self.backend.send_stop(label, mode=mode)
             self._forward_coast_snapshot = None
+            return True
 
     def _note_search_retry_zero_sent(self) -> None:
         """Acknowledge only a successful zero write, once per retry window."""
@@ -2801,6 +3011,8 @@ class MotionActionRuntime:
         owner = self.owner
         c = self.config
         s = self.symbols
+        if not self._command_revision_write_allowed("dispatch"):
+            return
         if self._service_near_yaw_park():
             return
         periodic_follow = self._periodic_follow_active()
@@ -2895,11 +3107,12 @@ class MotionActionRuntime:
             if base <= 0 and direct_correction <= 0:
                 send_start = time.monotonic()
                 try:
-                    self.send_percent_drive(0)
+                    sent = self.send_percent_drive(0)
                 except Exception as exc:
                     self.logger.warning("轮差前进零速停止失败: %s", exc)
                 else:
-                    self.log_motor_dispatch_timing(action, "STEER_ZERO", send_start)
+                    if sent:
+                        self.log_motor_dispatch_timing(action, "STEER_ZERO", send_start)
                 return
             inner = int(math.floor(base * inner_ratio / 100.0))
             outer = int(math.ceil(base * outer_ratio / 100.0))
@@ -3166,31 +3379,34 @@ class MotionActionRuntime:
             return
 
         if action == s.stop:
+            command = getattr(self._dispatch_context, "command", None)
             self.cancel_yaw_pulses("stop_action", send_zero=False)
             owner._last_stop_command_prepare_ts = time.monotonic()
             owner._last_stop_command_frame = int(getattr(owner, "frame_index", -1))
             owner._last_stop_command_reason = str(getattr(owner, "_last_control_decision_reason", "action_stop"))
-            if (
-                getattr(owner, "_use_soft_stop_next", False)
-                or getattr(owner, "_soft_stop_active", False)
-            ):
+            soft_stop = (command.soft_stop if command is not None else
+                         bool(getattr(owner, "_use_soft_stop_next", False)
+                              or getattr(owner, "_soft_stop_active", False)))
+            if soft_stop:
                 owner._use_soft_stop_next = False
                 owner._soft_stop_active = True
                 send_start = time.monotonic()
                 try:
-                    self.send_percent_drive(0)
+                    sent = self.send_percent_drive(0)
                 except Exception as exc:
                     self.logger.warning("转向结束软停失败: %s", exc)
                 else:
-                    self.log_motor_dispatch_timing(action, "STOP_SOFT", send_start)
+                    if sent:
+                        self.log_motor_dispatch_timing(action, "STOP_SOFT", send_start)
                 return
             send_start = time.monotonic()
             try:
-                self.send_percent_brake()
+                sent = self.send_percent_brake()
             except Exception as exc:
                 self.logger.warning("百分比刹车发送失败: %s", exc)
             else:
-                self.log_motor_dispatch_timing(action, "STOP", send_start)
+                if sent:
+                    self.log_motor_dispatch_timing(action, "STOP", send_start)
             return
 
         self.logger.warning("未知动作类型: %s", action)
@@ -3204,6 +3420,14 @@ class MotionActionRuntime:
         owner = self.owner
         c = self.config
         reason_text = str(reason or "direct_stop")
+        safety_request = reason in self.symbols.safety_stop_reasons or any(
+            token in reason_text for token in ("hard_stop", "front_ir", "left_ir", "right_ir", "bunker", "hazard"))
+        if not safety_request:
+            if self._search_reacquire_brake_request is not None:
+                self._service_search_reacquire_brake()
+                return
+            if not self._command_revision_write_allowed("stop_hold"):
+                return
         if (getattr(owner, "_near_yaw_park_request", None) is not None
                 and reason not in self.symbols.safety_stop_reasons
                 and not any(token in reason_text for token in

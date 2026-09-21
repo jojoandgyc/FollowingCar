@@ -9,6 +9,7 @@ from .deepsort.track import TrackState
 from .identity_bank import IdentityBank, IdentityBankConfig
 from .candidate_competition import competition_evidence
 from .yolo11 import Detection
+from .stage_timing import StageTiming
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,10 @@ class DeepSortTrackerConfig:
     identity_update_threshold: float = 0.30
     identity_update_interval: int = 5
     identity_max_features: int = 20
+    identity_template_memory_enable: bool = False
+    identity_template_crosscheck_enable: bool = False
+    identity_template_recent_sec: float = 30.0
+    identity_template_archive_sec: float = 120.0
     identity_max_weak_features: int = 8
     identity_diversity_min_distance: float = 0.02
     identity_diversity_replace_margin: float = 0.01
@@ -167,6 +172,10 @@ class DeepSortTracker:
                 update_threshold=config.identity_update_threshold,
                 update_interval=config.identity_update_interval,
                 max_features=config.identity_max_features,
+                template_memory_enable=config.identity_template_memory_enable,
+                template_crosscheck_enable=config.identity_template_crosscheck_enable,
+                template_recent_sec=config.identity_template_recent_sec,
+                template_archive_sec=config.identity_template_archive_sec,
                 max_weak_features=config.identity_max_weak_features,
                 diversity_min_distance=config.identity_diversity_min_distance,
                 diversity_replace_margin=config.identity_diversity_replace_margin,
@@ -253,6 +262,8 @@ class DeepSortTracker:
         image_height: Optional[int] = None,
         frame_context: Optional[dict] = None,
     ) -> List[TrackRecord]:
+        timer = StageTiming()
+        self.last_timing_ms = {}
         if len(features) != len(detections):
             raise ValueError("features length must match detections length")
         if partial_features is None:
@@ -271,8 +282,10 @@ class DeepSortTracker:
         if not detections:
             self._search_reacquire_eligible_tracks.clear()
             outputs = self.deepsort.update([], [], [], [], image_shape=_image_shape(image_width, image_height))
+            timer.mark("association")
             self._observe_identity_frame_evidence([], image_width, image_height)
-            return [
+            timer.mark("evidence")
+            records = [
                 self._to_record(
                     out,
                     image_width,
@@ -283,6 +296,9 @@ class DeepSortTracker:
                 )
                 for out in outputs
             ]
+            timer.mark("records")
+            self.last_timing_ms = timer.finish()
+            return records
 
         bbox_xywh = [_xyxy_to_expanded_xywh(det.bbox, self.config.bbox_expand_scale) for det in detections]
         confidences = [float(det.score) for det in detections]
@@ -297,6 +313,7 @@ class DeepSortTracker:
                 track_id, source_index, image_width, image_height,
             ),
         )
+        timer.mark("association")
         if outputs:
             self.identity_bank.track_to_uid.pop(self._search_probe_track_id, None)
             self.identity_bank.track_last_seen_frame.pop(self._search_probe_track_id, None)
@@ -313,14 +330,17 @@ class DeepSortTracker:
             getattr(out, "source_detection_index", None) for out in outputs
             if int(out.track_id) in suppressed_track_ids
         }
+        timer.mark("geometry")
         self._identity_competition = self._frame_identity_competition(
             detections, features, suppressed_indices=suppressed_indices,
         )
+        timer.mark("competition")
         self._observe_identity_frame_evidence(
             outputs, image_width, image_height,
             duplicate_track_ids=suppressed_track_ids,
             identity_swap_track_ids=identity_swap_track_ids,
         )
+        timer.mark("evidence")
         candidate_count = max(0, len(detections) - len(suppressed_track_ids))
         records = [
             self._to_record(
@@ -338,6 +358,7 @@ class DeepSortTracker:
             )
             for out in outputs
         ]
+        timer.mark("records")
         if not records:
             probe = self._search_probe_record(
                 detections,
@@ -349,6 +370,8 @@ class DeepSortTracker:
             )
             if probe is not None:
                 records.append(probe)
+        timer.mark("probe")
+        self.last_timing_ms = timer.finish()
         return records
 
     def _frame_identity_competition(self, detections, features, *, suppressed_indices=()):

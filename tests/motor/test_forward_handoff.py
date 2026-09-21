@@ -78,16 +78,16 @@ def test_whole_reverse_provenance_survives_changed_forward_curve():
                    allow_forward_handoff=True)[0] == (44, 0)
 
 
-def test_whole_reverse_aligned_release_continues_original_ramp_without_rearming():
+def test_whole_reverse_aligned_release_hands_current_forward_request_to_driver():
     g = WheelZeroCrossGuard()
     for stamp, speed in ((10, -10), (10.05, 8), (10.1, 8)):
         pair, reason = g.limit((44, 44), feedback(stamp, speed, speed), stamp,
                                allow_forward_handoff=True)
         g.note_sent(pair, stamp)
-    assert reason == "cross_aligned_resume" and pair == (5, 5)
+    assert reason == "cross_confirmed_forward_handoff" and pair == (44, 44)
     pair, reason = g.limit((44, 44), feedback(10.15, 8, 8), 10.15,
                            allow_forward_handoff=True)
-    assert reason == "cross_resume_ramp" and 5 < pair[0] <= 9
+    assert reason == "continuous" and pair == (44, 44)
 
 
 def test_single_wheel_wait_escalates_to_both_when_whole_car_reverses():

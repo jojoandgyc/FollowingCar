@@ -76,6 +76,8 @@ class DistancePidResult:
     pi_demand_limit_reason: str = "none"
     pi_motion_origin_ts: Optional[float] = None
     pi_motion_uncertainty_m_s: float = 0.
+    pi_brake_recovery_limited: bool = False
+    pi_brake_recovery_anchor_rpm: float = 0.
 
 
 class LongitudinalDistancePid:
@@ -248,6 +250,8 @@ class LongitudinalDistancePid:
                 pi_demand_limit_reason=result.demand_limit_reason,
                 pi_motion_origin_ts=result.motion_origin_ts,
                 pi_motion_uncertainty_m_s=result.motion_uncertainty_m_s,
+                pi_brake_recovery_limited=result.brake_recovery_limited,
+                pi_brake_recovery_anchor_rpm=result.brake_recovery_anchor_rpm,
             )
             if result.status not in {"stale_sample", "out_of_order", "execution_out_of_order",
                                      "suspended_duplicate", "measurement_jump", "continuation_only"}:
@@ -569,6 +573,11 @@ class VisualSteeringPidResult:
     startup_kick_active: bool
     startup_kick_elapsed_sec: float
     startup_kick_release_reason: str
+    # Persistent caller/config ceiling, not this tick's temporary brake or
+    # startup limit. Encoder refresh must recompute those transient limits.
+    correction_policy_limit_rpm: Optional[float] = None
+    forward_tracking_active: bool = False
+    forward_phase: str = "legacy"
 
 
 class VisualSteeringPid:
@@ -592,9 +601,11 @@ class VisualSteeringPid:
         self._reversal_settle_active = False
         self._reversal_settle_quiet_frames = 0
         self.last_result: Optional[VisualSteeringPidResult] = None
+        self._forward_direction_since: Optional[float] = None
 
     def reset(self) -> None:
         self._last_ts = None
+        self._forward_direction_since = None
         self._filtered_error_deg = 0.0
         self._filtered_error_rate_dps = 0.0
         self._rate_integral_deg = 0.0
@@ -624,6 +635,7 @@ class VisualSteeringPid:
         visual_age_sec: Optional[float] = None,
         target_rate_feedforward_max_dps_override: Optional[float] = None,
         target_speed_match_max_closing_dps_override: Optional[float] = None,
+        forward_tracking: bool = False,
     ) -> VisualSteeringPidResult:
         c = self.config
         now = time.monotonic() if now is None else float(now)
@@ -760,6 +772,24 @@ class VisualSteeringPid:
             # The target is still inside the deadband but is already moving
             # outward. Start following before it reaches the outer boundary.
             requested_direction = 1 if visual_error_deg > 0.0 else -1
+        # Opt-in for qualified forward following only. Bad/asynchronous yaw
+        # must retain the conservative policy, not gain steering authority.
+        raw_yaw = getattr(feedback, "raw_yaw_rate_right_dps", None)
+        forward_tracking = bool(
+            forward_tracking and requested_base_rpm > 0 and feedback_used
+            and feedback_age_sec is not None and feedback_age_sec <= 0.10
+            and 0.0 <= now - float(feedback.timestamp)
+            and min(feedback.left_forward_rpm, feedback.right_forward_rpm) >= -1.0
+            and (visual_age_sec is None or 0.0 <= visual_age_sec <= 0.35)
+            and (raw_yaw is None or (math.isfinite(float(raw_yaw))
+                 and abs(float(raw_yaw) - measured_rate) <= 10.0))
+        )
+        previous_direction = self._last_requested_direction
+        if requested_direction == 0:
+            self._forward_direction_since = None
+        elif previous_direction != requested_direction or self._forward_direction_since is None:
+            self._forward_direction_since = now
+        forward_phase = "approach" if forward_tracking else "legacy"
         if target_rate_valid:
             target_bearing_rate = image_rate + measured_rate if feedback_used else image_rate
             target_rate_feedforward = (
@@ -878,7 +908,7 @@ class VisualSteeringPid:
                 approach_blend = max(0.0, min(1.0, (
                     min(abs(visual_error_deg), abs(self._filtered_error_deg)) - small_error
                 ) / (large_error - small_error)))
-                max_closing_rate *= 1.0 + 0.5 * approach_blend
+                max_closing_rate *= 1.0 + (1.5 if forward_tracking else 0.5) * approach_blend
             # target_bearing_rate is the target's estimated world rate:
             # camera-relative bbox rate + measured chassis yaw. Permit a
             # bounded same-side excess so the aim line can converge without
@@ -950,6 +980,17 @@ class VisualSteeringPid:
                 max(0.0, float(c.max_correction_rpm)),
                 fast_countersteer_cap,
             )
+            if (forward_tracking and previous_direction == requested_direction
+                    and not reversal_settle_hold
+                    and self._forward_direction_since is not None
+                    and now - self._forward_direction_since >= 0.20
+                    and min(abs(visual_error_deg), abs(self._filtered_error_deg)) >= large_error):
+                # Same-side pursuit with wrong-way yaw is not a NEW visual
+                # reversal. Permit the normal bounded differential to arrest
+                # it; true side changes keep the original countersteer cap.
+                countersteer_limit = max(countersteer_limit, min(
+                    float(c.max_correction_rpm), 2.0 * float(c.braking_max_correction_rpm)))
+                forward_phase = "same_side_countersteer"
 
         # 期望和实际转向同向不代表还应继续驱动。车身角速度已经明显超过
         # 目标时先撤掉轮差，让电机的零速闭环减速。目标尚未越过中心前直接
@@ -1097,6 +1138,18 @@ class VisualSteeringPid:
             # direction (``opposite_yaw_braking`` below).
             output = 0.0
             output_floor_reason = "same_direction_overspeed_coast"
+            if (forward_tracking and not predictive_braking and not reversal_settle_hold
+                    and predictive_decel > 0.0
+                    and abs(visual_error_deg) >= large_error
+                    and stopping_distance_deg + max(0.0, float(c.predictive_brake_margin_deg)) < remaining_error_deg):
+                # A smaller SAME-SIDE wheel target decelerates yaw without
+                # discarding pursuit while the target is still far off-axis.
+                # Near-center/predicted crossing still takes the zero branch.
+                output = math.copysign(min(
+                    correction_limit, abs(feedforward_rpm)
+                    * min(1.0, abs(desired_rate) / max(1.0, abs(measured_rate)))), desired_rate)
+                output_floor_reason = "forward_overspeed_taper"
+                forward_phase = "overspeed_taper"
         elif predictive_braking:
             output = 0.0
             output_floor_reason = "predictive_brake_coast"
@@ -1274,6 +1327,19 @@ class VisualSteeringPid:
             self._rate_integral_deg = 0.0
             output_floor_rpm = 0.0
             output_floor_reason = "reversal_settle"
+        if (forward_tracking and requested_direction != 0
+                and min(abs(visual_error_deg), abs(self._filtered_error_deg)) > deadband + 0.5
+                and output_floor_reason in ("none", "tracking")
+                and not braking_active and not reversal_settle_hold and not target_return_coast
+                and not visual_direction_guarded
+                and requested_direction * measured_rate < abs(desired_rate)
+                and output * requested_direction > 0.0):
+            floor = min(3.0, correction_limit)
+            if abs(output) < floor:
+                output = requested_direction * floor
+                output_floor_rpm = floor
+                output_floor_reason = "forward_tracking_floor"
+                forward_phase = "response_floor"
         correction_rpm = int(round(output))
 
         result = VisualSteeringPidResult(
@@ -1316,6 +1382,13 @@ class VisualSteeringPid:
             startup_kick_active=startup_kick_active,
             startup_kick_elapsed_sec=startup_kick_elapsed_sec,
             startup_kick_release_reason=startup_kick_release_reason,
+            correction_policy_limit_rpm=min(
+                max(0.0, float(c.max_correction_rpm)),
+                max(0.0, float(max_correction_override_rpm))
+                if max_correction_override_rpm is not None else float("inf"),
+            ),
+            forward_tracking_active=forward_tracking,
+            forward_phase=forward_phase,
         )
         self.last_result = result
         return result

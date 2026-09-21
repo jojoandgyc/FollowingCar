@@ -38,7 +38,23 @@ class WheelZeroCrossGuard:
             self.resume_signs = None
             return (0, 0), "feedback_unavailable"
         measured = (feedback.left_forward_rpm, feedback.right_forward_rpm)
-        if signs != self.pending_signs:
+        full_reverse = (all(v < -1.0 for v in measured)
+                        or all(v < 0 for v in self.last_output))
+        # A Depth base may alternate between zero and positive while vision
+        # keeps asking for the same turn. Once its inner wheel is braking for
+        # reversal, preserve confirmation unless a fresh qualified forward
+        # request and new non-opposing feedback supersede it below.
+        # Straight/opposite yaw cancels this episode; ordinary forward with
+        # no pending turn uses the established controller handoff.
+        same_yaw_cross = bool(
+            self.pending_signs is not None
+            and self.pending_signs[0] * self.pending_signs[1] < 0
+            and not self.pending_full_reverse and not full_reverse
+            and sum(requested) >= 0
+            and (requested[0] - requested[1])
+            * (self.pending_signs[0] - self.pending_signs[1]) > 0
+        )
+        if signs != self.pending_signs and not same_yaw_cross:
             self.pending_signs = None
             self.pending_wheels = ()
             self.quiet_count = 0
@@ -49,15 +65,27 @@ class WheelZeroCrossGuard:
             measured[i]*signs[i] < -1.0
             or (self.last_output[i]*signs[i] < 0 and feedback.timestamp <= self.last_sent)
         ))
-        full_reverse = (all(v < -1.0 for v in measured)
-                        or all(v < 0 for v in self.last_output))
+        # A pending in-place turn is not an instruction to finish a reversal
+        # after Depth has replaced it with a forward curve. With fresh forward
+        # authority and non-opposing feedback, neither CURRENT wheel target
+        # needs to cross zero. Cancel only that obsolete mixed-sign episode.
+        # Real reverse feedback, whole-car reverse provenance, search/opt-out
+        # and invalid feedback must still take the original guarded path.
+        forward_pair = all(v >= 0 for v in requested) and any(v > 0 for v in requested)
+        if (same_yaw_cross and allow_forward_handoff and forward_pair
+                and not opposing and feedback.timestamp > self.started):
+            self.pending_signs = None
+            self.pending_wheels = ()
+            self.pending_full_reverse = False
+            self.quiet_count = self.aligned_count = 0
+            self.resume_signs = None
+            return tuple(requested), "cross_obsolete_turn_forward_handoff"
         # A fresh, visible forward grant may hand residual one-wheel rotation
         # directly to the motor controller. Do not inject a zero confirmation
         # or a second 5RPM software launch ramp. Search, reverse requests,
         # whole-car reverse transitions and invalid feedback remain guarded.
-        forward_pair = all(v >= 0 for v in requested) and any(v > 0 for v in requested)
         if (allow_forward_handoff and forward_pair and not full_reverse
-                and not self.pending_full_reverse):
+                and not self.pending_full_reverse and not same_yaw_cross):
             handed_off = bool(opposing or self.pending_signs or self.resume_signs)
             self.pending_signs = None
             self.pending_wheels = ()
@@ -88,12 +116,15 @@ class WheelZeroCrossGuard:
                 feedback_gap = feedback.timestamp - self.feedback_stamp
                 self.feedback_stamp = feedback.timestamp
                 quiet = all(abs(measured[i]) <= 1.0 for i in self.pending_wheels)
-                self.quiet_count = self.quiet_count + 1 if quiet else 0
+                self.quiet_count = (
+                    (self.quiet_count + 1 if feedback_gap <= .15 else 1)
+                    if quiet else 0
+                )
                 # Normal forward motion need not pass through exact zero if
                 # TWO distinct new feedback samples prove both wheels have
                 # already crossed to the requested side. Reversal/rotation
                 # still uses the original quiet-wheel rule.
-                aligned = (signs == (1, 1) and not opposing
+                aligned = (self.pending_signs == signs == (1, 1) and not opposing
                            and all(0 <= measured[i] <= requested[i] for i in range(2)))
                 self.aligned_count = (self.aligned_count + 1 if feedback_gap <= .15 else 1) if aligned else 0
             aligned_release = self.quiet_count < 2 and self.aligned_count >= 2
@@ -105,6 +136,15 @@ class WheelZeroCrossGuard:
             self.pending_wheels = ()
             self.quiet_count = 0
             self.aligned_count = 0
+            if aligned_release and allow_forward_handoff and forward_pair:
+                # TWO fresh samples have already proved that both wheels are
+                # on the requested side. The caller has revalidated Depth and
+                # the braking cap. Do not add a second 5RPM/80RPM/s launch to
+                # the controller's approved forward request. Real reverse,
+                # mixed-sign rotation and the opt-out path stay guarded.
+                self.pending_full_reverse = False
+                self.resume_signs = None
+                return tuple(requested), "cross_confirmed_forward_handoff"
             if aligned_release:
                 self.resume_signs = signs
                 self.resume_at = now

@@ -579,6 +579,10 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "identity_bank", "update_threshold", "Y8_IDENTITY_UPDATE_THRESHOLD")
     _set_env_if_present(parser, "identity_bank", "update_interval", "Y8_IDENTITY_UPDATE_INTERVAL")
     _set_env_if_present(parser, "identity_bank", "max_features", "Y8_IDENTITY_MAX_FEATURES")
+    _set_bool_env_if_present(parser, "identity_bank", "template_memory_enable", "Y8_IDENTITY_TEMPLATE_MEMORY_ENABLE")
+    _set_bool_env_if_present(parser, "identity_bank", "template_crosscheck_enable", "Y8_IDENTITY_TEMPLATE_CROSSCHECK_ENABLE")
+    _set_env_if_present(parser, "identity_bank", "template_recent_sec", "Y8_IDENTITY_TEMPLATE_RECENT_SEC")
+    _set_env_if_present(parser, "identity_bank", "template_archive_sec", "Y8_IDENTITY_TEMPLATE_ARCHIVE_SEC")
     _set_env_if_present(parser, "identity_bank", "max_weak_features", "Y8_IDENTITY_MAX_WEAK_FEATURES")
     _set_env_if_present(
         parser,
@@ -1554,6 +1558,10 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "search_evidence_probe_min_score",
         "SEARCH_EVIDENCE_PROBE_MIN_SCORE",
     )
+    _set_env_if_present(parser, "follow", "search_evidence_probe_edge_min_score",
+                        "SEARCH_EVIDENCE_PROBE_EDGE_MIN_SCORE")
+    _set_env_if_present(parser, "follow", "search_evidence_probe_edge_center_ratio",
+                        "SEARCH_EVIDENCE_PROBE_EDGE_CENTER_RATIO")
     _set_env_if_present(
         parser,
         "follow",
@@ -1764,6 +1772,7 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     # Visible-target steering cascade: camera angle outer loop plus ABZ
     # encoder-derived yaw-rate feedback. Search rotation remains independent.
     _set_bool_env_if_present(parser, "steering_pid", "enable", "VISIBLE_STEERING_PID_ENABLE")
+    _set_bool_env_if_present(parser, "steering_pid", "forward_tracking_enable", "VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE")
     _set_env_if_present(parser, "steering_pid", "camera_hfov_deg", "VISIBLE_STEERING_PID_CAMERA_HFOV_DEG")
     _set_env_if_present(parser, "steering_pid", "camera_latency_sec", "VISIBLE_STEERING_PID_CAMERA_LATENCY_SEC")
     _set_env_if_present(parser, "steering_pid", "deadband_deg", "VISIBLE_STEERING_PID_DEADBAND_DEG")

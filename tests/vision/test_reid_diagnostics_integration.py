@@ -101,6 +101,28 @@ def _records(directory):
     return [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
 
 
+def test_stage_timings_reach_pipeline_and_empty_frame_cannot_reuse_identity_cost(tmp_path):
+    det = Detection((30, 15, 75, 110), .95, 0)
+    feature = np.ones(512, dtype=np.float32)
+    feature /= np.linalg.norm(feature)
+    pipeline = _pipeline(tmp_path, [[det], [det], [], [], []], lambda *_: feature)
+    try:
+        _process(pipeline, 1)
+        _process(pipeline, 2)
+        timing = pipeline.last_timing_ms
+        for key in ("tracker_association", "deepsort_match", "deepsort_kalman_update",
+                    "tracker_records", "identity_match_evidence", "identity_decision",
+                    "identity_logging"):
+            assert timing[key] >= 0.0
+            assert timing[key + "_cpu"] >= 0.0
+        for i in (3, 4, 5):
+            _process(pipeline, i)
+        assert "tracker_competition" not in pipeline.last_timing_ms
+        assert "identity_logging" not in pipeline.last_timing_ms
+    finally:
+        pipeline.close()
+
+
 def test_detector_crop_provenance_survives_filtering_nms_and_reordering(tmp_path):
     first_left = Detection((20.4, 18.4, 55.6, 100.6), 0.88, 0)
     first_right = Detection((126.4, 16.4, 162.6, 104.6), 0.96, 0)

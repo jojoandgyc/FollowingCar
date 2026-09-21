@@ -48,6 +48,8 @@ class OSNetRKNNExtractor:
             "inference": 0.0,
             "partial_inference": 0.0,
             "postprocess": 0.0,
+            "postprocess_exclusive": 0.0,
+            "color": 0.0,
             "total": 0.0,
             "detections": 0.0,
             "features": 0.0,
@@ -80,6 +82,7 @@ class OSNetRKNNExtractor:
         inference_ms = 0.0
         postprocess_ms = 0.0
         partial_inference_ms = 0.0
+        color_ms = 0.0
         arr, _, _, fmt = numpy_from_frame(frame, frame_format)
         features: List[Optional[Any]] = []
         partial_features: List[Optional[Any]] = []
@@ -110,6 +113,7 @@ class OSNetRKNNExtractor:
             osnet_feat = _normalize_embedding(outputs[0])
             feat = osnet_feat.copy()
             if self.config.color_fusion_enable:
+                color_start = time.perf_counter()
                 color = _color_signature(crop)
                 if color is not None:
                     feat = _fuse_appearance_features(
@@ -117,6 +121,7 @@ class OSNetRKNNExtractor:
                         color,
                         self.config.color_fusion_weight,
                     )
+                color_ms += _elapsed_ms(color_start, time.perf_counter())
             partial_feature = None
             partial_source = None
             if compute_partial and self.config.partial_appearance_enable:
@@ -157,6 +162,8 @@ class OSNetRKNNExtractor:
             "inference": inference_ms + partial_inference_ms,
             "partial_inference": partial_inference_ms,
             "postprocess": postprocess_ms,
+            "postprocess_exclusive": max(0.0, postprocess_ms - partial_inference_ms),
+            "color": color_ms,
             "total": _elapsed_ms(start, end),
             "detections": float(len(detections)),
             "features": float(sum(feature is not None for feature in features)),
@@ -179,6 +186,8 @@ class OSNetRKNNExtractor:
             "inference": 0.0,
             "partial_inference": 0.0,
             "postprocess": 0.0,
+            "postprocess_exclusive": 0.0,
+            "color": 0.0,
             "total": 0.0,
             "detections": float(detections),
             "features": 0.0,
@@ -269,9 +278,16 @@ def _color_signature(crop: Any):
         s = hsv[:, :, 1].reshape(-1)
         v = hsv[:, :, 2].reshape(-1)
         # Hue is only meaningful for sufficiently saturated pixels.
-        h_hist, _ = np.histogram(h[s >= 24], bins=8, range=(0, 180))
-        s_hist, _ = np.histogram(s, bins=4, range=(0, 256))
-        v_hist, _ = np.histogram(v, bins=4, range=(0, 256))
+        if hsv.dtype == np.uint8:
+            # Exactly the same bin edges/counts for OpenCV's uint8 HSV.
+            # Avoid histogram's floating-point bin construction on large crops.
+            h_hist = np.bincount(h[s >= 24].astype(np.uint16) * 8 // 180, minlength=8)
+            s_hist = np.bincount(s >> 6, minlength=4)
+            v_hist = np.bincount(v >> 6, minlength=4)
+        else:
+            h_hist, _ = np.histogram(h[s >= 24], bins=8, range=(0, 180))
+            s_hist, _ = np.histogram(s, bins=4, range=(0, 256))
+            v_hist, _ = np.histogram(v, bins=4, range=(0, 256))
         descriptor = np.concatenate((h_hist, s_hist, v_hist)).astype("float32")
     except Exception:
         # Keep the fallback dependency-free for unit tests and non-OpenCV hosts.

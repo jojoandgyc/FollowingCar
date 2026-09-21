@@ -52,6 +52,8 @@ from car_control_modular.controllers import (
 )
 from car_control_modular.action_runtime import ActionRuntimeConfig, ActionRuntimeSymbols, MotionActionRuntime
 from car_control_modular.action_queue_policy import merge_pending_actions
+from car_control_modular.action_command import ActionCommandSnapshot
+from car_control_modular.search_reacquire_braking import search_brake_reason
 from car_control_modular.distance_runtime import DistanceRuntime, DistanceRuntimeConfig
 from car_control_modular.depth_target_geometry import resolve_depth_target_observation
 from car_control_modular.follow_distance_hold import is_follow_distance_hold
@@ -80,6 +82,7 @@ from car_control_modular.historical_direction_backfill import (
     HistoricalDirectionCandidate,
 )
 from car_control_modular.lateral_intent import (
+    with_forward_continuation,
     LateralControlIntent,
     LateralIntentStore,
     slew_signed_rpm,
@@ -698,8 +701,12 @@ SEARCH_EVIDENCE_REARM_MISSING_FRAMES = max(
     1, int(os.environ.get("SEARCH_EVIDENCE_REARM_MISSING_FRAMES", "8"))
 )
 SEARCH_EVIDENCE_PROBE_CONFIRM_FRAMES = max(
-    1, int(os.environ.get("SEARCH_EVIDENCE_PROBE_CONFIRM_FRAMES", "1"))
+    1, int(os.environ.get("SEARCH_EVIDENCE_PROBE_CONFIRM_FRAMES", "2"))
 )
+SEARCH_EVIDENCE_PROBE_EDGE_MIN_SCORE = max(0.0, min(1.0, float(
+    os.environ.get("SEARCH_EVIDENCE_PROBE_EDGE_MIN_SCORE", "0.20"))))
+SEARCH_EVIDENCE_PROBE_EDGE_CENTER_RATIO = max(0.0, min(0.49, float(
+    os.environ.get("SEARCH_EVIDENCE_PROBE_EDGE_CENTER_RATIO", "0.15"))))
 SEARCH_EVIDENCE_PROBE_MIN_SCORE = max(
     0.01,
     min(
@@ -1293,6 +1300,7 @@ VISIBLE_MOTION_MIN_RATIO = max(0.0, float(os.environ.get("VISIBLE_MOTION_MIN_RAT
 VISIBLE_MOTION_PROJECTION_GAIN = max(0.0, float(os.environ.get("VISIBLE_MOTION_PROJECTION_GAIN", "0.35")))
 VISIBLE_MOTION_STRONG_RATIO = max(0.0, float(os.environ.get("VISIBLE_MOTION_STRONG_RATIO", "0.10")))
 VISIBLE_STEERING_PID_ENABLE = os.environ.get("VISIBLE_STEERING_PID_ENABLE", "0").strip() != "0"
+VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE = os.environ.get("VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE", "0").strip() != "0"
 VISIBLE_STEERING_PID_CAMERA_HFOV_DEG = float(os.environ.get("VISIBLE_STEERING_PID_CAMERA_HFOV_DEG", "90.0"))
 VISIBLE_STEERING_PID_CAMERA_LATENCY_SEC = float(os.environ.get("VISIBLE_STEERING_PID_CAMERA_LATENCY_SEC", "0.13"))
 VISIBLE_STEERING_PID_DEADBAND_DEG = float(os.environ.get("VISIBLE_STEERING_PID_DEADBAND_DEG", "1.2"))
@@ -2085,7 +2093,8 @@ class PersonTracker:
             "candidate_observe=%dfresh_frames untracked_direction>=%.2f "
             "candidate_acquire=%drpm aimline_approach<=%.3f/%drpm "
             "aimline_intersection=active_brake "
-            "identity_claim=False direction=geometry_only",
+            "identity_claim=False direction=geometry_only "
+            "edge_probe_skip_below=%.2f edge_center_margin=%.2f",
             SEARCH_EVIDENCE_GATE_ENABLE,
             CONFIDENCE_THRESHOLD,
             SEARCH_EVIDENCE_PROBE_MIN_SCORE,
@@ -2100,6 +2109,8 @@ class PersonTracker:
             SEARCH_CANDIDATE_ACQUIRE_RAW_RPM,
             SEARCH_CANDIDATE_APPROACH_MARGIN_RATIO,
             PARKED_RECENTER_MIN_RPM,
+            SEARCH_EVIDENCE_PROBE_EDGE_MIN_SCORE,
+            SEARCH_EVIDENCE_PROBE_EDGE_CENTER_RATIO,
         )
         logger.info(
             "Single-direction search: direction=frozen_on_loss "
@@ -2494,6 +2505,8 @@ class PersonTracker:
                 min_area_ratio=SEARCH_EVIDENCE_MIN_AREA_RATIO,
                 max_area_ratio=SEARCH_EVIDENCE_MAX_AREA_RATIO,
                 probe_confirm_frames=SEARCH_EVIDENCE_PROBE_CONFIRM_FRAMES,
+                probe_edge_min_score=SEARCH_EVIDENCE_PROBE_EDGE_MIN_SCORE,
+                probe_edge_center_ratio=SEARCH_EVIDENCE_PROBE_EDGE_CENTER_RATIO,
                 hold_frames=SEARCH_EVIDENCE_HOLD_FRAMES,
                 max_hold_sec=SEARCH_EVIDENCE_MAX_HOLD_SEC,
                 consistency_iou=SEARCH_EVIDENCE_CONSISTENCY_IOU,
@@ -2853,6 +2866,7 @@ class PersonTracker:
                 visible_steering_pid_target_rate_feedforward_gain=VISIBLE_STEERING_PID_TARGET_RATE_FEEDFORWARD_GAIN,
                 visible_steering_pid_target_rate_feedforward_max_dps=VISIBLE_STEERING_PID_TARGET_RATE_FEEDFORWARD_MAX_DPS,
                 visible_steering_pid_target_speed_match_max_closing_dps=VISIBLE_STEERING_PID_TARGET_SPEED_MATCH_MAX_CLOSING_DPS,
+                visible_steering_pid_forward_tracking_enable=VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE,
                 visible_steering_pid_max_yaw_rate_dps=VISIBLE_STEERING_PID_MAX_YAW_RATE_DPS,
                 visible_steering_pid_rate_kp_rpm_per_dps=VISIBLE_STEERING_PID_RATE_KP_RPM_PER_DPS,
                 visible_steering_pid_rate_ki_rpm_per_deg=VISIBLE_STEERING_PID_RATE_KI_RPM_PER_DEG,
@@ -3827,6 +3841,7 @@ class PersonTracker:
         return bool(
             intent is not None
             and intent.valid(time.monotonic())
+            and self._has_fresh_lateral_yaw(intent.target_id)
             and not intent.hold_zero
             and int(getattr(self, "_lateral_intent_last_sequence", -1)) == intent.sequence
             and getattr(self._follow_controller, "active_target_id", None) == intent.target_id
@@ -4265,9 +4280,24 @@ class PersonTracker:
             if not zero_requested and bool(pid_result.target_rate_valid)
             else None
         )
+        # Only ordinary qualified forward tracking may recompute the dynamic
+        # limit on encoder refresh. Preserve explicit quality/park/reverse
+        # ceilings; a transient 5RPM brake cap must not become a whole-frame
+        # policy cap after the chassis has stopped rotating the wrong way.
+        policy_limit = getattr(pid_result, "correction_policy_limit_rpm", None)
+        if policy_limit is None or mode != "forward" or low_quality_visible or not target_steerable:
+            policy_limit = getattr(pid_result, "correction_limit_rpm", 0.0)
         now = time.monotonic()
-        published = self._lateral_intent_store.publish(
-            LateralControlIntent(
+        previous_intent = self._lateral_intent_store.snapshot()
+        capture_id = int(getattr(self, "_last_command_capture_frame", 0))
+        watermark_uid, watermark_cap = getattr(self, "_lateral_observation_watermark", (None, 0))
+        previous_cap = previous_intent.capture_frame_id if (
+            previous_intent is not None and previous_intent.target_id == int(target.track_id)) else 0
+        if watermark_uid == int(target.track_id):
+            previous_cap = max(previous_cap, watermark_cap)
+        if 0 < capture_id <= previous_cap and not zero_requested:
+            return False  # Replaying one observation cannot renew yaw authority.
+        intent = LateralControlIntent(
                 sequence=0,
                 target_id=int(target.track_id),
                 frame_index=int(self.frame_index),
@@ -4280,7 +4310,7 @@ class PersonTracker:
                 base_percent=max(0, int(action.speed_percent)),
                 base_rpm=max(0, int(getattr(pid_result, "base_rpm", 0))),
                 initial_correction_rpm=0 if zero_requested else int(pid_result.correction_rpm),
-                correction_limit_rpm=max(0.0, float(getattr(pid_result, "correction_limit_rpm", 0.0))),
+                correction_limit_rpm=max(0.0, float(policy_limit)),
                 confidence=max(0.0, min(1.0, float(target.confidence))),
                 bbox_quality=(
                     "limited"
@@ -4294,8 +4324,13 @@ class PersonTracker:
                 hold_zero=zero_requested,
                 near_distance_mode=str(self._last_control_decision_reason).startswith("near_distance_rotation_only"),
                 park_requested=bool(near_yaw_park_requested),
-            )
         )
+        if VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE:
+            get_feedback = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
+            intent = with_forward_continuation(intent, get_feedback() if callable(get_feedback) else None)
+        published = self._lateral_intent_store.publish(intent)
+        if capture_id > 0:
+            self._lateral_observation_watermark = (int(target.track_id), max(previous_cap, capture_id))
         self._lateral_intent_owned_frame = int(self.frame_index)
         if zero_requested:
             # Do not wait for the next lateral tick or a 250ms motor timeout.
@@ -4489,12 +4524,16 @@ class PersonTracker:
                 self._clear_lateral_intent("expired")
                 logger.info(
                     "lateral_intent_expired seq=%d frame=%d target=%d age=%.0fms ttl=%.0fms "
-                    "action=revoke_yaw recognizer_owns_lost_transition=True",
+                    "action=revoke_yaw recognizer_owns_lost_transition=True "
+                    "capture_frame_id=%d capture_age_ms=%.1f overdue_ms=%.1f",
                     intent.sequence,
                     intent.frame_index,
                     intent.target_id,
                     intent.age_sec(now) * 1000.0,
-                    LATERAL_INTENT_TTL_SEC * 1000.0,
+                    (intent.valid_until - intent.published_at) * 1000.0,
+                    int(intent.capture_frame_id),
+                    max(0.0, now - intent.capture_timestamp) * 1000.0 if intent.capture_timestamp > 0 else -1.0,
+                    max(0.0, now - intent.valid_until) * 1000.0,
                 )
             return
 
@@ -4524,6 +4563,11 @@ class PersonTracker:
                 # cannot re-arm startup or image-rate feedforward.
                 return
             feedback = self._action_runtime.get_steering_feedback()
+            if not intent.continuation_allowed(now, feedback):
+                self._clear_lateral_intent("continuation_evidence_invalid")
+                logger.info("lateral_continuation_rejected capture_frame_id=%d age_ms=%.1f",
+                            intent.capture_frame_id, intent.age_sec(now) * 1000.0)
+                return
             projected_x, projection_sec = intent.projected_x_ratio(
                 now,
                 camera_hfov_deg=VISIBLE_STEERING_PID_CAMERA_HFOV_DEG,
@@ -4546,6 +4590,8 @@ class PersonTracker:
                 refresh_kwargs = {}
                 if intent.mode == "yaw_only":
                     refresh_kwargs["near_distance_mode"] = intent.near_distance_mode
+                elif intent.mode == "reverse":
+                    refresh_kwargs["allow_forward_tracking"] = False
                 result = refresh_pid(
                     x_ratio=projected_x,
                     base_rpm=int(intent.base_rpm),
@@ -4742,7 +4788,8 @@ class PersonTracker:
                     "age=%.0fms x=%.3f projected_x=%.3f projection=%.0fms "
                     "target_rate=%s desired_yaw=%+.2fdps measured_yaw=%+.2fdps "
                     "requested=%+drpm output=%+drpm limit=%.1frpm floor=%s action=%s "
-                    "confidence=%.2f quality=%s feedback=%s publish=%s",
+                    "confidence=%.2f quality=%s feedback=%s publish=%s "
+                    "policy_limit_rpm=%.1f limit_reason=%s remaining_ms=%.1f forward_phase=%s continuation=%s capture_age_ms=%.1f",
                     intent.sequence,
                     intent.frame_index,
                     int(intent.capture_frame_id),
@@ -4770,6 +4817,12 @@ class PersonTracker:
                     intent.bbox_quality,
                     False if result is None else result.feedback_used,
                     publish_due,
+                    intent.correction_limit_rpm,
+                    getattr(result, "correction_limit_reason", "none"),
+                    max(0.0, intent.valid_until - now) * 1000.0,
+                    getattr(result, "forward_phase", "legacy"),
+                    bool(intent.nominal_valid_until > 0 and now > intent.nominal_valid_until),
+                    max(0.0, now - intent.capture_timestamp) * 1000.0 if intent.capture_timestamp > 0 else -1.0,
                 )
 
     def _lateral_intent_control_loop(self) -> None:
@@ -5014,7 +5067,7 @@ class PersonTracker:
 
     def _action_queue_snapshot_locked(self) -> List[int]:
         try:
-            return list(self.action_queue.queue)
+            return [int(item) for item in self.action_queue.queue]
         except Exception:
             return []
 
@@ -5335,11 +5388,21 @@ class PersonTracker:
             self._last_rotate_visual_refresh_ts = time.time()
         cleared = 0
         queued = 0
-        with self.action_queue_lock:
+        # Serialize publication with the final motor write. A popped ordinary
+        # STOP cannot cross this commit and override a newer steering intent.
+        with getattr(self, "motor_io_lock", nullcontext()), self.action_queue_lock:
+            self._action_command_revision = int(getattr(self, "_action_command_revision", 0)) + 1
+            revision = self._action_command_revision
+            old_commands = tuple(self.action_queue.queue)
+            protected_commands = [item for item in old_commands
+                                  if isinstance(item, ActionCommandSnapshot) and item.protected_stop]
             before_actions = self._action_queue_snapshot_locked()
             before = len(before_actions)
             merge = merge_pending_actions(
-                before_actions,
+                [int(item) for item in old_commands
+                 if not (isinstance(item, ActionCommandSnapshot)
+                         and int(item) == ACTION_STOP and not item.protected_stop
+                         and requested_actions and requested_actions[0] != ACTION_STOP)],
                 requested_actions,
                 stop_action=ACTION_STOP,
                 rotate_actions=frozenset(ROTATE_ACTIONS),
@@ -5366,7 +5429,25 @@ class PersonTracker:
             clear_ms = (time.perf_counter() - clear_start) * 1000.0
             for action in queued_actions:
                 try:
-                    self.action_queue.put_nowait(action)
+                    if action == ACTION_STOP and protected_commands:
+                        self.action_queue.put_nowait(protected_commands.pop(0))
+                        queued += 1
+                        continue
+                    protected = bool(action == ACTION_STOP and (
+                        getattr(self, "_runtime_shutdown_requested", False)
+                        or getattr(self, "_explicit_stop_requested", False)
+                        or any(token in reason for token in
+                               ("hard_stop", "hazard", "bunker", "front_ir", "left_ir", "right_ir", "manual", "user_stop"))))
+                    self.action_queue.put_nowait(ActionCommandSnapshot(
+                        action=int(action), revision=revision, enqueued_at=replace_ts,
+                        control_frame=int(self.frame_index),
+                        capture_frame_id=int(getattr(self, "_last_command_capture_frame", -1)),
+                        capture_timestamp=float(getattr(self, "_last_command_capture_timestamp", 0.0)),
+                        reason=str(reason), soft_stop=bool(getattr(self, "_use_soft_stop_next", False)) and not protected,
+                        protected_stop=protected,
+                        source_module=str(getattr(self, "_last_command_source_module", "unknown")),
+                        uid=getattr(getattr(self, "_follow_controller", None), "active_target_id", None),
+                    ))
                     queued += 1
                 except queue.Full:
                     logger.warning(
@@ -5834,9 +5915,10 @@ class PersonTracker:
     def _has_fresh_lateral_yaw(self, target_id: Optional[int] = None) -> bool:
         """Neither a queued rotate nor bbox geometry can revive a revoked yaw."""
         intent = self._lateral_intent_store.snapshot()
+        now = time.monotonic()
         if (
             intent is None
-            or not intent.valid(time.monotonic())
+            or not intent.valid(now)
             or intent.hold_zero
             or int(getattr(self, "_lateral_intent_zero_sequence", -1)) == intent.sequence
             or (target_id is not None and intent.target_id != int(target_id))
@@ -5848,6 +5930,10 @@ class PersonTracker:
             or not self.running
         ):
             return False
+        if intent.nominal_valid_until > 0.0 and now > intent.nominal_valid_until:
+            get_feedback = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
+            if not intent.continuation_allowed(now, get_feedback() if callable(get_feedback) else None):
+                return False  # Last-moment writer gate, even if the control loop is delayed.
         if int(getattr(self, "_lateral_intent_last_sequence", -1)) == intent.sequence:
             return int(getattr(self, "_lateral_intent_last_correction_rpm", 0)) != 0
         return intent.initial_correction_rpm != 0
@@ -6967,6 +7053,15 @@ class PersonTracker:
                     self.search_direction,
                 )
                 self._last_control_decision_log_key = log_key
+                logger.info(
+                    "control_direction_provenance processed_capture_frame_id=%s "
+                    "latest_observation_capture_frame_id=%s action_evidence_capture_frame_id=%s "
+                    "direction_source=%s",
+                    frame.capture_frame_id,
+                    getattr(self._follow_controller, "_direction_latest_visible_capture_id", None),
+                    decision.evidence_capture_frame_id,
+                    getattr(self._follow_controller, "_lost_hint_source", "none"),
+                )
             if decision.explicit_stop_requested:
                 self._log_distance_stop_trigger(decision.reason, frame.distance_state)
             pid_result = self._follow_controller.last_steering_pid_result
@@ -7462,6 +7557,10 @@ class PersonTracker:
             "hold_frame": int(gate_decision.hold_frame),
             "hold_frames": int(gate_decision.hold_frames),
             "defer_sec": round(float(gate_decision.defer_sec), 4),
+            "ignored_edge_probes": [detection_item(item, "probe") for item in
+                                    getattr(self._search_candidate_gate, "last_ignored_edge_probes", ())],
+            "edge_probe_min_score": SEARCH_EVIDENCE_PROBE_EDGE_MIN_SCORE,
+            "edge_probe_center_ratio": SEARCH_EVIDENCE_PROBE_EDGE_CENTER_RATIO,
             "internal_probe_streak": int(
                 getattr(self._search_candidate_gate, "_probe_streak", 0)
             ),
@@ -7758,7 +7857,7 @@ class PersonTracker:
             output_uid = int(getattr(rec, "reid_uid", 0))
             mapped_uid = int(assignment.get("mapped_uid") or 0)
             assignment_reason = str(assignment.get("reason") or "")
-            rejected_mapping = assignment_reason in {
+            rejected_mapping = bool(assignment.get("identity_control_rejected")) or assignment_reason in {
                 "mapped_missing_identity",
                 "mapped_verify_reject",
                 "mapped_weak_distance_reject",
@@ -7939,6 +8038,8 @@ class PersonTracker:
         Edge-cropped and distorted boxes are handled by the separate visible
         low-quality hold path, so they cannot reach the distance PID.
         """
+        if assignment.get("identity_control_rejected"):
+            return False
         if assignment.get("bbox_quality_ok") is not False:
             return True
         reasons = [
@@ -8048,6 +8149,9 @@ class PersonTracker:
         width: int,
     ) -> Optional[int]:
         """Recover the locked UID from two unique, direction-consistent boxes."""
+        if assignment.get("identity_control_rejected"):
+            self._reset_search_geometry_reacquire()
+            return None
         if not SINGLE_PERSON_GEOMETRY_FALLBACK_ENABLE:
             self._reset_search_geometry_reacquire()
             return None
@@ -8520,6 +8624,8 @@ class PersonTracker:
         height: int,
     ) -> Optional[int]:
         """Return the held UID for one strong, geometrically continuous frame."""
+        if assignment.get("identity_control_rejected"):
+            return None
         active_uid = getattr(self._follow_controller, "active_target_id", None)
         held_uid = getattr(self, "_visual_reacquire_hold_uid", None)
         if (
@@ -8753,6 +8859,61 @@ class PersonTracker:
             # transition while preserving their existing control semantics.
             self._replace_action_queue([ACTION_FORWARD], reason)
 
+    def _hold_search_reacquire_brake(self, *, bbox, width, eligible, confirmed=False) -> bool:
+        """Brake before search early returns. No UID, forward grant or template mutation."""
+        runtime = getattr(self, "_action_runtime", None)
+        pending = getattr(runtime, "search_reacquire_brake_pending", None)
+        policy = getattr(self._follow_controller, "cfg", None)
+        if not callable(pending) or policy is None:
+            return False
+        now = time.monotonic()
+        stamp = float(getattr(self, "_active_capture_timestamp", 0.0))
+        if not 0 < stamp <= now or now-stamp > VISION_CONTROL_MAX_RESULT_AGE_SEC:
+            return bool(getattr(runtime, "_search_reacquire_brake_request", None))
+        if pending():
+            return True
+        search_active = getattr(self._follow_controller, "search_state", self.search_state) == "searching"
+        handoff = bool(confirmed and getattr(self, "_search_handoff_uid", None) is not None
+                       and getattr(self._follow_controller, "active_target_id", None) == self._search_handoff_uid)
+        if not search_active and not handoff:
+            self._search_candidate_brake_episode = None
+            return False
+        direction = (getattr(self, "_search_handoff_direction", None) if handoff and not search_active
+                     else getattr(self._follow_controller, "search_direction", self.search_direction))
+        reason = search_brake_reason(
+            bbox=bbox, width=width, direction=direction, eligible=eligible,
+            now=now, capture_timestamp=stamp, max_age=VISION_CONTROL_MAX_RESULT_AGE_SEC,
+            feedback=runtime.get_steering_feedback(), policy=policy,
+        )
+        if reason is None:
+            self._search_candidate_brake_episode = None
+            return False
+        episode = getattr(self, "_search_candidate_brake_episode", None)
+        if episode is not None:
+            # A completed physical stop is not re-armed on every central box.
+            # Unconfirmed evidence gets only the existing bounded observation
+            # window; confirmed identity may immediately resume lateral control.
+            if not confirmed and now-episode < SEARCH_EVIDENCE_MAX_HOLD_SEC:
+                self._publish_observation_soft_zero("search_reacquire_brake_observe", use_stop_action=True)
+                return True
+            return False
+        self._search_candidate_brake_episode = now
+        self._search_handoff_uid = None  # one stop per acquisition, not normal-follow braking
+        self._clear_lateral_intent("search_reacquire_brake")
+        self._clear_longitudinal_context(reason="search_reacquire_brake")
+        self._current_forward_percent = self._current_steer_base_percent = 0
+        self._current_steer_correction_rpm = self._current_rotate_raw_target = 0
+        self._use_soft_stop_next = False
+        accepted = runtime.request_search_reacquire_brake(
+            int(getattr(self, "_active_capture_frame_id", 0)), stamp, reason)
+        if accepted is False:
+            self._search_candidate_brake_episode = None
+            return False
+        logger.info("search_reacquire_brake_gate capture_frame_id=%s reason=%s "
+                    "confirmed=%s identity_claim=False longitudinal_allowed=False",
+                    getattr(self, "_active_capture_frame_id", 0), reason, confirmed)
+        return True
+
     def _publish_search_reacquire_direction_hold(self, reason: str) -> bool:
         """Keep a bounded search yaw while a candidate waits for fresh Depth.
 
@@ -8835,6 +8996,16 @@ class PersonTracker:
             )
         ]
         if not search_active or len(confirmed) != 1:
+            if not search_active and len(confirmed) == 1:
+                current = confirmed[0]
+                if getattr(self, "_search_handoff_uid", None) == int(current["stable_id"]):
+                    if PersonTracker._hold_search_reacquire_brake(
+                            self, bbox=current["bbox"], width=width,
+                            eligible=int(getattr(current["rec"], "time_since_update", 0)) == 0,
+                            confirmed=True):
+                        return True
+            elif len(confirmed) != 1:
+                self._search_handoff_uid = None
             self._reset_confirmed_search_reacquire()
             return False
 
@@ -8874,13 +9045,18 @@ class PersonTracker:
         )
         late_visual_confirmed = bool(
             assignment_confirmed
-            and assignment_reason == "preferred_search_late_reacquire"
+            and assignment_reason in {"preferred_search_late_reacquire", "preferred_search_soft_reacquire"}
         )
         identity_geometry_blocked = bool(
             assignment.get("reacquire_geometry_ok") is False
             or assignment.get("bbox_quality_ok") is False
             or int(getattr(rec, "time_since_update", 0)) != 0
         )
+        if PersonTracker._hold_search_reacquire_brake(
+                self, bbox=bbox, width=width,
+                eligible=assignment_confirmed and not identity_geometry_blocked,
+                confirmed=assignment_confirmed):
+            return True
         # A small appearance distance alone is not identity proof. The bank
         # must also verify the locked UID's recent geometry; Depth still gates
         # longitudinal follow even when visual confirmation needs one frame.
@@ -8982,6 +9158,13 @@ class PersonTracker:
                 None,
             )
             if callable(releaser):
+                # Carry the search-to-follow braking obligation across early
+                # identity release, until the first center approach is stopped.
+                # It never supplies identity or motion authorization itself.
+                if getattr(self, "_search_candidate_brake_episode", None) is None:
+                    self._search_handoff_uid = uid
+                    self._search_handoff_direction = getattr(
+                        self._follow_controller, "search_direction", self.search_direction)
                 releaser(
                     "visual_reacquire_depth_pending"
                     if depth_gate_pending
@@ -9472,6 +9655,88 @@ class PersonTracker:
         self._visible_unsteerable_last_ts = None
         self._visible_unsteerable_bbox = None
 
+    def _observe_target_during_search_brake(self, records, width: int, height: int) -> str:
+        """Observation-only path: no PID, depth refresh, assignment or action queue."""
+        controller = getattr(self, "_follow_controller", None)
+        uid = getattr(controller, "active_target_id", None)
+        cap = int(getattr(self, "_active_capture_frame_id", 0))
+        stamp = float(getattr(self, "_active_capture_timestamp", 0.0))
+        age = time.monotonic() - stamp
+        if uid is None or int(uid) <= 0 or width <= 0 or height <= 0:
+            return "no_active_target"
+        if not math.isfinite(age) or stamp <= 0 or not 0 <= age <= VISION_CONTROL_MAX_RESULT_AGE_SEC:
+            return "stale_capture"
+        if cap <= int(getattr(controller, "_direction_latest_visible_capture_id", 0)):
+            return "duplicate_or_old_capture"
+        # Require a unique, fresh, formally assigned record. Detector-only and
+        # geometry fallback candidates must not steer the loss-direction history.
+        owned = [r for r in records if int(getattr(r, "reid_uid", 0)) == int(uid)
+                 and int(getattr(r, "class_id", -1)) == PERSON_CLASS_ID
+                 and int(getattr(r, "time_since_update", 0)) == 0
+                 and float(getattr(r, "score", 0.0)) > CONFIDENCE_THRESHOLD]
+        if len(owned) != 1:
+            return "no_unique_confirmed_record"
+        rec = owned[0]
+        tracker = getattr(getattr(self, "_rknn_pipeline", None), "tracker", None)
+        observations = [o for o in getattr(tracker, "last_identity_observations", ())
+                        if o.get("raw_track_id") == int(rec.track_id)
+                        and o.get("uid") == int(uid)
+                        and (o.get("sample_metadata") or {}).get("capture_frame_id") == cap
+                        and (o.get("sample_metadata") or {}).get("capture_timestamp") == stamp]
+        if len(observations) != 1:
+            return "missing_current_identity_provenance"
+        observation = observations[0]
+        metadata = observation.get("sample_metadata") or {}
+        assignment = observation.get("assignment") or {}
+        competition = metadata.get("identity_competition") or {}
+        if (metadata.get("is_fresh") is not True
+                or assignment.get("bbox_quality_ok") is not True
+                or assignment.get("reacquire_geometry_ok") is False
+                or assignment.get("search_excluded")
+                or competition.get("passed") is False):
+            return "identity_or_quality_rejected"
+        bindings = PersonTracker._search_exclusion_bindings(self)
+        if any(b["raw_track_id"] == int(rec.track_id) and b["exclusion"] is not None
+               for b in bindings):
+            return "identity_excluded"
+        bbox = observation.get("detector_bbox")
+        if bbox is None or len(bbox) != 4:
+            return "missing_detector_bbox"
+        bbox = tuple(float(v) for v in bbox)
+        if (not all(math.isfinite(v) for v in bbox)
+                or not 0 <= bbox[0] < bbox[2] <= width
+                or not 0 <= bbox[1] < bbox[3] <= height):
+            return "invalid_detector_bbox"
+        yaw = metadata.get("integrated_yaw_deg")
+        feedback = (SteeringFeedback(timestamp=stamp, integrated_yaw_right_deg=float(yaw))
+                    if yaw is not None and math.isfinite(float(yaw)) else None)
+        target = PersonTarget(bbox=bbox, track_id=int(uid), confidence=float(rec.score),
+                              area=(bbox[2]-bbox[0])*(bbox[3]-bbox[1]))
+        frame = SensorFrame(width=width, height=height, persons=[target],
+                            capture_frame_id=cap, capture_timestamp=stamp,
+                            steering_feedback=feedback)
+        if not controller.note_brake_hold_observation(frame, target):
+            return "history_not_updated"
+        self._search_brake_latest_observation = (int(uid), cap)
+        return "trusted_observation_recorded"
+
+    def _finish_search_brake_observation_hold(self) -> None:
+        if not getattr(self, "_search_brake_observation_active", False):
+            return
+        self._search_brake_observation_active = False
+        evidence = getattr(self, "_search_brake_latest_observation", None)
+        self._search_brake_latest_observation = None
+        controller = getattr(self, "_follow_controller", None)
+        reset = bool(evidence and controller.resume_direction_after_brake_hold(*evidence))
+        if reset:
+            self.search_state = controller.search_state
+            self.search_direction = controller.search_direction
+        logger.info("search_reacquire_brake_resume capture_frame_id=%s "
+                    "latest_observation_capture_frame_id=%s direction_recomputed_required=%s "
+                    "motion_authorized=False",
+                    getattr(self, "_active_capture_frame_id", 0),
+                    None if evidence is None else evidence[1], reset)
+
     def _consume_track_records(
         self,
         records,
@@ -9481,6 +9746,29 @@ class PersonTracker:
         *,
         lateral_candidate: Optional[LateralCandidateEvidence] = None,
     ) -> None:
+        runtime = getattr(self, "_action_runtime", None)
+        pending = getattr(runtime, "search_reacquire_brake_pending", None)
+        if callable(pending) and pending():
+            # New vision may finish identity processing, but it cannot restore
+            # forward/yaw while the search NORMAL stop is still settling.
+            if not getattr(self, "_search_brake_observation_active", False):
+                self._search_brake_observation_active = True
+                self._search_brake_latest_observation = None
+                invalidate = getattr(getattr(self, "_follow_controller", None),
+                                     "invalidate_pre_brake_steering", None)
+                if callable(invalidate):
+                    invalidate()
+            observation_reason = PersonTracker._observe_target_during_search_brake(self, records, width, height)
+            request = getattr(runtime, "_search_reacquire_brake_request", None)
+            logger.info("search_reacquire_brake_wait capture_frame_id=%s "
+                        "latest_observation_capture_frame_id=%s action_evidence_capture_frame_id=%s "
+                        "observation_reason=%s control=held longitudinal_allowed=False",
+                        getattr(self, "_active_capture_frame_id", 0),
+                        getattr(getattr(self, "_follow_controller", None),
+                                "_direction_latest_visible_capture_id", None),
+                        getattr(request, "capture_frame_id", None), observation_reason)
+            return
+        PersonTracker._finish_search_brake_observation_hold(self)
         # CAP1786->1790: clearing the accepted speed here made a fresh
         # STEER become TURN + transition STOP on every older RGB observation.
         self._clear_longitudinal_context(
@@ -9637,6 +9925,14 @@ class PersonTracker:
                 "assignment": assignment,
             }
             reid_debug_by_stable_id.setdefault(int(stable_id), []).append(debug_entry)
+            if VISION_REID_ENABLE and assignment.get("identity_control_rejected"):
+                skipped_unconfirmed_reid += 1
+                person_track_debug.append((area, stable_id, rec, None))
+                logger.info("identity_control_rejected capture_frame_id=%s raw_track_id=%s "
+                            "reason=%s geometry_fallback=False longitudinal_allowed=False",
+                            getattr(self, "_active_capture_frame_id", None), rec.track_id,
+                            assignment.get("reason"))
+                continue
             if VISION_REID_ENABLE and not self._bound_reid_bbox_allowed_for_control(assignment):
                 # 已绑定身份也不能绕过正常控制质量门槛。裁剪型大框可在
                 # 后续独立路径受限转向；其他拒绝框只保留诊断记录。
@@ -11365,6 +11661,26 @@ class PersonTracker:
         # Do not let a single edge/blurred frame reverse the frozen search
         # direction before the candidate gate has completed its streak.
         lateral_candidate_deferred = False
+        if lateral_candidate is not None and not stale_result_discarded:
+            binding = PersonTracker._search_binding_for_bbox(lateral_candidate.bbox, exclusion_bindings)
+            assignment = ({} if binding is None else
+                          self._identity_assignment_debug_for_track(binding["raw_track_id"]))
+            distance = assignment.get("distance")
+            stop_only_evidence = bool(
+                binding is not None and binding["exclusion"] is None
+                and len(formal_evidence) == 1
+                and assignment.get("best_uid", assignment.get("uid")) == active_candidate_uid
+                and assignment.get("match_source") == "strong"
+                and isinstance(distance, (float, int)) and math.isfinite(distance)
+                and distance <= 0.30
+                and assignment.get("reacquire_geometry_ok") is True
+                and assignment.get("bbox_quality_ok") is True
+            )
+            PersonTracker._hold_search_reacquire_brake(
+                self, bbox=lateral_candidate.bbox, width=width,
+                eligible=bool(lateral_candidate.active_target_match or stop_only_evidence),
+                confirmed=bool(lateral_candidate.active_target_match),
+            )
         if (
             lateral_candidate is not None
             and not bool(lateral_candidate.active_target_match)
@@ -11462,7 +11778,9 @@ class PersonTracker:
             "reid_partial_inference_ms=%.2f "
             "reid_postprocess_ms=%.2f reid_total_ms=%.2f tracker_ms=%.2f "
             "predicted_reid_verify_ms=%.2f vision_total_ms=%.2f control_ms=%.2f "
-            "end_to_end_ms=%.2f result_age_ms=%.2f stale_result_discarded=%s",
+            "end_to_end_ms=%.2f result_age_ms=%.2f stale_result_discarded=%s "
+            "reid_color_ms=%.2f reid_postprocess_exclusive_ms=%.2f "
+            "tracker_stages_wall_cpu_ms=%s",
             int(self.frame_index),
             int(getattr(self, "_active_capture_frame_id", 0)),
             float(camera_read_ms or 0.0),
@@ -11484,6 +11802,20 @@ class PersonTracker:
             (control_finished - pipeline_started) * 1000.0,
             vision_result_age_sec * 1000.0,
             stale_result_discarded,
+            float(timing.get("reid_color", 0.0)),
+            float(timing.get("reid_postprocess_exclusive", 0.0)),
+            ";".join(
+                "%s=%.2f/%.2f" % (
+                    key, float(timing.get(key, 0.0)), float(timing.get(key + "_cpu", 0.0))
+                )
+                for key in (
+                    "tracker_association", "deepsort_match", "deepsort_kalman_update",
+                    "deepsort_metric_update", "tracker_geometry", "tracker_competition",
+                    "tracker_evidence", "tracker_records", "tracker_probe",
+                    "identity_match_evidence", "identity_decision",
+                    "identity_quarantine", "identity_logging",
+                )
+            ),
         )
         diagnostic_now = time.monotonic()
         controller_status_after = self._follow_controller.search_status(diagnostic_now)

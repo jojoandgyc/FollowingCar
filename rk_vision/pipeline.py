@@ -223,6 +223,10 @@ class RKNNVisionConfig:
     identity_update_threshold: float = 0.30
     identity_update_interval: int = 5
     identity_max_features: int = 20
+    identity_template_memory_enable: bool = False
+    identity_template_crosscheck_enable: bool = False
+    identity_template_recent_sec: float = 30.0
+    identity_template_archive_sec: float = 120.0
     identity_max_weak_features: int = 8
     identity_diversity_min_distance: float = 0.02
     identity_diversity_replace_margin: float = 0.01
@@ -379,6 +383,10 @@ class RKNNVisionConfig:
             identity_update_threshold=float(os.environ.get("Y8_IDENTITY_UPDATE_THRESHOLD", "0.30")),
             identity_update_interval=max(1, int(os.environ.get("Y8_IDENTITY_UPDATE_INTERVAL", "5"))),
             identity_max_features=max(1, int(os.environ.get("Y8_IDENTITY_MAX_FEATURES", "20"))),
+            identity_template_memory_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_MEMORY_ENABLE", "0").strip() == "1",
+            identity_template_crosscheck_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_CROSSCHECK_ENABLE", "0").strip() == "1",
+            identity_template_recent_sec=max(1.0, float(os.environ.get("Y8_IDENTITY_TEMPLATE_RECENT_SEC", "30"))),
+            identity_template_archive_sec=max(1.0, float(os.environ.get("Y8_IDENTITY_TEMPLATE_ARCHIVE_SEC", "120"))),
             identity_max_weak_features=max(0, int(os.environ.get("Y8_IDENTITY_MAX_WEAK_FEATURES", "8"))),
             identity_diversity_min_distance=max(
                 0.0, float(os.environ.get("Y8_IDENTITY_DIVERSITY_MIN_DISTANCE", "0.02"))
@@ -714,6 +722,10 @@ class RKNNVisionPipeline:
                 identity_update_threshold=self.config.identity_update_threshold,
                 identity_update_interval=self.config.identity_update_interval,
                 identity_max_features=self.config.identity_max_features,
+                identity_template_memory_enable=self.config.identity_template_memory_enable,
+                identity_template_crosscheck_enable=self.config.identity_template_crosscheck_enable,
+                identity_template_recent_sec=self.config.identity_template_recent_sec,
+                identity_template_archive_sec=self.config.identity_template_archive_sec,
                 identity_max_weak_features=self.config.identity_max_weak_features,
                 identity_diversity_min_distance=self.config.identity_diversity_min_distance,
                 identity_diversity_replace_margin=self.config.identity_diversity_replace_margin,
@@ -1029,6 +1041,7 @@ class RKNNVisionPipeline:
             for key in (
                 "preprocess", "inference", "partial_inference", "postprocess",
                 "total", "detections", "features",
+                "color", "postprocess_exclusive",
             ):
                 combined_reid_timing[key] = float(combined_reid_timing.get(key, 0.0)) + float(verify_timing.get(key, 0.0))
         frame_wrap_ms = _elapsed_ms(frame_start, detect_end) - float(yolo_timing.get("total", 0.0))
@@ -1044,6 +1057,8 @@ class RKNNVisionPipeline:
             "reid_inference": float(combined_reid_timing.get("inference", 0.0)),
             "reid_partial_inference": float(combined_reid_timing.get("partial_inference", 0.0)),
             "reid_postprocess": float(combined_reid_timing.get("postprocess", 0.0)),
+            "reid_color": float(combined_reid_timing.get("color", 0.0)),
+            "reid_postprocess_exclusive": float(combined_reid_timing.get("postprocess_exclusive", 0.0)),
             "reid_total": float(combined_reid_timing.get("total", 0.0)),
             "reid_detections": float(combined_reid_timing.get("detections", 0.0)),
             "reid_features": float(combined_reid_timing.get("features", 0.0)),
@@ -1058,6 +1073,15 @@ class RKNNVisionPipeline:
             "predicted_reid_verify": _elapsed_ms(verify_start, verify_end) if verify_timing is not None else 0.0,
             "total": _elapsed_ms(frame_start, verify_end),
         }
+        for key, value in getattr(self.tracker, "last_timing_ms", {}).items():
+            self.last_timing_ms["tracker_" + key] = value
+        inner_tracker = getattr(getattr(self.tracker, "deepsort", None), "tracker", None)
+        for key, value in getattr(inner_tracker, "last_timing_ms", {}).items():
+            self.last_timing_ms["deepsort_" + key] = value
+        bank = getattr(self.tracker, "identity_bank", None)
+        if getattr(bank, "_assign_timing_frame", None) == getattr(self.tracker, "_frame_index", -1):
+            for key, value in getattr(bank, "last_assign_timing_ms", {}).items():
+                self.last_timing_ms["identity_" + key] = value
         if self.logger is not None:
             self.logger.debug(
                 "rknn vision frame processed width=%d height=%d detections=%d persons=%d tracks=%d",

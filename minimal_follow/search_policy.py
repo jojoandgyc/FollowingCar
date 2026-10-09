@@ -64,6 +64,11 @@ class LostPersonSearchPolicy:
             self._last_direction = "right"
             self._last_direction_at = float(now)
 
+    @property
+    def loss_episode_active(self) -> bool:
+        """Whether a candidate must be appearance-verified before takeover."""
+        return self._state != "tracking"
+
     def _fresh_direction(self, now: float) -> Optional[str]:
         if self._last_direction not in {"left", "right"} or self._last_direction_at is None:
             return None

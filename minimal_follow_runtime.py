@@ -3,8 +3,9 @@
 
 This is intentionally independent from request_0513_modular.py.  It reuses
 only stable adapters: RKNN vision, registered Astra depth, front IR, and the
-LZ30EMA motor backend.  There is no ReID, search, target memory, reverse,
-motion prediction, or legacy action queue.
+LZ30EMA motor backend.  The normal loop has no per-frame ReID: an optional
+appearance worker runs only for bounded initial enrollment and loss recovery.
+It does not reuse the legacy action queue, target memory, or motion predictor.
 """
 
 from __future__ import annotations
@@ -26,6 +27,15 @@ LOADED_CONFIG = preload_config_from_argv()
 
 from car_control_modular.astra_depth import AstraDepthConfig, AstraDepthRuntime
 from car_control_modular.mssd_motor import MssdMotorBackend, MssdMotorConfig
+from minimal_follow.appearance import (
+    AppearanceDecision,
+    AppearanceIdentityConfig,
+    AppearanceIdentityPolicy,
+    AppearanceQualityConfig,
+    AppearanceQualityGate,
+    AppearanceWorker,
+    AppearanceWorkerConfig,
+)
 from minimal_follow import (
     LostPersonSearchConfig,
     LostPersonSearchPolicy,
@@ -88,6 +98,14 @@ class RuntimeConfig:
     search_turn_memory_sec: float
     search_timeout_sec: float
     search_turn_percent: int
+    appearance_enabled: bool
+    appearance_stable_enroll_frames: int
+    appearance_enroll_interval_sec: float
+    appearance_reacquire_interval_sec: float
+    appearance_result_max_age_sec: float
+    appearance_full_match_threshold: float
+    appearance_partial_match_threshold: float
+    appearance_reacquire_confirm_results: int
     motor_enabled: bool
     front_ir_enabled: bool
 
@@ -113,6 +131,14 @@ class RuntimeConfig:
             search_turn_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TURN_MEMORY_SEC", 1.0)),
             search_timeout_sec=max(0.0, _float_env("MINIMAL_SEARCH_TIMEOUT_SEC", 1.5)),
             search_turn_percent=max(0, _int_env("MINIMAL_SEARCH_TURN_PERCENT", 8)),
+            appearance_enabled=_bool_env("MINIMAL_APPEARANCE_ENABLE", True),
+            appearance_stable_enroll_frames=max(1, _int_env("MINIMAL_APPEARANCE_STABLE_ENROLL_FRAMES", 3)),
+            appearance_enroll_interval_sec=max(0.0, _float_env("MINIMAL_APPEARANCE_ENROLL_INTERVAL_SEC", 0.80)),
+            appearance_reacquire_interval_sec=max(0.0, _float_env("MINIMAL_APPEARANCE_REACQUIRE_INTERVAL_SEC", 0.20)),
+            appearance_result_max_age_sec=max(0.01, _float_env("MINIMAL_APPEARANCE_RESULT_MAX_AGE_SEC", 0.35)),
+            appearance_full_match_threshold=_float_env("MINIMAL_APPEARANCE_FULL_MATCH_THRESHOLD", 0.72),
+            appearance_partial_match_threshold=_float_env("MINIMAL_APPEARANCE_PARTIAL_MATCH_THRESHOLD", 0.80),
+            appearance_reacquire_confirm_results=max(1, _int_env("MINIMAL_APPEARANCE_REACQUIRE_CONFIRM_RESULTS", 2)),
             motor_enabled=bool(motor_enabled),
             front_ir_enabled=_bool_env("MINIMAL_FRONT_IR_ENABLE", True),
         )
@@ -131,6 +157,7 @@ class MinimalFollowRuntime:
         self.previous_frame_started_at: Optional[float] = None
         self.motor: Optional[MssdMotorBackend] = None
         self.ir_started = False
+        self.appearance_worker: Optional[AppearanceWorker] = None
 
         model_value = os.environ.get(
             "VISION_MODEL_PATH", "models/yolo11n_int8_person_val2017.rknn"
@@ -200,6 +227,7 @@ class MinimalFollowRuntime:
                 turn_percent=config.search_turn_percent,
             )
         )
+        self.identity_policy = self._make_identity_policy()
         if config.motor_enabled:
             self.motor = self._make_motor()
         LOG.info(
@@ -210,6 +238,61 @@ class MinimalFollowRuntime:
             config.search_enabled, config.search_turn_memory_sec,
             config.search_timeout_sec, config.search_turn_percent,
         )
+
+    def _make_identity_policy(self) -> AppearanceIdentityPolicy:
+        cfg = self.config
+        quality_gate = AppearanceQualityGate(AppearanceQualityConfig(
+            min_confidence=_float_env("MINIMAL_APPEARANCE_MIN_CONFIDENCE", 0.75),
+            min_height_px=_float_env("MINIMAL_APPEARANCE_MIN_HEIGHT_PX", 120.0),
+            min_area_px=_float_env("MINIMAL_APPEARANCE_MIN_AREA_PX", 8000.0),
+            min_aspect_ratio=_float_env("MINIMAL_APPEARANCE_MIN_ASPECT_RATIO", 0.20),
+            max_aspect_ratio=_float_env("MINIMAL_APPEARANCE_MAX_ASPECT_RATIO", 1.25),
+            edge_margin_ratio=_float_env("MINIMAL_APPEARANCE_EDGE_MARGIN_RATIO", 0.015),
+        ))
+        policy_config = AppearanceIdentityConfig(
+            enabled=cfg.appearance_enabled,
+            stable_enroll_frames=cfg.appearance_stable_enroll_frames,
+            enroll_interval_sec=cfg.appearance_enroll_interval_sec,
+            reacquire_interval_sec=cfg.appearance_reacquire_interval_sec,
+            result_max_age_sec=cfg.appearance_result_max_age_sec,
+            full_match_threshold=cfg.appearance_full_match_threshold,
+            partial_match_threshold=cfg.appearance_partial_match_threshold,
+            reacquire_confirm_results=cfg.appearance_reacquire_confirm_results,
+            max_full_templates=max(1, _int_env("MINIMAL_APPEARANCE_MAX_FULL_TEMPLATES", 5)),
+            max_partial_templates=max(1, _int_env("MINIMAL_APPEARANCE_MAX_PARTIAL_TEMPLATES", 3)),
+        )
+        if not cfg.appearance_enabled:
+            LOG.info("minimal appearance disabled")
+            return AppearanceIdentityPolicy(policy_config, quality_gate, None)
+        model_value = os.environ.get(
+            "VISION_REID_MODEL_PATH", "models/osnet_x0_25_msmt17_b1.rknn"
+        ).strip()
+        model_path = model_value if os.path.isabs(model_value) else os.path.join(SCRIPT_DIR, model_value)
+        if not os.path.isfile(model_path):
+            LOG.warning("minimal appearance disabled: OSNet model not found: %s", model_path)
+            disabled = AppearanceIdentityConfig(**{**policy_config.__dict__, "enabled": False})
+            return AppearanceIdentityPolicy(disabled, quality_gate, None)
+        self.appearance_worker = AppearanceWorker(AppearanceWorkerConfig(
+            model_path=model_path,
+            input_width=_int_env("RKNN_REID_INPUT_WIDTH", 128),
+            input_height=_int_env("RKNN_REID_INPUT_HEIGHT", 256),
+            input_format=os.environ.get("RKNN_REID_INPUT_FORMAT", "RGB").strip(),
+            input_dtype=os.environ.get("RKNN_REID_INPUT_DTYPE", "float32").strip(),
+            input_layout=os.environ.get("RKNN_REID_INPUT_LAYOUT", "NCHW").strip(),
+            normalize=os.environ.get("RKNN_REID_NORMALIZE", "imagenet").strip(),
+            target=os.environ.get("RKNN_TARGET", "rk3588").strip(),
+            core_mask=os.environ.get("MINIMAL_APPEARANCE_RKNN_CORE_MASK", os.environ.get("RKNN_CORE_MASK", "auto")).strip(),
+            backend=os.environ.get("RKNN_BACKEND", "auto").strip(),
+            color_fusion_enable=_bool_env("MINIMAL_APPEARANCE_COLOR_FUSION_ENABLE", True),
+            color_fusion_weight=_float_env("MINIMAL_APPEARANCE_COLOR_FUSION_WEIGHT", 0.35),
+        ), logger=LOG)
+        self.appearance_worker.start()
+        LOG.info(
+            "minimal appearance ready model=%s enroll_every=%.2fs reacquire_every=%.2fs confirm=%d",
+            model_path, cfg.appearance_enroll_interval_sec,
+            cfg.appearance_reacquire_interval_sec, cfg.appearance_reacquire_confirm_results,
+        )
+        return AppearanceIdentityPolicy(policy_config, quality_gate, self.appearance_worker)
 
     def _make_motor(self) -> MssdMotorBackend:
         backend = os.environ.get("MOTOR_BACKEND", "rs485_lz30ema").strip().lower()
@@ -276,13 +359,13 @@ class MinimalFollowRuntime:
             return True
 
     @staticmethod
-    def _select_person(detections, threshold: float) -> Optional[Tuple[Tuple[float, float, float, float], int, float]]:
+    def _select_person(detections, threshold: float) -> Optional[Tuple[Tuple[float, float, float, float], int, float, float]]:
         candidates = []
         for detection in detections:
             if int(detection.class_id) != 0 or float(detection.score) < threshold:
                 continue
             bbox = tuple(float(value) for value in detection.bbox)
-            candidates.append((bbox, 1, float(detection.area)))
+            candidates.append((bbox, 1, float(detection.area), float(detection.score)))
         if not candidates:
             return None
         return max(candidates, key=lambda item: item[2])
@@ -334,6 +417,8 @@ class MinimalFollowRuntime:
         dispatch_ms: float,
         search_policy_ms: float,
         search_status,
+        appearance_policy_ms: float,
+        appearance_decision,
         detection_count: int,
         selected: bool,
         depth_attempted: bool,
@@ -347,6 +432,12 @@ class MinimalFollowRuntime:
         self.previous_frame_started_at = frame_started_at
         self.frame_index += 1
         detector_timing = getattr(self.detector, "last_timing_ms", {}) or {}
+        appearance_timing = appearance_decision.worker_timing_ms or {}
+
+        def _appearance_timing_value(name: str):
+            value = appearance_timing.get(name)
+            return round(float(value), 3) if isinstance(value, (int, float)) and math.isfinite(float(value)) else None
+
         record = {
             "frame": self.frame_index,
             "monotonic_s": round(time.monotonic(), 6),
@@ -363,6 +454,7 @@ class MinimalFollowRuntime:
             "decision_ms": round(decision_ms, 3),
             "dispatch_ms": round(dispatch_ms, 3),
             "search_policy_ms": round(search_policy_ms, 3),
+            "appearance_policy_ms": round(appearance_policy_ms, 3),
             "total_ms": round((finished_at - frame_started_at) * 1000.0, 3),
             "detections": int(detection_count),
             "person_selected": bool(selected),
@@ -379,6 +471,15 @@ class MinimalFollowRuntime:
                 None if search_status.search_elapsed_ms is None
                 else round(float(search_status.search_elapsed_ms), 3)
             ),
+            "appearance_state": appearance_decision.state,
+            "appearance_reason": appearance_decision.reason,
+            "appearance_match_score": appearance_decision.match_score,
+            "appearance_match_source": appearance_decision.match_source,
+            "appearance_result_age_ms": appearance_decision.result_age_ms,
+            "appearance_worker_preprocess_ms": _appearance_timing_value("preprocess"),
+            "appearance_worker_inference_ms": _appearance_timing_value("inference"),
+            "appearance_worker_partial_inference_ms": _appearance_timing_value("partial_inference"),
+            "appearance_worker_total_ms": _appearance_timing_value("total"),
         }
         LOG.info("minimal_timing %s", json.dumps(record, separators=(",", ":"), sort_keys=True))
 
@@ -413,17 +514,54 @@ class MinimalFollowRuntime:
             depth_ms = 0.0
             depth_attempted = False
             distance = None
+            policy_now = time.monotonic()
+            appearance_started_at = time.perf_counter()
             if selected is None:
+                self.identity_policy.target_missing(policy_now)
+                appearance_decision = AppearanceDecision(
+                    False, "missing", "no_candidate", None, None, None, None,
+                )
+                appearance_policy_ms = (time.perf_counter() - appearance_started_at) * 1000.0
                 search_started_at = time.perf_counter()
                 command, search_status = self.search_policy.target_missing(
-                    now=time.monotonic(), front_obstacle=front_blocked,
+                    now=policy_now, front_obstacle=front_blocked,
                 )
                 search_policy_ms = (time.perf_counter() - search_started_at) * 1000.0
                 decision_ms = 0.0
             else:
-                bbox, track_id, _area = selected
+                bbox, track_id, _area, score = selected
+                if self.search_policy.loss_episode_active:
+                    appearance_decision = self.identity_policy.search_candidate(
+                        frame=frame, bbox=bbox, score=score, frame_id=self.frame_index + 1,
+                        now=policy_now, frame_width=frame.shape[1], frame_height=frame.shape[0],
+                    )
+                else:
+                    appearance_decision = self.identity_policy.visible_target(
+                        frame=frame, bbox=bbox, score=score, frame_id=self.frame_index + 1,
+                        now=policy_now, frame_width=frame.shape[1], frame_height=frame.shape[0],
+                    )
+                appearance_policy_ms = (time.perf_counter() - appearance_started_at) * 1000.0
+                if not appearance_decision.accepted:
+                    search_started_at = time.perf_counter()
+                    command, search_status = self.search_policy.target_missing(
+                        now=policy_now, front_obstacle=front_blocked,
+                    )
+                    search_policy_ms = (time.perf_counter() - search_started_at) * 1000.0
+                    decision_ms = 0.0
+                    dispatch_started_at = time.perf_counter()
+                    dispatched = self._dispatch(command)
+                    dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000.0
+                    self._log_frame_timing(
+                        frame_started_at=frame_started_at, capture_ms=capture_ms, detect_ms=detect_ms,
+                        select_ms=select_ms, ir_ms=ir_ms, depth_ms=depth_ms, decision_ms=decision_ms,
+                        dispatch_ms=dispatch_ms, search_policy_ms=search_policy_ms, search_status=search_status,
+                        appearance_policy_ms=appearance_policy_ms, appearance_decision=appearance_decision,
+                        detection_count=len(detections), selected=True, depth_attempted=False,
+                        distance_m=None, front_blocked=front_blocked, command=command,
+                    )
+                    continue
                 search_started_at = time.perf_counter()
-                search_status = self.search_policy.visible(time.monotonic())
+                search_status = self.search_policy.visible(policy_now)
                 search_policy_ms = (time.perf_counter() - search_started_at) * 1000.0
                 if search_status.state == "search_reacquire_transition_stop":
                     decision_started_at = time.perf_counter()
@@ -463,6 +601,8 @@ class MinimalFollowRuntime:
                 dispatch_ms=dispatch_ms,
                 search_policy_ms=search_policy_ms,
                 search_status=search_status,
+                appearance_policy_ms=appearance_policy_ms,
+                appearance_decision=appearance_decision,
                 detection_count=len(detections),
                 selected=selected is not None,
                 depth_attempted=depth_attempted,
@@ -488,6 +628,9 @@ class MinimalFollowRuntime:
                 IR.deinit()
             except Exception:
                 LOG.exception("front IR close failed")
+        if self.appearance_worker is not None:
+            self.appearance_worker.close()
+            self.appearance_worker = None
         self.depth.close()
         self.detector.release()
 

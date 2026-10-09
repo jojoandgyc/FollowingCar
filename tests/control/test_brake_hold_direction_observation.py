@@ -33,6 +33,11 @@ def owner(monkeypatch):
     t._action_runtime = SimpleNamespace(
         search_reacquire_brake_pending=lambda: t.pending,
         _search_reacquire_brake_request=SimpleNamespace(capture_frame_id=654))
+    def pending():
+        if not t.pending:
+            t._action_runtime._search_reacquire_brake_request = None
+        return t.pending
+    t._action_runtime.search_reacquire_brake_pending = pending
     t._current_forward_percent = 0
     t._longitudinal_valid_until = 99.8
     def forbidden(*args, **kwargs):
@@ -66,6 +71,14 @@ def consume(t, records):
     t._consume_track_records(records, 640, 480, "test")
 
 
+def finish(t):
+    # These unit cases start AFTER the motor's completed-stop/new-image gate.
+    # Mirror its clearing of the pending request, not only a mock Boolean.
+    t.pending = False
+    t._action_runtime._search_reacquire_brake_request = None
+    t._finish_search_brake_observation_hold()
+
+
 def test_cap_replay_updates_history_without_releasing_stop(owner, caplog):
     t, c = owner, owner._follow_controller
     with caplog.at_level("INFO"):
@@ -81,7 +94,7 @@ def test_cap_replay_updates_history_without_releasing_stop(owner, caplog):
         assert "latest_observation_capture_frame_id=666 action_evidence_capture_frame_id=654" in caplog.text
     t.pending = False
     t._active_capture_frame_id = 671
-    t._finish_search_brake_observation_hold()
+    finish(t)
     assert c.search_direction is None and c._lost_exit_direction is None
     assert t._longitudinal_valid_until == 99.8
     for cap in (671,673,675):
@@ -123,7 +136,7 @@ def test_untrusted_frames_cannot_change_history(owner, case):
     elif case == "no_detector_bbox": obs["detector_bbox"] = None
     consume(t, records)
     assert t._follow_controller._direction_latest_visible_capture_id == 651
-    t._finish_search_brake_observation_hold()
+    finish(t)
     assert t._follow_controller.search_direction == "right"
 
 
@@ -146,7 +159,7 @@ def test_old_or_duplicate_capture_does_not_rewrite_history(owner):
 def test_identity_changed_during_hold_cannot_release_new_search(owner):
     consume(owner, [sample(owner, 666, .1)])
     owner._follow_controller.active_target_id = 2
-    owner._finish_search_brake_observation_hold()
+    finish(owner)
     assert owner._follow_controller.search_direction == "right"
 
 
@@ -160,7 +173,7 @@ def test_other_person_does_not_block_unique_assigned_uid(owner):
 
 def test_release_is_one_shot_and_does_not_clear_next_decision(owner):
     consume(owner, [sample(owner, 666, .1)])
-    owner._finish_search_brake_observation_hold()
+    finish(owner)
     owner._follow_controller.search_direction = "left"
     owner._finish_search_brake_observation_hold()
     assert owner._follow_controller.search_direction == "left"
@@ -212,7 +225,7 @@ def test_real_logged_detector_boxes_choose_left_without_hardware(owner):
         obs["detector_bbox"] = bbox
         obs["sample_metadata"]["capture_timestamp"] = stamp
         consume(owner, [r])
-    owner._finish_search_brake_observation_hold()
+    finish(owner)
     c = owner._follow_controller
     for cap in (668,670,671):
         c._record_target_direction_evidence(SensorFrame(width=640,
@@ -289,7 +302,7 @@ def test_cap1226_to1240_replay_searches_right_after_hold(owner, monkeypatch):
     assert c._direction_latest_visible_capture_id == 1240
     consume(t, [sample(t, 1244, .917, uid=0)])
     t.pending = False
-    t._finish_search_brake_observation_hold()
+    finish(t)
     assert c.search_direction is None and c._lost_exit_direction is None
     for cap in (1252, 1254, 1257):
         frame = SensorFrame(width=640, height=480, capture_frame_id=cap,
@@ -333,7 +346,7 @@ def test_stale_pipeline_branch_keeps_safety_and_only_records_during_hold(owner, 
     assert owner._follow_controller._direction_latest_visible_capture_id == (666 if pending else 651)
     assert owner._longitudinal_valid_until == 99.8
     if pending:
-        owner._finish_search_brake_observation_hold()
+        finish(owner)
         assert not owner._follow_controller.stale_direction_recovery_active
         assert owner._follow_controller.search_direction is None
 

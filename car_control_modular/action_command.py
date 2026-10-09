@@ -16,6 +16,9 @@ class ActionCommandSnapshot:
     protected_stop: bool = False
     source_module: str = "unknown"
     uid: Optional[int] = None
+    # Ordinary controller wait/settle requests are not external emergency
+    # latches. Unknown historical protected stops remain fail-closed.
+    stop_origin: str = "unknown"
 
     def __int__(self):
         return self.action

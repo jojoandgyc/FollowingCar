@@ -215,7 +215,7 @@ def test_real_revocations_never_escape_short_commit(monkeypatch, stage, fault):
         assert driver.stops == [1] and len(driver.pairs) == 1
 
 
-def test_continuous_publication_is_bounded_and_cannot_keep_expired_packet(monkeypatch):
+def test_continuous_fresh_publication_is_adopted_without_zero_or_lease_extension(monkeypatch):
     rt, owner, driver, clock, publish, _ = writer(monkeypatch)
     original = rt._linear_packet_write_limit
     calls = []
@@ -228,17 +228,24 @@ def test_continuous_publication_is_bounded_and_cannot_keep_expired_packet(monkey
 
     monkeypatch.setattr(rt, "_linear_packet_write_limit", change)
     rt._service_follow_wheels()
-    assert len(calls) == 4  # Three normal plans, one bounded straight-only plan.
-    assert driver.pairs[-1] == (0, 0)
+    assert len(calls) == 1  # Fresh equivalent evidence is not a failed plan.
+    assert driver.pairs[-1] == (82, -94)
     assert not owner.motor_io_lock.locked()
     history = rt._continuation_executed_speed_history
     assert len(history) == 2
-    assert history[-1].outer_rpm == 0
+    assert history[-1].outer_rpm == 94
     assert history[-1].receipt is rt.backend.last_speed_receipt
-    # Recording zero is not proof that the earlier high momentum vanished.
+    # A newer grant doesn't erase previously acknowledged high momentum.
     assert history[0].outer_rpm > 0
-    assert rt._forward_execution_anchor is None
-    assert rt._turn_response_trial.history[-1][1:] == (0., 0.)
+    assert rt._forward_execution_anchor.sample_timestamp == clock[0]
+    assert rt._turn_response_trial.history[-1][1:] == (88., -6.)
+    assert owner._depth30_linear_timing.depth_expires_at == clock[0] + .25
+    # No new publication: the physical deadline still stops translation.
+    monkeypatch.setattr(rt, "_linear_packet_write_limit", original)
+    clock[0] += .251
+    rt._steering_feedback = feedback(clock[0], 24., 24.)
+    rt._service_follow_wheels()
+    assert driver.pairs[-1] == (0, 0)
 
 
 def test_short_veto_without_completed_zero_receipt_cannot_fabricate_history(monkeypatch):

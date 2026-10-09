@@ -142,10 +142,20 @@ def test_new_axes_during_release_are_rebuilt_without_reparking(monkeypatch, new_
 
     assert change_on_release_read(monkeypatch, driver, update) == []
     rt._service_follow_wheels()
-    assert driver.pairs == [(26, -22), (int(new_base+new_yaw), -int(new_base-new_yaw))]
+    evidence_stamp = clock[0]
+    if (new_base, new_yaw) == (30., 2.):
+        # A larger same-yaw cap arriving during parking release may retain
+        # the already guarded nonzero pair; the next tick plans acceleration.
+        assert driver.pairs == [(26, -22), (26, -22)]
+        clock[0] += .05
+        rt._steering_feedback = feedback(clock[0])
+        rt._service_follow_wheels()
+        assert driver.pairs[-1] == (32, -28)
+    else:
+        assert driver.pairs == [(26, -22), (int(new_base+new_yaw), -int(new_base-new_yaw))]
     assert driver.stops == [1]
     assert rt.backend.parking_current_a == 0.
-    assert owner._depth30_linear_snapshot[3] == clock[0]
+    assert owner._depth30_linear_snapshot[3] == evidence_stamp
 
 
 @pytest.mark.parametrize("before", ["stop", "hazard", "expiry"])

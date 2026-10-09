@@ -1,5 +1,47 @@
 """Brake-only candidate continuity. Never assigns a UID or a search direction."""
+from collections.abc import Mapping
 import math
+
+
+def provisional_reacquire_direction(assignment):
+    """Identify only a newly armed late/soft binding, not all quarantined UIDs.
+
+    CAP589 obtained a UID before its first post-binding verification. That
+    single candidate must not replace a trusted search-direction observation.
+    Later accepted continuation/recovery can provide direction evidence while
+    gallery writes remain quarantined; no one-second gallery wait is imposed.
+
+    False is *not* identity or motion authorization. The caller must still
+    check current-capture provenance, quality, competition and exclusions.
+    Missing legacy metadata preserves those existing checks unchanged.
+    """
+    if not isinstance(assignment, Mapping):
+        return False
+    if not (
+        assignment.get("reason") in (
+            "preferred_search_late_reacquire",
+            "preferred_search_mapped_late_reacquire",
+            "preferred_search_soft_reacquire",
+        )
+        and assignment.get("template_update_quarantined") is True
+        and assignment.get("template_quarantine_reason") == "armed"
+        and assignment.get("template_quarantine_streak") == 0
+        and not isinstance(assignment.get("template_quarantine_streak"), bool)
+    ):
+        return False
+    continuation = assignment.get("identity_continuation")
+    continuation = continuation if isinstance(continuation, Mapping) else {}
+    competition = assignment.get("identity_competition")
+    competition = competition if isinstance(competition, Mapping) else {}
+    # Contradictory positive flags must not override a current explicit veto.
+    if (assignment.get("identity_control_rejected")
+            or assignment.get("search_excluded")
+            or assignment.get("reacquire_geometry_ok") is False
+            or competition.get("passed") is False
+            or continuation.get("status") == "reject"):
+        return True
+    return not (continuation.get("status") == "accept"
+                or assignment.get("reacquire_control_recovered") is True)
 
 
 class SearchBrakeObservation:

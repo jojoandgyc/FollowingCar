@@ -7,9 +7,22 @@ cannot end up waiting for the speculative worker under the control mutex.
 """
 from collections import deque
 from copy import copy, deepcopy
+from dataclasses import dataclass
 import math
 import threading
 import time
+
+
+@dataclass(frozen=True)
+class DepthCommitReceipt:
+    """Proof that this exact immutable result passed the physical commit gate.
+
+    It is not a new sample timestamp or a motor lease. Consumers still age the
+    original sample; they need not re-admit already completed pixel work merely
+    because normal delivery took another few milliseconds.
+    """
+    measurement: object
+    validated_at: float
 
 
 # Deliberate allowlist: never copy hardware handles, frame history, locks,
@@ -74,6 +87,7 @@ class DepthMeasurementTransaction:
             transaction.selected_at = selected_at
             transaction.args, transaction.kwargs = args, dict(kwargs)
             transaction.result = None
+            transaction.commit_receipt = None
             transaction.started = transaction.consumed = transaction.committed = False
             transaction.reject_reason = None
             transaction.preflight_sample_timestamp = None
@@ -199,6 +213,7 @@ class DepthMeasurementTransaction:
                     setattr(runtime, name, getattr(self.private, name))
             runtime._measurement_revision += 1
             self.committed = True
+            self.commit_receipt = DepthCommitReceipt(self.result, current_now)
             return self.result
         finally:
             runtime._measurement_lock.release()

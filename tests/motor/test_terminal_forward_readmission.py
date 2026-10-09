@@ -30,8 +30,18 @@ def test_ten_rpm_common_increment_is_fused_without_zero(monkeypatch, yaw, stage)
     else:
         inject(monkeypatch, rt, stage, lambda: publish(50., yaw))
     rt._service_follow_wheels()
-    assert driver.pairs == [(int(40+yaw), -int(40-yaw)),
-                            (int(50+yaw), -int(50-yaw))]
+    if stage == "terminal":
+        # The new larger cap does not require increasing a wheel which was
+        # already guarded. Keep continuous forward this tick; accelerate on
+        # the next ordinary tick, without a stop or full restart in between.
+        assert driver.pairs == [(int(40+yaw), -int(40-yaw))] * 2
+        clock[0] += .05
+        rt._service_follow_wheels()
+        assert driver.pairs[-1] == (int(50+yaw), -int(50-yaw))
+        assert all(left > 0 > right for left, right in driver.pairs)
+    else:
+        assert driver.pairs == [(int(40+yaw), -int(40-yaw)),
+                                (int(50+yaw), -int(50-yaw))]
     assert not driver.stops
 
 

@@ -6,6 +6,7 @@ detector sample or by the periodic motor writer.
 """
 from dataclasses import dataclass
 import math
+import time
 from rk_vision.detector_continuation import FULL_PROOF_TTL_SEC, MAX_FULL_RESULT_AGE_SEC
 
 
@@ -62,6 +63,62 @@ class ValidatedVisualObservation:
         return bool(self.live(uid, now) and (
             self.continuation_sample_timestamp is None
             or self.continuation_sample_timestamp == sample_timestamp))
+
+
+@dataclass(frozen=True)
+class VisualIdentityEvidence:
+    """One completed identity publication, not two independently read fields.
+
+    ``None`` preserves startup/full-only compatibility; ``False`` is an
+    explicit rejection. A detector lease and its corresponding observation
+    must change together, including when full verification retires that lease.
+    """
+    observation: ValidatedVisualObservation | bool | None
+    lease: DetectorIdentityLease | bool | None
+
+    def motion_identity_live(self, uid, now):
+        return self.lease is None or (
+            isinstance(self.lease, DetectorIdentityLease) and self.lease.live(uid, now))
+
+    def live(self, uid, now):
+        return bool(isinstance(self.observation, ValidatedVisualObservation)
+                    and self.observation.live(uid, now)
+                    and self.motion_identity_live(uid, now))
+
+    def permits_depth(self, uid, sample_timestamp, now):
+        return bool(self.live(uid, now)
+                    and self.observation.permits_depth(uid, sample_timestamp, now))
+
+
+def publish_visual_identity_evidence(owner, *, observation, lease):
+    """Commit a complete result before mirroring it to legacy readers.
+
+    The normal paired control path reads only the immutable publication.
+    Legacy fields remain available for search and legacy control, but cannot
+    expose an intermediate full/fast transition to the paired motor writer.
+    """
+    evidence = VisualIdentityEvidence(observation, lease)
+    owner._visual_identity_evidence = evidence
+    owner._validated_visual_observation = observation
+    owner._detector_identity_lease = lease
+    return evidence
+
+
+def read_visual_identity_evidence(owner, *, clock=None):
+    """Read the proof FIRST, then the clock used to assess that proof.
+
+    Sampling time before a concurrent publication can label a genuinely new
+    proof as being from the future. Never repair that race by extending its
+    expiry or by accepting a future timestamp. Old full-only adapters/fakes
+    without this mailbox retain their two-field contract; runtime publishers
+    all use the atomic mailbox.
+    """
+    evidence = getattr(owner, "_visual_identity_evidence", None)
+    if not isinstance(evidence, VisualIdentityEvidence):
+        evidence = VisualIdentityEvidence(
+            getattr(owner, "_validated_visual_observation", None),
+            getattr(owner, "_detector_identity_lease", None))
+    return evidence, (time.monotonic() if clock is None else clock())
 
 
 def validated_visual_observation(*, uid, track_id, capture, timestamp, now,

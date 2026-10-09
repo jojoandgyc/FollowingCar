@@ -72,6 +72,21 @@ class _CurrentLateralCandidate:
 
 
 @dataclass(frozen=True)
+class SearchBrakeResumeContext:
+    """A suspended finite search, not an identity proof or a motor command."""
+    uid: int
+    direction: str
+    episode_token: object
+    rotation_started_at: float
+    loss_started_at: Optional[float]
+    loss_capture_id: Optional[int]
+    lost_confirm_frames: int
+    exit_direction: Optional[str]
+    hint_source: str
+    hint_confidence: float
+
+
+@dataclass(frozen=True)
 class ControlConfig:
     target_distance_m: float = 1.5
     brake_distance_m: float = 0.5
@@ -514,6 +529,7 @@ class FollowSafetyController:
         self._last_visual_selection_capture: Optional[Tuple[float, int]] = None
         self._has_seen_person = False
         self._startup_search_started_at = time.monotonic()
+        self._search_resume_token = object()
         self._search_rotation_started_at: Optional[float] = None
         self._search_rotation_accumulated_deg = 0.0
         self._search_rotation_last_integrated_yaw_deg: Optional[float] = None
@@ -1182,11 +1198,164 @@ class FollowSafetyController:
         self.invalidate_pre_brake_steering()
         return True
 
-    def retire_pre_search_brake_direction(self, sent_at: float) -> None:
-        """Retire old motion provenance, without granting identity or movement."""
+    def capture_search_brake_resume(self) -> Optional[SearchBrakeResumeContext]:
+        """Remember only an already-running, target-owned finite scan.
+
+        A center candidate may interrupt this task, but cannot create it. The
+        opaque token changes whenever a scan is reset or starts a new origin.
+        """
+        started = self._search_rotation_started_at
+        if (not self._has_seen_person
+                or type(self.active_target_id) is not int or self.active_target_id <= 0
+                or self.search_state != "searching"
+                or self.search_direction not in ("left", "right")
+                or started is None or not math.isfinite(started)
+                or (self.cfg.search_timeout_sec <= 0
+                    and not self._search_rotation_feedback_seen)):
+            return None
+        return SearchBrakeResumeContext(
+            self.active_target_id, self.search_direction, self._search_resume_token,
+            float(started), self._lost_started_at, self._direction_loss_capture_id,
+            self.lost_confirm_frames, self._lost_exit_direction,
+            self._lost_hint_source, self._lost_hint_confidence,
+        )
+
+    def search_wait_direction(self, now: float, steering_feedback: Optional[object] = None) -> Optional[str]:
+        """Check the finite search budget for direct depth-wait yaw publishers.
+
+        This path does not call ``decide``. It still owns the same loss timer
+        and angular coverage as ordinary search, not a new budget per frame.
+        No previous wheel command or identity/depth authority is restored.
+        """
+        if (not self._has_seen_person or type(self.active_target_id) is not int
+                or self.active_target_id <= 0 or self.search_state != "searching"
+                or self.search_direction not in ("left", "right")):
+            return None
+        try:
+            fresh_feedback = bool(steering_feedback is not None
+                and getattr(steering_feedback, "trustworthy", False)
+                and not getattr(steering_feedback, "left_error", 0)
+                and not getattr(steering_feedback, "right_error", 0)
+                and 0 <= now - float(steering_feedback.timestamp)
+                    <= max(.10, float(self.cfg.search_revolution_feedback_stale_sec))
+                and math.isfinite(float(steering_feedback.integrated_yaw_right_deg)))
+        except (AttributeError, TypeError, ValueError):
+            fresh_feedback = False
+        feedback = steering_feedback if fresh_feedback else None
+        frame = SensorFrame(width=1, height=1, steering_feedback=feedback)
+        if fresh_feedback and self._search_rotation_origin_integrated_yaw_deg is None:
+            self._begin_search_rotation_measurement(frame)
+        if self._search_rotation_started_at is None:
+            # A valid new search may reach this publisher before decide().
+            # Keep any existing loss-time budget; initialise only once.
+            if not self._search_rotation_feedback_seen and not fresh_feedback:
+                self._begin_search_rotation_measurement(frame)
+            self._mark_search_rotation_started(now)
+            if self._lost_started_at is None:
+                self._lost_started_at = now
+        if (not self._search_rotation_feedback_seen
+                or self._search_rotation_origin_integrated_yaw_deg is None) and self.cfg.search_timeout_sec <= 0:
+            return None
+        if fresh_feedback:
+            self._update_search_rotation_progress(frame)
+        if (self._search_revolution_complete_decision(now) is not None
+                or self._search_timeout_decision(now, feedback) is not None):
+            return None
+        return self.search_direction
+
+    def search_brake_resume_context_current(self, context: object) -> bool:
+        """Pure task-ownership check, shared by the controller and caller.
+
+        A matching physical STOP receipt does not prove that a delayed finish
+        still owns today's search. Callers must check this before applying
+        either resumed-search or trusted-observation completion side effects.
+        """
+        if (not isinstance(context, SearchBrakeResumeContext)
+                or context.episode_token is not self._search_resume_token
+                or context.uid != self.active_target_id or not self._has_seen_person):
+            return False
+        return bool(self.search_state == "timed_out"
+            or (self.search_state == "searching"
+                and self.search_direction == context.direction
+                and self._search_rotation_started_at is not None))
+
+    def retire_pre_search_brake_direction(
+        self, sent_at: float, *, resume_context: Optional[SearchBrakeResumeContext] = None,
+        steering_feedback: Optional[object] = None,
+    ) -> bool:
+        """Retire stale axes; optionally continue the same interrupted search.
+
+        The caller has completed the real STOP/quiet/new-image barrier. No old
+        command or UID evidence is restored here. A new trustworthy post-STOP
+        target takes precedence over the interrupted search. Absent that, the
+        original scan origin, coverage and timeout remain authoritative.
+        """
+        context = resume_context
+        current_context = self.search_brake_resume_context_current(context)
+        same_search = current_context and self.search_state == "searching"
+        if context is not None and not current_context:
+            # A completed physical STOP can outlive the search it suspended.
+            # Rejecting that context must not retire a newer task's history,
+            # PID or scan budget as though this were its own completed hold.
+            logger.info("search_brake_task_resume_ignored reason=search_task_changed "
+                        "context_uid=%s current_uid=%s current_state=%s direction=%s "
+                        "identity_claim=False motion_authorized=False",
+                        getattr(context, "uid", None), self.active_target_id,
+                        self.search_state, self.search_direction)
+            return False
         self._target_direction_history.discard_through(sent_at)
         self.clear_historical_direction_hint("search_brake_completed")
         self.invalidate_pre_brake_steering()
+        visible = self._target_direction_history.latest_visible_evidence()
+        self.last_person_center_x = None
+        if visible is not None and visible.bbox is not None:
+            self.last_person_center_x = (visible.bbox[0] + visible.bbox[2]) / 2
+        if same_search and visible is None:
+            # A candidate observation may defer clocks. This handoff must not
+            # grant the interrupted scan any additional wall-clock budget.
+            self._search_rotation_started_at = min(
+                float(self._search_rotation_started_at), context.rotation_started_at)
+            if context.loss_started_at is not None:
+                self._lost_started_at = (context.loss_started_at if self._lost_started_at is None
+                    else min(float(self._lost_started_at), context.loss_started_at))
+            self._direction_loss_capture_id = context.loss_capture_id
+            self.lost_confirm_frames = max(self.lost_confirm_frames, context.lost_confirm_frames)
+            self._lost_exit_direction = context.exit_direction or context.direction
+            self._lost_hint_source, self._lost_hint_confidence = context.hint_source, context.hint_confidence
+            self._search_observation_hold = False
+            self._reset_stale_direction_recovery("search_brake_resume")
+            now = time.monotonic()
+            try:
+                fresh_feedback = bool(steering_feedback is not None
+                    and self._search_rotation_feedback_seen
+                    and self._search_rotation_origin_integrated_yaw_deg is not None
+                    and getattr(steering_feedback, "trustworthy", False)
+                    and not getattr(steering_feedback, "left_error", 0)
+                    and not getattr(steering_feedback, "right_error", 0)
+                    and 0 <= now - float(steering_feedback.timestamp)
+                        <= max(.10, float(self.cfg.search_revolution_feedback_stale_sec))
+                    and math.isfinite(float(steering_feedback.integrated_yaw_right_deg)))
+            except (AttributeError, TypeError, ValueError):
+                fresh_feedback = False
+            if fresh_feedback:
+                self._update_search_rotation_progress(SensorFrame(
+                    width=1, height=1, steering_feedback=steering_feedback))
+            exhausted = (self._search_revolution_complete_decision(now)
+                or self._search_timeout_decision(now, steering_feedback if fresh_feedback else None))
+            resumed = exhausted is None
+            logger.info("search_brake_task_resume uid=%s direction=%s resumed=%s reason=%s "
+                        "loss_capture=%s scan_started_at=%s progress_deg=%.1f "
+                        "identity_claim=False motion_authorized=False",
+                        context.uid, context.direction, resumed,
+                        "same_interrupted_search" if resumed else exhausted.reason,
+                        self._direction_loss_capture_id, self._search_rotation_started_at,
+                        self.search_status(now).progress_deg)
+            return resumed
+        if current_context and visible is None and self.search_state == "timed_out":
+            # An already-exhausted scan stays terminal; it must not turn into
+            # a new direction-unknown episode with reset time/angle budgets.
+            self.search_direction = None
+            return False
         self.search_state, self.search_direction = "none", None
         self._lost_exit_direction = None
         self._lost_hint_source, self._lost_hint_confidence = "post_search_brake", 0.0
@@ -1195,13 +1364,10 @@ class FollowSafetyController:
         self._direction_loss_capture_id = None
         self._reset_search_timeout()
         self._reset_stale_direction_recovery("post_search_brake")
-        visible = self._target_direction_history.latest_visible_evidence()
-        self.last_person_center_x = None
-        if visible is not None and visible.bbox is not None:
-            self.last_person_center_x = (visible.bbox[0] + visible.bbox[2]) / 2
         logger.info("search_brake_direction_retired stop_sent_ts=%.6f latest_post_stop_cap=%s "
                     "identity_claim=False motion_authorized=False", sent_at,
                     None if visible is None else visible.capture_frame_id)
+        return False
 
     def _record_target_direction_evidence(
         self,
@@ -1477,7 +1643,8 @@ class FollowSafetyController:
                     self._lost_exit_direction = observed_side
                     self._lost_hint_confidence = 0.90
                     self._lost_hint_source = "search_candidate_opposite_side"
-                    self._reset_search_timeout()
+                    # The candidate changes direction within this finite
+                    # scan, not its elapsed time, origin or coverage budget.
                     logger.info(
                         "search_candidate_direction_switch observed=%s previous=%s "
                         "center=%.3f score=%s tracked=%s identity_match=%s "
@@ -1523,7 +1690,7 @@ class FollowSafetyController:
                 self._lost_exit_direction = candidate_side
                 self._lost_hint_confidence = 0.90
                 self._lost_hint_source = "search_candidate_side"
-                self._reset_search_timeout()
+                # Same-side promotion is evidence, not a fresh search task.
                 logger.info(
                     "search_candidate_direction_promoted side=%s center=%.3f confirmations=1",
                     candidate_side,
@@ -1549,7 +1716,8 @@ class FollowSafetyController:
                 self._lost_exit_direction = observed_side
                 self._lost_hint_confidence = 0.90
                 self._lost_hint_source = "search_candidate_opposite_side"
-                self._reset_search_timeout()
+                if not active_search:
+                    self._reset_search_timeout()
                 logger.info(
                     "candidate_centering_direction_switch observed=%s previous=%s "
                     "center=%.3f score=%s tracked=%s confirmations=1",
@@ -1582,7 +1750,8 @@ class FollowSafetyController:
         self.search_state = "searching"
         self._lost_hint_confidence = 0.75 if str(source) == "formal" else 0.50
         self._lost_hint_source = "search_candidate_%s" % candidate_source
-        self._reset_search_timeout()
+        if not active_search:
+            self._reset_search_timeout()
         self._reset_stale_direction_recovery("candidate_observation_complete")
         logger.info(
             "search_candidate_observation_complete context=%s source=%s center=%.3f "
@@ -5430,6 +5599,7 @@ class FollowSafetyController:
         return None
 
     def _reset_search_timeout(self) -> None:
+        self._search_resume_token = object()
         self._search_rotation_started_at = None
         self._search_rotation_accumulated_deg = 0.0
         self._search_rotation_last_integrated_yaw_deg = None
@@ -5443,6 +5613,7 @@ class FollowSafetyController:
 
     def _begin_search_rotation_measurement(self, frame: SensorFrame) -> None:
         """Take the encoder yaw at target loss as the zero of this scan."""
+        self._search_resume_token = object()
         feedback = frame.steering_feedback
         integrated = None if feedback is None else getattr(
             feedback, "integrated_yaw_right_deg", None

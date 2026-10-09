@@ -1,5 +1,6 @@
 """CAP87: production PI/grant/writer interleavings, fake serial and clock only."""
 from dataclasses import replace
+import threading
 
 import pytest
 
@@ -11,6 +12,7 @@ from test_execution_anchor_admission import AdmissionDriver
 from car_control_modular.executed_speed_budget import record_completed_speed
 from car_control_modular.mssd_motor import MssdMotorBackend
 import car_control_modular.action_runtime as action_module
+import request_0513_modular as runtime
 
 
 @pytest.mark.parametrize("phase", ["before_right", "after_right", "before_left", "after_left", "before_ledger"])
@@ -127,7 +129,7 @@ def test_pending_pair_cannot_fabricate_an_interval_chain(execution_case, entry):
 
 
 @pytest.mark.parametrize("phase", ["before_right", "after_right", "after_left", "before_ledger"])
-def test_cap87_new_depth_covers_prior_legitimate_inflight_38rpm(execution_case, phase):
+def test_cap87_new_depth_covers_prior_legitimate_inflight_38rpm(execution_case, phase, monkeypatch):
     a = execution_case()
     # Replace fixture's initial 76RPM, not just its ledger: the actual history
     # for this log trace is completed28 -> admitted38 -> concurrent new Depth.
@@ -145,14 +147,45 @@ def test_cap87_new_depth_covers_prior_legitimate_inflight_38rpm(execution_case, 
     a.owner._last_vision_control_ts = 100.08
     decide_commit(a, a.frame(1.7747243, rpm=38., stamp=100.))
     assert a.owner._fresh_depth_linear_snapshot(1) == ("forward", 19, 1, 100.)
+    prior_grant = a.owner._depth30_linear_snapshot
     seen = []
+    errors, workers = [], []
+    preview_done = threading.Event()
+    original_read = runtime.PersonTracker._fresh_depth_linear_snapshot
+
+    def read_with_preview_signal(self, uid, **kwargs):
+        result = original_read(self, uid, **kwargs)
+        candidate = kwargs.get("_candidate")
+        if self is a.owner and candidate is not None and candidate[3] == 100.1344:
+            preview_done.set()
+        return result
+
+    monkeypatch.setattr(runtime.PersonTracker, "_fresh_depth_linear_snapshot", read_with_preview_signal)
+
+    def calculate_new_depth():
+        try:
+            a.clock.now = 100.224
+            a.owner._last_vision_control_ts = 100.22
+            decide_commit(a, a.frame(1.78600455, rpm=4.5, stamp=100.1344))
+            seen.append(a.owner._fresh_depth_linear_snapshot(1))
+            assert a.owner._depth30_linear_timing.braking_assessment.travel_bound_rpm == 38.
+            assert a.owner._depth30_linear_timing.depth_expires_at == pytest.approx(100.4344)
+        except BaseException as exc:
+            errors.append(exc)
+            preview_done.set()
+
     def new_depth():
-        a.clock.now = 100.224
-        a.owner._last_vision_control_ts = 100.22
-        decide_commit(a, a.frame(1.78600455, rpm=4.5, stamp=100.1344))
-        seen.append(a.owner._fresh_depth_linear_snapshot(1))
-        assert a.owner._depth30_linear_timing.braking_assessment.travel_bound_rpm == 38.
-        assert a.owner._depth30_linear_timing.depth_expires_at == pytest.approx(100.4344)
+        # Production Depth runs on another thread. It may compute during a
+        # dual-wheel write, but final publication waits for serial ownership.
+        # Calling decide_commit inline from this driver's hook would instead
+        # recursively take the intentionally NON-reentrant motor lock.
+        assert not workers
+        worker = threading.Thread(target=calculate_new_depth, daemon=True)
+        workers.append(worker)
+        worker.start()
+        assert preview_done.wait(2.), "Depth preview did not finish while serial was busy"
+        assert not errors
+        assert a.owner._depth30_linear_snapshot is prior_grant
     originals = {}
     for side in ("right", "left"):
         original = getattr(a.backend.driver, "set_"+side+"_speed")
@@ -170,7 +203,14 @@ def test_cap87_new_depth_covers_prior_legitimate_inflight_38rpm(execution_case, 
             new_depth()
         return note(*args, **kwargs)
     a.action._note_follow_packet = after_ack
-    a.action._service_follow_wheels()
+    try:
+        a.action._service_follow_wheels()
+    finally:
+        for worker in workers:
+            worker.join(2.)
+    assert workers and all(not worker.is_alive() for worker in workers), "Depth publication deadlocked"
+    if errors:
+        raise errors[0]
     assert a.backend.driver.pairs == [(28, -28), (38, -38)]
     assert len(seen) == 1 and seen[0] is not None and seen[0][1] > 2
     assert a.owner._fresh_depth_linear_snapshot(1) == seen[0]

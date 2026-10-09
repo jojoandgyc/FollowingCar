@@ -46,6 +46,7 @@ Environment:
   FOLLOW_NUMERIC_THREADS=1  # default; inherit preserves parent BLAS/OpenMP settings
   FOLLOW_KALMAN_SOLVER=numpy  # baseline; triangular enables equivalent SciPy solver trial
   FOLLOW_VIDEO_EXPORT_MP4=1  # post-run MP4 copy; 0 disables, AVI/CSV always retained
+  FOLLOW_NORMAL_MODE=legacy  # rollback paired distance-PI follow to the old control path
   PY=/path/to/python3
   FOLLOW_DISTANCE_P_TRIAL=36  # optional A/B: only longitudinal P; 24, 27 or 36
   FOLLOW_MATCHING_BIAS_TRIAL=5  # optional matching RPM bias experiment: 0, 5, 10

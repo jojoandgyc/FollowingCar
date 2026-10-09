@@ -228,7 +228,9 @@ def test_reader_between_snapshot_and_timing_publication_uses_new_complete_envelo
     monkeypatch.setattr(runtime.PersonTracker, "__setattr__", intercept)
     _, final = publish(relative, stamp=stamp)
     assert observed and observed[0][1] is None
-    assert observed[0][0][1] == 58  # Arithmetic request, not approved authority.
+    # Arithmetic requests are now previewed before publication; no reader
+    # should ever see the unqualified 58% request, even momentarily.
+    assert observed[0][0] == final
     assert all(live is not None and 0 < live[1] < 58 for _value, _timing, live in observed)
     assert all(live[3] == stamp for _value, _timing, live in observed)
     assert observed[0][2] == final

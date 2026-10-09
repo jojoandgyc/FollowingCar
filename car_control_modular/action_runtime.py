@@ -33,6 +33,8 @@ from .turn_response_trial import TurnResponseTrial, forward_brake_allowed
 from .wheel_response import WheelDifferentialResponse
 from .follow_wheel_clock import FollowWheelClock
 from .follow_distance_hold import FollowDistanceHold
+from .forward_write_snapshot import select_forward_write_snapshot
+from .short_follow_executor import ShortFollowExecutor
 from .final_yaw_coalescing import (
     contract_forward_yaw, contract_forward_base, contract_forward_axes, contract_forward_speed,
     ordinary_intent_handoff, straight_park_candidate_contraction,
@@ -52,6 +54,9 @@ from .search_reacquire_braking import (
 class LinearWriteDecision:
     limit_rpm: float
     forward_pair: Optional[tuple[int, int]] = None
+    effective_linear: Optional[tuple] = None
+    effective_grant: Optional[tuple] = None
+    yaw_revision: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +186,7 @@ class MotionActionRuntime:
         # Planning may read/control-compute for tens of milliseconds. It is
         # serialized independently from physical serial/encoder transactions.
         self._follow_planning_lock = threading.Lock()
+        self._short_follow_creation_lock = threading.Lock()
         self._follow_planning_offlock = False
         self._follow_planning_thread_id = None
         self._follow_plan_token = None
@@ -270,6 +276,9 @@ class MotionActionRuntime:
         self._search_reacquire_brake_uid = None
         self._search_reacquire_brake_sent_at = 0.0
         self._search_reacquire_settling = None
+        self._search_reacquire_resume_context = None
+        self._search_reacquire_resume_request = None
+        self._search_reacquire_resume_released_request = None
         self._distance_brake_episode = None
         self._distance_brake_sample_floor = 0.0
         self._distance_brake_stop_generation = None
@@ -1506,6 +1515,11 @@ class MotionActionRuntime:
                 if self._service_motion_write_fault() or self._service_runtime_shutdown():
                     time.sleep(0.01)
                     continue
+                if self._service_short_follow():
+                    # One complete pair owns normal following. Do not run
+                    # old axis keepalives, queues, recovery or park services.
+                    time.sleep(0.01)
+                    continue
                 if self._service_detector_reverse_guard():
                     time.sleep(0.01)
                     continue
@@ -2087,6 +2101,94 @@ class MotionActionRuntime:
                 if not self._service_motion_write_fault():
                     self.send_stop_with_brake_hold("action_executor_exception")
 
+    def _short_follow_executor_instance(self):
+        executor = getattr(self, "_short_follow_executor", None)
+        if executor is None and getattr(self.owner, "_short_follow", None) is not None:
+            with self._short_follow_creation_lock:
+                executor = getattr(self, "_short_follow_executor", None)
+                if executor is None:
+                    executor = self._short_follow_executor = ShortFollowExecutor(self)
+        return executor
+
+    def _short_follow_blocks_legacy(self):
+        executor = self._short_follow_executor_instance()
+        return executor is not None and executor.blocks_legacy()
+
+    def _service_short_follow(self):
+        executor = self._short_follow_executor_instance()
+        if executor is None:
+            return False
+        with deferred_diagnostics(self.logger), deferred_diagnostics(self.backend.logger):
+            return executor.service()
+
+    def _retire_legacy_normal_executor(self):
+        """Discard superseded software plans, never erase hardware safety."""
+        self.cancel_yaw_pulses("short_follow_takeover", send_zero=False)
+        self._follow_wheel_clock.reset()
+        self._forward_coast_snapshot = None
+        self._current_action_snapshot = None
+        self._distance_brake_episode = None
+        self._distance_brake_stop_generation = None
+        self._distance_brake_sample_floor = 0.
+        self._near_yaw_park_applied = None
+        self._near_yaw_park_settling = None
+        # A real search STOP already in flight retains its settlement proof.
+        # Only this entry contract may be serviced while paired mode waits.
+        inherited_search_hold = (self._search_reacquire_brake_request is not None
+            or (getattr(self.owner, "_brake_hold_active", False)
+                and getattr(self.owner, "_brake_hold_label", "") == "search_reacquire_brake"))
+        if not inherited_search_hold:
+            self._search_reacquire_brake_applied = None
+            self._search_reacquire_settling = None
+        self._visible_wheel_waiting = False
+        self._visible_wheel_guard.reset()
+        self._forward_loss_handoff.reset()
+
+    def _service_short_follow_entry_hold(self):
+        if (self._search_reacquire_brake_request is None and not (
+                getattr(self.owner, "_brake_hold_active", False)
+                and getattr(self.owner, "_brake_hold_label", "") == "search_reacquire_brake")):
+            return False
+        self._service_search_reacquire_brake_deferred(paired_entry=True)
+        return True
+
+    def _take_short_follow_protected_stop(self):
+        """Consume only a real queued STOP; ordinary old axes stay inert."""
+        pending = getattr(self.owner, "action_queue", None)
+        if pending is None:
+            return None
+        lock = getattr(self.owner, "action_queue_lock", None)
+        with lock if lock is not None else nullcontext():
+            with pending.mutex:
+                command = next((item for item in pending.queue
+                    if isinstance(item, ActionCommandSnapshot)
+                    and item.action == self.symbols.stop and item.protected_stop
+                    and getattr(item, "stop_origin", "unknown") != "controller_state"), None)
+                if command is not None:
+                    pending.queue.remove(command)
+                    pending.not_full.notify()
+                return command
+
+    def _short_follow_stop(self, reason, *, safety=False):
+        executor = self._short_follow_executor_instance()
+        if executor is None:
+            return False
+        if (not executor.blocks_legacy() and not (
+                executor.controller() is not None and (safety or executor.explicit_stop_pending()))):
+            return False
+        command = getattr(self._dispatch_context, "command", None)
+        protected = command is not None and command.protected_stop
+        # Only ordinary old-lane stop signals are superseded by pair ownership.
+        # Unknown stops, identity conflicts and explicitly protected stops keep
+        # their authority; never infer that an unlabelled STOP is harmless.
+        soft_reasons = {"stop_signal", "queued_action_stop_signal", "soft_stop",
+                        "near_yaw_park", "search_reacquire_brake", "brake"}
+        if (not safety and not protected and reason in soft_reasons
+                and not getattr(self.owner, "_explicit_stop_requested", False)
+                and not getattr(self.owner, "_runtime_shutdown_requested", False)):
+            return True
+        return executor.external_stop(reason)
+
     def _service_runtime_shutdown(self) -> bool:
         backend_logger = getattr(self.backend, "logger", self.logger)
         with deferred_diagnostics(self.logger), (
@@ -2389,6 +2491,8 @@ class MotionActionRuntime:
         exits that mode. Thus a stale zero is just as invalid as a stale turn.
         This check never releases a hold or performs nested motor I/O.
         """
+        if self._short_follow_blocks_legacy():
+            return True
         if (getattr(self.owner, "_runtime_shutdown_requested", False)
                 or getattr(self.backend, "motion_write_fault", None)
                 or getattr(self.backend, "parking_release_fault", None)):
@@ -2440,6 +2544,16 @@ class MotionActionRuntime:
                 return True
             self._search_reacquire_brake_request = SearchReacquireBrakeRequest(
                 int(capture_id), float(capture_timestamp), time.monotonic(), str(reason))
+            controller = getattr(owner, "_follow_controller", None)
+            capture_resume = getattr(controller, "capture_search_brake_resume", None)
+            # Pause an existing finite sweep, not its old motor packet. Bind
+            # recovery to THIS brake request before candidate observations can
+            # replace direction history. A failed/timed-out/new search cannot
+            # later consume another episode's context.
+            self._search_reacquire_resume_context = (
+                capture_resume() if callable(capture_resume) else None)
+            self._search_reacquire_resume_request = self._search_reacquire_brake_request
+            self._search_reacquire_resume_released_request = None
             self._search_reacquire_brake_uid = getattr(
                 getattr(owner, "_follow_controller", None), "active_target_id", None)
             self._search_reacquire_brake_applied = None
@@ -2470,6 +2584,9 @@ class MotionActionRuntime:
                 # A higher-priority owner replaces this episode. Never leave
                 # an unapplied request preventing safety/identity processing.
                 self._search_reacquire_brake_request = None
+                self._search_reacquire_resume_context = None
+                self._search_reacquire_resume_request = None
+                self._search_reacquire_resume_released_request = None
                 return False
             if self._search_reacquire_brake_applied is not request:
                 return True
@@ -2489,6 +2606,9 @@ class MotionActionRuntime:
             if not ready or not fresh_image or keep_observing:
                 return True
             self._search_reacquire_brake_request = None
+            # Only actual quiet feedback plus a fresh post-settle image can
+            # complete this pause. Cancellation/supersession is not completion.
+            self._search_reacquire_resume_released_request = request
             # Retire work published during settling. Leave the software hold
             # until the executor adopts a NEW decision and releases the hold;
             # merely observing quiet encoders must not revive cached axes.
@@ -2609,7 +2729,9 @@ class MotionActionRuntime:
         ):
             return self._service_search_reacquire_brake_deferred()
 
-    def _service_search_reacquire_brake_deferred(self):
+    def _service_search_reacquire_brake_deferred(self, *, paired_entry=False):
+        if self._short_follow_blocks_legacy() and not paired_entry:
+            return False
         request = self._search_reacquire_brake_request
         if request is None:
             self._observe_settled_search_brake()
@@ -2655,6 +2777,8 @@ class MotionActionRuntime:
         self.cancel_yaw_pulses("search_reacquire_brake", send_zero=False)
         owner = self.owner
         with owner.motor_io_lock:
+            if self._short_follow_blocks_legacy() and not paired_entry:
+                return False
             if request is not self._search_reacquire_brake_request:
                 return False
             if (getattr(owner, "_explicit_stop_requested", False)
@@ -2668,21 +2792,29 @@ class MotionActionRuntime:
             owner._brake_hold_stop_mode = self._ordinary_park_stop_mode()
             owner._brake_hold_label = "search_reacquire_brake"
             owner._use_soft_stop_next = owner._soft_stop_active = False
+            stop_feedback = self.get_steering_feedback()  # cached, no serial I/O
+            before_stop = time.monotonic()  # qualify against the completed cache read
+            early_quiet_release = bool(
+                wheel_feedback_valid(stop_feedback, before_stop)
+                and max(abs(stop_feedback.left_forward_rpm),
+                        abs(stop_feedback.right_forward_rpm)) <= 10.)
             self.backend.send_stop("search_reacquire_brake", mode=owner._brake_hold_stop_mode,
                                    prepare_parking_current=True)
             self._search_reacquire_brake_sent_at = time.monotonic()
             self._search_brake_dispatch_delay_sec = min(.15, max(.05,
                 self._search_reacquire_brake_sent_at-request.requested_at))
             self._search_reacquire_settling = ParkSettlingEvidence(
-                request, self._search_reacquire_brake_sent_at, require_current_release=True)
+                request, self._search_reacquire_brake_sent_at, require_current_release=True,
+                allow_early_quiet_release=early_quiet_release)
             owner._last_brake_hold_send_ts = time.time()
             self._search_reacquire_brake_applied = request
             self.logger.info("search_reacquire_brake_applied capture_frame_id=%d mode=%s minimum_hold_ms=%.0f "
-                             "request_age_ms=%.1f capture_to_stop_ms=%.1f next_dispatch_allowance_ms=%.1f",
+                             "request_age_ms=%.1f capture_to_stop_ms=%.1f next_dispatch_allowance_ms=%.1f "
+                             "early_release_on_quiet=%s",
                              request.capture_frame_id, owner._brake_hold_stop_mode, ParkSettlingEvidence.MIN_HOLD_SEC * 1000,
                              (self._search_reacquire_brake_sent_at-request.requested_at)*1000,
                              (self._search_reacquire_brake_sent_at-request.capture_timestamp)*1000,
-                             self._search_brake_dispatch_delay_sec*1000)
+                             self._search_brake_dispatch_delay_sec*1000, early_quiet_release)
         return True
 
     def _observe_settled_search_brake(self):
@@ -2739,6 +2871,8 @@ class MotionActionRuntime:
         applies the configured stop once, ends its bounded hold independently,
         and retains a software hold against queued/periodic motion writes.
         """
+        if self._short_follow_blocks_legacy():
+            return False
         owner = self.owner
         if self._service_motion_write_fault():
             return True
@@ -2764,6 +2898,8 @@ class MotionActionRuntime:
             return True
         self.cancel_yaw_pulses("near_yaw_park", send_zero=False)
         with owner.motor_io_lock:
+            if self._short_follow_blocks_legacy():
+                return False
             if getattr(owner, "_near_yaw_park_request", None) is not request:
                 return False
             self._follow_wheel_clock.reset()
@@ -2856,6 +2992,8 @@ class MotionActionRuntime:
                     and not getattr(owner, "_runtime_shutdown_requested", False))
         if evidence.fault or not owns_hold():
             return
+        release_feedback = (self.get_steering_feedback()
+                            if label == "search_reacquire_brake" else None)
         now = time.monotonic()
         early_forward = (label == "near_yaw_park" and evidence.forward_resume_live(now)
                          and getattr(owner, "search_state", "none") == "none"
@@ -2864,7 +3002,10 @@ class MotionActionRuntime:
                              "target_visible", "target_visible_depth_valid"}
                          and owner._follow_controller.search_state == "none"
                          and owner._follow_controller.active_target_id == evidence.request.uid)
-        if not early_forward and not evidence.minimum_hold_complete(now):
+        early_search_quiet = (
+            label == "search_reacquire_brake"
+            and evidence.quiet_current_release_ready(release_feedback, now))
+        if not early_forward and not early_search_quiet and not evidence.minimum_hold_complete(now):
             return
         if evidence.current_released_at is None:
             failure_reason = "current_release_failed"
@@ -2875,6 +3016,12 @@ class MotionActionRuntime:
                     owner._brake_hold_label = "safety_hold_hard_stop"
                     self.backend.send_stop("hard_stop", mode="emergency")
                     return  # In particular, a refresh may not clear 5A first.
+                if early_search_quiet and not getattr(evidence, "response_logged", False):
+                    evidence.response_logged = True
+                    self.logger.info("search_brake_stop_response cap=%d stop_sent_ts=%.6f "
+                                     "quiet_ts=%.6f stop_to_quiet_ms=%.1f phase=before_current_release",
+                                     evidence.request.capture_frame_id, evidence.sent_at, evidence.ready_at,
+                                     (evidence.ready_at-evidence.sent_at)*1000)
                 self.backend.release_parking_current_only()  # both 0A readbacks required; no speed write
                 if (not owns_hold()
                         or self.hard_stop_check(getattr(owner, "current_command", None))):
@@ -2891,12 +3038,13 @@ class MotionActionRuntime:
                 # Completion of both FREE writes, not merely the 0A readback,
                 # starts the fresh feedback/image boundary. The ordinary hold
                 # remains latched; its periodic service must not replay FREE.
-                evidence.mark_current_released(time.monotonic())
+                evidence.mark_current_released(time.monotonic(), early_quiet=early_search_quiet)
                 self.logger.info("ordinary_park_current_released cap=%s label=%s hold_ms=%.1f "
                                  "current_a=0 zero_rpm=False speed_write=False motion_authorized=False "
-                                 "exit_stop_mode=free",
+                                 "exit_stop_mode=free early_release_on_quiet=%s pre_release_quiet_ts=%s",
                                  evidence.request.capture_frame_id, label,
-                                 (evidence.current_released_at-evidence.sent_at)*1000)
+                                 (evidence.current_released_at-evidence.sent_at)*1000,
+                                 evidence.early_quiet_release_completed, evidence.pre_release_quiet_at)
             except Exception:
                 self.logger.exception("ordinary park current/free-stop release failed")
                 self._ordinary_park_exit_fault(evidence, failure_reason)
@@ -2905,7 +3053,8 @@ class MotionActionRuntime:
         # fresh evidence so existing release gates can recover after a long
         # coast; elapsed time never grants motion or replays an old command.
         # Current/STOP I/O failures and safety changes still fault above.
-        evidence.observe(self.get_steering_feedback(), now)
+        feedback = self.get_steering_feedback()
+        evidence.observe(feedback, time.monotonic())
 
     def _stop_predictive_turn_brake_emergency(self, request, reason):
         # Caller already holds the NON-reentrant motor lock. Do not call
@@ -3745,7 +3894,8 @@ class MotionActionRuntime:
                                    planned_revision=None, yaw_required=False,
                                    adopted_intent=..., adopted_policy=...,
                                    expected_receipt=..., expected_stop_generation=...,
-                                   independent_straight=False, commit_after_prepare=False):
+                                   independent_straight=False, commit_after_prepare=False,
+                                   adopt_latest_forward=False):
         """Prepare an optional contraction, then check its physical lifetime.
 
         The ordinary authority reader may log or wait while evaluating its
@@ -3759,6 +3909,7 @@ class MotionActionRuntime:
             self._follow_write_veto_reason = reason
             return None
 
+        feedback_cache_at_entry = getattr(self, "_steering_feedback", None)
         self._snapshot_used_feedback(feedback)
         if independent_straight and (yaw_required or mean_rpm <= 0
                 or forward_pair is None or len(forward_pair) != 2
@@ -3773,6 +3924,34 @@ class MotionActionRuntime:
             return reject("handoff_receipt_or_stop_changed")
         if mean_rpm == 0:
             return LinearWriteDecision(0.)  # This check grants no yaw authority.
+        # Normal publishers may replace a sample while a guarded wheel plan
+        # is being prepared. Select that current same-UID sample BEFORE its
+        # budget is checked, rather than exhausting retries and writing zero.
+        # This cannot increase a wheel, keep an expired sample alive or turn
+        # a withdrawn/new-UID grant into permission. Only the unified forward
+        # writer consumes the returned effective sample for its ledger.
+        if adopt_latest_forward and mean_rpm > 0 and source_grant is not None:
+            if (not self._visible_wheel_control_active()
+                    or self._visible_wheel_guard.pending_full_reverse
+                    or self._visible_wheel_guard.commanded_reverse):
+                return reject("forward_control_revoked")
+            cached = getattr(self, "_steering_feedback", None)
+            if cached is not None and cached is not feedback:
+                if (not self._ordinary_forward_feedback_eligible(uid, cached, time.monotonic())
+                        or (feedback is not None and cached.timestamp < feedback.timestamp)):
+                    return reject("replacement_feedback_unqualified")
+                feedback = cached
+                self._snapshot_used_feedback(feedback)
+            current_grant = self._follow_grant_marker()
+            if not self._same_follow_grant_marker(source_grant, current_grant):
+                selection = select_forward_write_snapshot(uid, source_grant,
+                    current_grant, forward_pair, time.monotonic(),
+                    self.config.motor_forward_max_target_rpm)
+                if selection is None:
+                    return reject("replacement_forward_grant_unqualified")
+                linear, source_grant, forward_pair = (
+                    selection.linear, selection.grant, selection.pair)
+                mean_rpm = .5 * sum(forward_pair)
         if (self._distance_brake_stop_generation is not None
                 and self.backend.stop_write_generation != self._distance_brake_stop_generation):
             return reject("distance_brake_newer_stop_owner")
@@ -3792,11 +3971,13 @@ class MotionActionRuntime:
         intent_store = getattr(self.owner, "_lateral_intent_store", None)
         expected_intent = self._follow_intent_snapshot(intent_store)
         expected_policy = getattr(self.owner, "_lateral_turn_response_policy", None)
+        equivalent_yaw = bool(adopt_latest_forward and self._forward_yaw_permits_pair(
+            uid, expected_intent, expected_policy, forward_pair, feedback, time.monotonic()))
         neutral_straight = bool(not yaw_required and mean_rpm > 0
             and forward_pair is not None and len(forward_pair) == 2
             and forward_pair[0] == forward_pair[1] == mean_rpm
             and self._neutral_follow_yaw(uid, expected_intent, time.monotonic()))
-        if (not independent_straight and not neutral_straight and (
+        if (not independent_straight and not neutral_straight and not equivalent_yaw and (
                 (adopted_intent is not ... and expected_intent is not adopted_intent)
                 or (adopted_policy is not ... and expected_policy != adopted_policy))):
             return reject("adopted_intent_or_policy_changed")
@@ -3829,6 +4010,8 @@ class MotionActionRuntime:
                     or stamp <= 0 or ttl <= 0 or not 0 <= now-stamp <= ttl
                     or not 0 < percent <= current[1] <= 100
                     or abs(mean_rpm) > percent*self.config.motor_forward_max_target_rpm/100.
+                    or (adopt_latest_forward and tuple((getattr(self.owner,
+                        "_depth30_read_veto", None) or ())[:2]) == (uid, stamp))
                     or getattr(self.owner, "_depth30_continuation_veto", None) == (uid, stamp)):
                 return reject("physical_grant_or_initial_limit")
             if timing is not None and timing.snapshot == current:
@@ -3868,6 +4051,11 @@ class MotionActionRuntime:
                     self._follow_motor_call("send_stop", "follow_snapshot_commit_hard_stop", mode="emergency")
                     return reject("commit_hard_stop")
                 cached = getattr(self, "_steering_feedback", None)
+                if adopt_latest_forward and (
+                        (cached is None and feedback_cache_at_entry is not None)
+                        or (cached is not None and not self._ordinary_forward_feedback_eligible(
+                            uid, cached, time.monotonic()))):
+                    return reject("commit_feedback_cache_revoked")
                 if cached is not None and (feedback is None or cached.timestamp > feedback.timestamp):
                     self._snapshot_used_feedback(cached)
                     # A forward plan cannot inherit its earlier wheel guard
@@ -3923,12 +4111,34 @@ class MotionActionRuntime:
             # before sampling the physical clock, not after it.
             terminal_intent = self._follow_intent_snapshot(intent_store)
             terminal_now = time.monotonic()
+            if adopt_latest_forward:
+                cached = getattr(self, "_steering_feedback", None)
+                if cached is None:
+                    if feedback_cache_at_entry is not None:
+                        return reject("terminal_feedback_cache_revoked")
+                else:
+                    if (not self._ordinary_forward_feedback_eligible(uid, cached, terminal_now)
+                            or cached.timestamp < feedback.timestamp):
+                        return reject("terminal_feedback_cache_revoked")
+                    if cached is not feedback:
+                        # A fresh slower/non-opposing report fits the already
+                        # checked (higher) budget. Faster motion needs a new
+                        # budget, not an unverified write or implicit STOP.
+                        old_wheels = (feedback.left_forward_rpm, feedback.right_forward_rpm)
+                        new_wheels = (cached.left_forward_rpm, cached.right_forward_rpm)
+                        if (max(map(abs, new_wheels)) > max(map(abs, old_wheels))
+                                or max(0., sum(new_wheels)) > max(0., sum(old_wheels))):
+                            return reject("terminal_feedback_requires_replan")
+                        feedback = cached
             terminal_raw = getattr(self.owner, "_depth30_linear_snapshot", None)
             terminal_timing = getattr(self.owner, "_depth30_prepared_timing", None)
             if terminal_timing is None or terminal_timing.snapshot != terminal_raw:
                 terminal_timing = getattr(self.owner, "_depth30_linear_timing", None)
             if (terminal_raw is not current or terminal_timing is not timing
                     or self.owner._follow_controller.active_target_id != uid
+                    or (adopt_latest_forward and not self._visible_wheel_control_active())
+                    or (adopt_latest_forward and (self._visible_wheel_guard.pending_full_reverse
+                        or self._visible_wheel_guard.commanded_reverse))
                     or not motion_identity_live(self.owner, uid, terminal_now)
                     or not 0 <= terminal_now-stamp <= ttl
                     or (kind == "forward" and not wheel_feedback_valid(feedback, terminal_now))
@@ -3958,7 +4168,10 @@ class MotionActionRuntime:
             # bounded replan; only the explicit terminal fallback may drop it.
             neutral_straight = bool(neutral_straight
                 and self._neutral_follow_yaw(uid, terminal_intent, terminal_now))
-            if ((not independent_straight and not neutral_straight and (
+            terminal_policy = getattr(self.owner, "_lateral_turn_response_policy", None)
+            equivalent_yaw = bool(equivalent_yaw and self._forward_yaw_permits_pair(
+                uid, terminal_intent, terminal_policy, prepared_pair, feedback, terminal_now))
+            if ((not independent_straight and not neutral_straight and not equivalent_yaw and (
                     getattr(self.owner, "_lateral_yaw_revision", None) != expected_revision
                     or terminal_intent is not expected_intent
                     or getattr(self.owner, "_lateral_turn_response_policy", None) != expected_policy))
@@ -3987,7 +4200,8 @@ class MotionActionRuntime:
                     or getattr(self.backend, "last_speed_receipt", None) is not prior_receipt):
                 return reject("terminal_stop_or_publisher_changed")
             self._follow_write_feedback = feedback
-            return LinearWriteDecision(limit_rpm, prepared_pair)
+            return LinearWriteDecision(limit_rpm, prepared_pair, linear, source_grant,
+                getattr(self.owner, "_lateral_yaw_revision", None))
         except (AttributeError, TypeError, ValueError, OverflowError):
             return reject("invalid_write_metadata")
 
@@ -4258,6 +4472,8 @@ class MotionActionRuntime:
         with context:
             acquired_at = time.monotonic()
             try:
+                if self._short_follow_blocks_legacy():
+                    return False  # Includes obsolete legacy zero plans.
                 if offlock and not self._follow_plan_owns_motor():
                     return False
                 if (method in {"send_targets", "prepare_speed_mode"}
@@ -4345,6 +4561,33 @@ class MotionActionRuntime:
             if getattr(self.owner, "_lateral_intent_last_sequence", -1) == intent.sequence
             else intent.initial_correction_rpm)
         return isinstance(correction, (int, float)) and correction == 0
+
+    def _forward_yaw_permits_pair(self, uid, intent, policy, pair, feedback, now):
+        """Semantic current-yaw admission, without axes readers or serial I/O.
+
+        A new observation/revision with the same correction does not change
+        an already guarded forward pair. Changed direction/amplitude requires
+        recomposition; no arbitrary new turn is adopted at the final gate.
+        Whole-car STOP remains a separate final check, never a yaw property.
+        """
+        if (pair is None or len(pair) != 2 or min(pair) < 0 or sum(pair) <= 0
+                or not isinstance(intent, LateralControlIntent) or intent.target_id != uid
+                or intent.mode != "forward" or intent.bbox_quality != "reliable"
+                or intent.hold_zero or intent.near_distance_mode
+                or intent.forward_countersteer or intent.countersteer_rpm
+                or not intent.valid(now) or not intent.continuation_allowed(now, feedback)
+                or not 0 < intent.capture_timestamp <= intent.published_at <= now
+                or getattr(self.owner, "_lateral_intent_zero_sequence", -1) == intent.sequence
+                or (policy is not None and (not isinstance(policy, tuple) or len(policy) != 2
+                    or policy[0] != intent.sequence or not isinstance(policy[1], bool)))):
+            return False
+        correction = (getattr(self.owner, "_lateral_intent_last_correction_rpm", None)
+            if getattr(self.owner, "_lateral_intent_last_sequence", -1) == intent.sequence
+            else intent.initial_correction_rpm)
+        yaw = .5 * (pair[0] - pair[1])
+        return bool(isinstance(correction, (int, float)) and math.isfinite(correction)
+            and math.isfinite(intent.correction_limit_rpm)
+            and yaw == correction and abs(yaw) <= intent.correction_limit_rpm)
 
     def _ordinary_forward_feedback_eligible(self, uid, feedback, now, *, hold_existing=False):
         """One forward feedback contract, including a narrowly bounded tail.
@@ -4614,14 +4857,18 @@ class MotionActionRuntime:
                     or self.owner._follow_controller.active_target_id != uid
                     or not motion_identity_live(self.owner, uid, time.monotonic())):
                 return self._ordinary_snapshot_stop(uid, "identity_or_control_revoked")
+            # Resolve the potentially yielding feedback reader first. A
+            # normal producer can publish while it runs; read the immutable
+            # axes/grant afterwards instead of invalidating that publication
+            # solely because it arrived during feedback acquisition.
+            feedback = self.get_steering_feedback()
+            self._snapshot_used_feedback(feedback)
             marker = self._follow_grant_marker()
             axes = self._read_follow_axes(time.monotonic())
             linear = self._read_depth_linear(uid, now=time.monotonic())
             store = getattr(self.owner, "_lateral_intent_store", None)
             intent = self._follow_intent_snapshot(store)
             policy = getattr(self.owner, "_lateral_turn_response_policy", None)
-            feedback = self.get_steering_feedback()
-            self._snapshot_used_feedback(feedback)
             now = time.monotonic()
             if not self._same_follow_grant_marker(marker, self._follow_grant_marker()):
                 last_reason = "depth_published_during_snapshot"
@@ -4784,7 +5031,8 @@ class MotionActionRuntime:
                 yaw_required=guarded[0] != guarded[1], adopted_intent=intent,
                 adopted_policy=policy, expected_receipt=previous_receipt,
                 expected_stop_generation=stop_generation,
-                independent_straight=straight_fallback, commit_after_prepare=True)
+                independent_straight=straight_fallback, commit_after_prepare=True,
+                adopt_latest_forward=True)
             if decision is None:
                 latest = (self._follow_grant_marker(),
                     getattr(self.owner, "_lateral_yaw_revision", None),
@@ -4793,13 +5041,16 @@ class MotionActionRuntime:
                 changed = (not self._same_follow_grant_marker(publication[0], latest[0])
                     or publication[1] != latest[1] or publication[2] is not latest[2]
                     or publication[3] != latest[3])
-                if (changed or self._follow_write_veto_reason == "terminal_yaw_expired") \
+                if (changed or self._follow_write_veto_reason in {
+                        "terminal_yaw_expired", "terminal_feedback_requires_replan"}) \
                         and self._follow_plan_owns_motor():
                     # Pure time expiry has no publisher/revision change.
                     # Rebuild without stale yaw; Depth/visual/feedback and
                     # STOP still pass their own complete terminal gate.
                     last_reason = ("publication_changed_at_terminal" if changed
-                                   else "yaw_expired_at_terminal")
+                        else "feedback_updated_at_terminal"
+                        if self._follow_write_veto_reason == "terminal_feedback_requires_replan"
+                        else "yaw_expired_at_terminal")
                     continue
                 return self._ordinary_snapshot_stop(uid, self._follow_write_veto_reason)
             applied = decision.forward_pair
@@ -4809,14 +5060,18 @@ class MotionActionRuntime:
             ls = self.backend.wheel_raw_state_to_target("left", 1, 0x01)
             rs = self.backend.wheel_raw_state_to_target("right", 1, 0x01)
             previous_sent = self._visible_wheel_guard.last_sent
+            effective_linear = decision.effective_linear or linear
+            effective_revision = (axes[1] if decision.yaw_revision is None
+                                  else decision.yaw_revision)
+            self._follow_source_grant = decision.effective_grant or marker
             if not self._follow_motor_call("send_targets", applied[0]*ls, applied[1]*rs,
                                            label, max_target_override=max_target_override,
                                            history_uid=uid):
                 return False
             sent_at, _ = self._note_follow_packet(
-                uid, applied, linear, feedback, (ls, rs), previous_receipt,
+                uid, applied, effective_linear, feedback, (ls, rs), previous_receipt,
                 previous_sent, packet_written=True, trial=trial)
-            self._periodic_follow_axes = (uid, axes[1], .5*sum(applied),
+            self._periodic_follow_axes = (uid, effective_revision, .5*sum(applied),
                                           .5*(applied[0]-applied[1]))
             self._visible_wheel_waiting = False
             self._visible_wheel_feedback_ts = feedback.timestamp
@@ -4824,14 +5079,18 @@ class MotionActionRuntime:
                 "requested_forward_rpm=%s applied_forward_rpm=%s reason=snapshot_forward "
                 "depth_fresh=True feedback_forward_rpm=%s feedback_ts=%s "
                 "feedback_age_ms=%.1f evidence_capture_frame_id=%s packet_written=True "
-                "sent_ts=%.6f snapshot_attempts=%d full_plan_repeated=False straight_fallback=%s",
+                "sent_ts=%.6f snapshot_attempts=%d full_plan_repeated=False straight_fallback=%s "
+                "sample_ts=%.6f grant_reselected=%s deadline_renewed=False",
                 uid, label, .5*sum(applied), .5*(applied[0]-applied[1]), pair, applied,
                 (feedback.left_forward_rpm, feedback.right_forward_rpm), feedback.timestamp,
                 (sent_at-feedback.timestamp)*1000., getattr(self.owner, "_last_command_capture_frame", None),
-                sent_at, attempt-first_attempt+1, straight_fallback)
+                sent_at, attempt-first_attempt+1, straight_fallback,
+                effective_linear[3], not self._same_follow_grant_marker(marker,
+                    decision.effective_grant or marker))
             return True
         if (not straight_fallback and last_reason in {"publication_changed_at_terminal", "depth_published_during_snapshot",
-                            "yaw_published_during_snapshot", "yaw_expired_at_terminal", "revocation_superseded_before_commit"}
+                            "yaw_published_during_snapshot", "yaw_expired_at_terminal",
+                            "feedback_updated_at_terminal", "revocation_superseded_before_commit"}
                 and self._current_receipt_survives_publication(
                     uid, max_target_override=max_target_override)):
             # No packet was sent and no execution/sample clock is renewed.
@@ -4841,7 +5100,8 @@ class MotionActionRuntime:
                 and (getattr(self, "_follow_defer_reject_reason", None) == "forward_replan_needed"
                      or last_reason == "revocation_superseded_before_commit")
                 and last_reason in {"publication_changed_at_terminal", "depth_published_during_snapshot",
-                                    "yaw_published_during_snapshot", "yaw_expired_at_terminal", "revocation_superseded_before_commit"}):
+                                    "yaw_published_during_snapshot", "yaw_expired_at_terminal",
+                                    "feedback_updated_at_terminal", "revocation_superseded_before_commit"}):
             # Failure to retain an old receipt says nothing about admission
             # of the current forward grant. The old packet may be zero/a
             # pivot, or its execution clock may have been cleared on loss.
@@ -6779,6 +7039,8 @@ class MotionActionRuntime:
         Emergency STOP is a driver mode, not a claimed deceleration. Do not
         introduce 10A parking current: its high-speed benefit is uncalibrated.
         """
+        if self._short_follow_blocks_legacy():
+            return
         self.backend.send_stop("distance_momentum_brake", mode="emergency", preserve_zero=True)
         sent_at = time.monotonic()
         self._distance_brake_episode = (assessment, ParkSettlingEvidence(assessment, sent_at))
@@ -6799,6 +7061,8 @@ class MotionActionRuntime:
         No fixed-duration release, no renewed depth/identity lease. Returning
         False only hands control back to the normal complete packet checks.
         """
+        if self._short_follow_blocks_legacy():
+            return False
         # Ordinary live following acquires NO extra motor lock and invokes no
         # publisher/continuation callback. Recheck evidence under I/O ownership
         # only when it actually asks for braking (or an episode already exists).
@@ -6815,6 +7079,8 @@ class MotionActionRuntime:
             if candidate is None or candidate[2] != "shared_braking_momentum":
                 return False
         with self.owner.motor_io_lock:
+            if self._short_follow_blocks_legacy():
+                return False
             now = time.monotonic()
             episode = self._distance_brake_episode
             protected = (any(getattr(self.owner, name, False) for name in (
@@ -6901,6 +7167,8 @@ class MotionActionRuntime:
 
     def _service_follow_wheels_deferred(self):
         """Action-thread sole normal-follow writer; safety is checked each loop."""
+        if self._service_short_follow():
+            return
         if self._service_runtime_shutdown():
             return
         if self._service_distance_brake():
@@ -7124,6 +7392,8 @@ class MotionActionRuntime:
                 sum(planning_times))
 
     def send_transition_stop_sequence(self, label: str) -> None:
+        if self._short_follow_blocks_legacy():
+            return
         c = self.config
         try:
             repeat = max(1, int(c.motor_rs485_transition_stop_repeat))
@@ -7182,6 +7452,8 @@ class MotionActionRuntime:
         coast_action: Optional[int] = None,
         yaw_revision: Optional[int] = None,
     ) -> bool:
+        if self._short_follow_blocks_legacy():
+            return False
         c = self.config
         p = self.backend.clip_percent(percent)
         if p <= 0:
@@ -7245,6 +7517,8 @@ class MotionActionRuntime:
         reverse_guard: bool = False,
     ) -> bool:
         """Apply signed camera yaw with zero longitudinal wheel speed."""
+        if self._short_follow_blocks_legacy():
+            return False
         c = self.config
         correction = int(correction_rpm)
         raw = abs(correction)
@@ -7500,6 +7774,9 @@ class MotionActionRuntime:
             return self._send_percent_brake_deferred(mode=mode, label=label)
 
     def _send_percent_brake_deferred(self, mode: Optional[str] = None, label: str = "brake") -> bool:
+        if self._short_follow_stop(label, safety=(mode == "emergency" and label not in
+                {"near_yaw_park", "search_reacquire_brake"})):
+            return True
         with self.owner.motor_io_lock:
             ordinary_label = label in ("near_yaw_park", "search_reacquire_brake")
             safety = (mode == "emergency" and not ordinary_label) or label.startswith("safety_")
@@ -7742,6 +8019,14 @@ class MotionActionRuntime:
         owner = self.owner
         c = self.config
         s = self.symbols
+        if self._short_follow_blocks_legacy():
+            if action == s.stop:
+                try:
+                    safety = self.hard_stop_check(None)
+                except Exception:
+                    safety = True
+                self._short_follow_stop("queued_action_stop_signal", safety=safety)
+            return  # The paired watchdog, not this queued axis, owns writing.
         if self._service_motion_write_fault():
             return
         if not self._command_revision_write_allowed("dispatch"):
@@ -8185,6 +8470,8 @@ class MotionActionRuntime:
             or reason_text.startswith(("runtime_fault_", "runtime_shutdown"))
             or any(token in reason_text for token in
                    ("hard_stop", "front_ir", "left_ir", "right_ir", "bunker", "hazard")))
+        if self._short_follow_stop(reason_text, safety=safety_request):
+            return
         if not safety_request:
             if self._search_reacquire_brake_request is not None:
                 self._service_search_reacquire_brake()

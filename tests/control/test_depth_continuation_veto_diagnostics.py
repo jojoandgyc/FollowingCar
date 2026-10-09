@@ -73,5 +73,9 @@ def test_admission_log_preserves_actual_rejection_details(authority, setup, monk
     fresh = replace(frame, distance_state=replace(frame.distance_state,
         sample_timestamp=frame.distance_state.sample_timestamp+.05),
         steering_feedback=replace(frame.steering_feedback, timestamp=frame.steering_feedback.timestamp+.05))
-    decide_commit(a, fresh)
+    _decision, actions, _committed = decide_commit(a, fresh)
+    # The newer reversing-wheel evidence must not be masked by an older
+    # positive feedback cache just because that lease is still in time.
+    assert not any(action.speed_percent > 0 for action in actions)
+    assert a.owner._depth30_linear_snapshot is None
     assert any("admission_veto" in line and "evidence_veto=feedback_reverse_exceeds_tail" in line for line in records)

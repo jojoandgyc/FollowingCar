@@ -108,12 +108,15 @@ def test_new_forward_grant_requires_actual_dispatch_time_without_braking_evidenc
     current = a.frame(2.02, rpm=30., stamp=a.clock.now-new_depth_age)
     a.owner._depth_continuation_evidence = lambda *_args: (None, None)
     _decision, actions, accepted = decide_commit(a, current)
-    assert accepted and any(action.kind == "forward" and action.speed_percent > 0
-                            for action in actions)
     if admitted:
+        assert accepted and any(action.kind == "forward" and action.speed_percent > 0
+                                for action in actions)
         assert a.owner._depth30_linear_snapshot[3] == current.distance_state.sample_timestamp
     else:
         # The still-live prior grant may continue, but the unsuitable newer
-        # sample cannot get its own deadline or acceleration budget.
+        # sample cannot get its own deadline or acceleration budget. A failed
+        # unchanged update no longer republishes the existing motor target.
+        assert not accepted and actions == []
+        assert a.owner._fresh_depth_linear_snapshot(1)[1] > 0
         assert a.owner._depth30_linear_snapshot[3] == stamp
         assert a.owner._depth30_linear_timing.depth_expires_at == deadline

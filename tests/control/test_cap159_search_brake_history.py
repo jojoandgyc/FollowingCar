@@ -1,9 +1,15 @@
 """Production tracker observation + controller provenance regression."""
+from pathlib import Path
+import sys
 from types import SimpleNamespace
 import pytest
-from test_brake_hold_direction_observation import owner, sample, consume
+from test_brake_hold_direction_observation import owner, sample, consume, finish
 from car_control_modular.control_types import SensorFrame
 from car_control_modular.search_brake_observation import SearchBrakeObservation
+
+# Keep the real-runtime case runnable independently of pytest collection of
+# the motor test directory; these shared hardware-free helpers are modules.
+sys.path.append(str(Path(__file__).resolve().parents[1] / "motor"))
 
 
 def test_pre_stop_left_does_not_restart_after_uid0_center(owner):
@@ -11,7 +17,7 @@ def test_pre_stop_left_does_not_restart_after_uid0_center(owner):
     sent = owner._active_capture_timestamp+.03
     consume(owner,[sample(owner,659,.548,uid=0)])
     owner._action_runtime._search_reacquire_brake_sent_at = sent
-    owner._finish_search_brake_observation_hold()
+    finish(owner)
     c=owner._follow_controller
     assert c._target_direction_history.latest_visible_evidence() is None
     assert c.last_person_center_x is None
@@ -26,7 +32,7 @@ def test_post_stop_trusted_right_is_preserved(owner):
     sent=owner._active_capture_timestamp+.03
     consume(owner,[sample(owner,660,.72)])
     owner._action_runtime._search_reacquire_brake_sent_at=sent
-    owner._finish_search_brake_observation_hold()
+    finish(owner)
     side=owner._follow_controller._target_direction_history.latest_reliable_side()
     assert side.direction == "right" and side.last_visible_capture_frame_id == 660
     assert owner._longitudinal_valid_until == 99.8
@@ -92,6 +98,7 @@ def test_consume_records_current_capture_before_release(owner):
         if not kwargs:return True
         assert owner._search_brake_latest_observation == (1,660)
         assert kwargs["capture_timestamp"] == owner._active_capture_timestamp
+        owner._action_runtime._search_reacquire_brake_request = None
         return False
     owner._action_runtime.search_reacquire_brake_pending=pending
     def normal(**kwargs):

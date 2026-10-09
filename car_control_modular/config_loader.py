@@ -123,6 +123,21 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
             raise ValueError("FOLLOW_MATCHING_MODE must be optional or distance_only with [distance_pid]")
         parser.set("distance_pid", "approach_matching_enable", "true" if matching_mode == "optional" else "false")
 
+    # Normal-follow ownership is separate from legacy PI tuning. Explicit
+    # process override is the rollback switch; old INIs keep the old path.
+    normal_mode = os.environ.get("FOLLOW_NORMAL_MODE", "").strip().lower()
+    if not normal_mode:
+        normal_mode = parser.get("short_follow", "mode", fallback="legacy").strip().lower()
+    if normal_mode not in {"legacy", "paired"}:
+        raise ValueError("FOLLOW_NORMAL_MODE / [short_follow] mode must be legacy or paired")
+    os.environ["FOLLOW_NORMAL_MODE"] = normal_mode
+    # Paired mode shares the existing distance PI / motor tuning below; do not
+    # create a second P-only speed policy or a hidden 40 RPM ceiling here.
+    for option in ("stop_margin_m", "restart_margin_m",
+                   "yaw_max_delta_rpm", "yaw_full_error_ratio", "pivot_max_rpm", "center_deadband_ratio",
+                   "depth_ttl_sec", "visual_ttl_sec", "write_period_sec", "stop_refresh_sec"):
+        _set_env_if_unset(parser, "short_follow", option, "SHORT_FOLLOW_" + option.upper())
+
     # Module switches.  Keep both generic MODULE_* names and existing BUNKER_*.
     _set_bool_env_if_present(parser, "modules", "vision", "MODULE_VISION_ENABLE")
     _set_bool_env_if_present(parser, "modules", "ir", "MODULE_IR_ENABLE")

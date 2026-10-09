@@ -42,21 +42,31 @@ def snapshot_loss(monkeypatch, rt, owner, clock, publish, mode):
         monkeypatch.setattr(rt._visible_wheel_guard, "limit", age_after_guard)
     else:
         original = rt._linear_packet_write_limit
+        original_budget = owner._depth_forward_continuation_limit
+        pending = [False]
 
         def age_at_terminal(*args, **kwargs):
             if mode == "terminal_depth" and not changes:
                 changes.append(mode)
                 clock[0] = 10.251
             elif mode == "exhausted" and len(changes) < 3:
+                pending[0] = True
+            return original(*args, **kwargs)
+
+        def publish_during_budget(*args, **kwargs):
+            result = original_budget(*args, **kwargs)
+            if pending[0]:
+                pending[0] = False
                 changes.append(mode)
                 clock[0] += .005
                 publish(58., -4.)
                 if len(changes) == 3:
                     clock[0] += .251
                     rt._steering_feedback = feedback(clock[0], 24., 24.)
-            return original(*args, **kwargs)
+            return result
 
         monkeypatch.setattr(rt, "_linear_packet_write_limit", age_at_terminal)
+        monkeypatch.setattr(owner, "_depth_forward_continuation_limit", publish_during_budget)
     return changes
 
 

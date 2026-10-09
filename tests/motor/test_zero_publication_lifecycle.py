@@ -61,19 +61,31 @@ def test_missing_turn_policy_does_not_bypass_actual_stop(monkeypatch, phase, fau
 
 def churn_at_three_terminal_checks(monkeypatch, rt, clock, publish, *, base=80., yaw=0.,
                                    after_last=None):
+    # Change evidence AFTER the first current-budget evaluation, not before
+    # the admission function starts. A normal fresh publication at entry is
+    # now adopted and is no longer a reason to exercise retry exhaustion.
     original = rt._linear_packet_write_limit
+    original_budget = rt.owner._depth_forward_continuation_limit
     calls = []
+    pending = [False]
 
     def change(*args, **kwargs):
         calls.append(clock[0])
-        if len(calls) <= 3:
+        pending[0] = len(calls) <= 3
+        return original(*args, **kwargs)
+
+    def budget(*args, **kwargs):
+        result = original_budget(*args, **kwargs)
+        if pending[0]:
+            pending[0] = False
             clock[0] += .005
             publish(base, yaw)
             if len(calls) == 3 and after_last is not None:
                 after_last()
-        return original(*args, **kwargs)
+        return result
 
     monkeypatch.setattr(rt, "_linear_packet_write_limit", change)
+    monkeypatch.setattr(rt.owner, "_depth_forward_continuation_limit", budget)
     return calls
 
 

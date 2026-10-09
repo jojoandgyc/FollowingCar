@@ -63,7 +63,7 @@ def test_neutral_publication_cannot_reject_already_acknowledged_straight_pair(mo
 
 
 @pytest.mark.parametrize("old_yaw", [0., -4.])
-def test_three_new_depth_publications_then_neutral_refresh_make_forward_progress(monkeypatch, old_yaw):
+def test_new_depth_publications_are_adopted_before_retry_exhaustion(monkeypatch, old_yaw):
     rt, owner, driver, clock, publish, _ = writer(monkeypatch, base=46., yaw=old_yaw)
     original = rt._linear_packet_write_limit
     changes = []
@@ -76,15 +76,19 @@ def test_three_new_depth_publications_then_neutral_refresh_make_forward_progress
 
     monkeypatch.setattr(rt, "_linear_packet_write_limit", refresh)
     rt._service_follow_wheels()
-    assert len(changes) == 4  # Shared retry budget; no unbounded retry loop.
+    assert len(changes) == (2 if old_yaw else 1)
     assert not driver.stops and all(left > 0 > right for left, right in driver.pairs)
     if old_yaw:
         # An obsolete curved receipt must be replaced, never silently held.
         assert driver.pairs == [(42, -50), (86, -86)]
     else:
-        assert driver.pairs == [(46, -46)]
-        rt._service_follow_wheels()
-        assert driver.pairs == [(46, -46), (86, -86)]
+        assert driver.pairs == [(46, -46), (46, -46)]
+    assert rt._forward_execution_anchor.sample_timestamp == clock[0]
+    assert owner._depth30_linear_timing.depth_expires_at == pytest.approx(clock[0] + .25)
+    # Adoption only retains the guarded pair; it is not a persistent cap.
+    clock[0] += .05
+    rt._service_follow_wheels()
+    assert driver.pairs[-1] == (86, -86)
 
 
 @pytest.mark.parametrize("fault", ["uid", "identity", "stop", "explicit_stop", "receipt",

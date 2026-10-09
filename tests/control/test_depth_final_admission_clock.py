@@ -173,7 +173,9 @@ def test_rejected_new_admission_only_tightens_independently_live_previous_grant(
     delay_evidence(monkeypatch, state, stamp, final_age)
     actions, accepted = commit(state, frame, decision)
     current = state.owner._fresh_depth_linear_snapshot(1)
-    assert accepted and actions[0].speed_percent > 0
+    # No closer evidence and no lower request: reject the NEW publication
+    # without manufacturing another command for the independent old lease.
+    assert not accepted and actions == []
     assert current[3] == original_stamp
     assert 0 < current[1] <= before[1]
     assert state.owner._depth30_linear_timing.depth_expires_at == timing.depth_expires_at
@@ -241,7 +243,7 @@ def test_real_pi_rejects_new_sample_while_old_grant_continues_and_next_sample_re
         delay_evidence(delayed, state, stamp, .181)
         _decision, actions, accepted = decide_commit(state, frame)
     current = state.owner._fresh_depth_linear_snapshot(1)
-    assert accepted and actions[0].speed_percent > 0
+    assert not accepted and actions == []
     assert current[3] == original_stamp and 0 < current[1] <= before[1]
     assert state.owner._depth30_linear_timing.depth_expires_at == timing.depth_expires_at
     assert pi.integral_m_s == pytest.approx(integral)

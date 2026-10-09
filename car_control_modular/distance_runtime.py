@@ -13,6 +13,7 @@ from .control_types import (
     SteeringFeedback,
 )
 from .distance_fusion import DistanceFusionConfig, VisionRadarEncoderDistanceFusion
+from .depth_measurement_transaction import DepthCommitReceipt
 
 
 @dataclass
@@ -1395,9 +1396,10 @@ class DistanceRuntime:
         if reason == "yolo_detector_bounded_history":
             selection = result.bounded_roi_selection
             observation = target.depth_observation
-            if selection is None or not selection.valid_for(
+            provenance_now = self._prepared_bounded_provenance_time(prepared, now)
+            if provenance_now is None or selection is None or not selection.valid_for(
                     capture_timestamp=observation.capture_timestamp,
-                    sample_timestamp=result.observation_sample_timestamp, now=now,
+                    sample_timestamp=result.observation_sample_timestamp, now=provenance_now,
                     target_id=target.track_id, capture_frame_id=observation.capture_frame_id,
                     bbox=ranging_target.bbox,
                     max_roi_age=self.config.vision_depth_detector_bbox_max_age_sec):
@@ -1406,6 +1408,31 @@ class DistanceRuntime:
               or result.observation_sample_timestamp != prepared.transaction.private._latest_depth_ts):
             return None, "prepared_latest_provenance_invalid"
         return ranging_target, reason
+
+    @staticmethod
+    def _prepared_bounded_provenance_time(prepared, now):
+        """Separate physical admission from consumption of its committed result.
+
+        CAP227 completed and committed within 180 ms. A second 180 ms check
+        after ordinary control work discarded that SAME measurement and reset
+        fusion. Keep association/UID/ROI checks against the successful commit;
+        _build_vision_depth_state still checks the actual current sample age,
+        and the controller/motor deadlines remain tied to its original clock.
+        Uncommitted work always uses current time and the original 180 ms gate.
+        """
+        if prepared.measurement is None:
+            return now
+        transaction = prepared.transaction
+        receipt = getattr(transaction, "commit_receipt", None)
+        if (not getattr(transaction, "committed", False)
+                or not isinstance(receipt, DepthCommitReceipt)
+                or receipt.measurement is not prepared.measurement
+                or receipt.measurement is not transaction.result
+                or isinstance(now, bool) or not isinstance(now, (int, float))
+                or not math.isfinite(now)
+                or not receipt.validated_at <= now):
+            return None
+        return receipt.validated_at
 
     def commit_prepared_depth(self, prepared, *, target, steering_feedback=None):
         """Validate post-compute geometry before publishing any sensor history."""
@@ -1506,13 +1533,17 @@ class DistanceRuntime:
             from .depth_roi_policy import BoundedDepthSelection
             stamp = getattr(measurement, "sample_timestamp", None)
             selection = getattr(measurement, "bounded_roi_selection", None)
+            validation_now = time.monotonic()
+            if prepared_depth is not None:
+                validation_now = self._prepared_bounded_provenance_time(prepared_depth, validation_now)
             valid = bool(
                 getattr(measurement, "observation_source", None) == "roi_bounded_history"
                 and getattr(measurement, "observation_sample_timestamp", None) == stamp
                 and isinstance(selection, BoundedDepthSelection)
+                and validation_now is not None
                 and selection.valid_for(
                     capture_timestamp=observation.capture_timestamp, sample_timestamp=stamp,
-                    now=time.monotonic(), target_id=target.track_id,
+                    now=validation_now, target_id=target.track_id,
                     capture_frame_id=observation.capture_frame_id, bbox=ranging_target.bbox,
                     max_roi_age=self.config.vision_depth_detector_bbox_max_age_sec,
                 )

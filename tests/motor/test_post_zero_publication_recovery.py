@@ -144,7 +144,7 @@ def test_missing_execution_clock_does_not_admit_unknown_or_reverse_packet(monkey
     assert not owner.motor_io_lock.locked()
 
 
-def test_post_zero_continuous_publication_cannot_restart_the_admission_budget(monkeypatch):
+def test_post_zero_continuous_fresh_publication_recovers_without_another_zero(monkeypatch):
     rt, owner, driver, clock, publish = stopped_writer(monkeypatch)
     original = rt._linear_packet_write_limit
     calls = []
@@ -157,9 +157,14 @@ def test_post_zero_continuous_publication_cannot_restart_the_admission_budget(mo
 
     monkeypatch.setattr(rt, "_linear_packet_write_limit", refresh)
     rt._service_follow_wheels()
-    assert len(calls) == 4
-    assert driver.pairs == [(60, -60), (0, 0), (0, 0)]
+    assert len(calls) == 1
+    assert driver.pairs == [(60, -60), (0, 0), (56, -64)]
+    assert rt._forward_execution_anchor.sample_timestamp == clock[0]
+    assert owner._depth30_linear_timing.depth_expires_at == pytest.approx(clock[0] + .25)
     assert not driver.stops and not owner.motor_io_lock.locked()
+    clock[0] += .05
+    rt._service_follow_wheels()
+    assert driver.pairs[-1] == (66, -74)
 
 
 def pivot_writer(monkeypatch, yaw=-7.):

@@ -48,6 +48,7 @@ class AppearanceResult:
     partial_feature: Any
     timings_ms: dict
     error: Optional[str] = None
+    bbox: Optional[Tuple[float, float, float, float]] = None
 
 
 class AppearanceWorker:
@@ -140,11 +141,12 @@ class AppearanceWorker:
                     result = AppearanceResult(
                         request.frame_id, request.submitted_at, time.monotonic(), request.purpose,
                         full_feature, partial, dict(extractor.last_timing_ms), None,
+                        request.bbox,
                     )
                 except Exception as exc:
                     result = AppearanceResult(
                         request.frame_id, request.submitted_at, time.monotonic(), request.purpose,
-                        None, None, {}, f"{type(exc).__name__}: {exc}",
+                        None, None, {}, f"{type(exc).__name__}: {exc}", request.bbox,
                     )
                 self._results.put(result)
         except Exception as exc:

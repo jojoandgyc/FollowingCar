@@ -41,7 +41,11 @@ class AppearanceTemplateBank:
 
     @property
     def enrolled(self) -> bool:
-        return bool(self._full)
+        # A near/edge-clipped target may never produce a safe full-body crop,
+        # while its torso descriptor is still a valid identity anchor.  The
+        # two galleries remain separate at match time, but either is enough
+        # to prevent the runtime from falling back to "any person".
+        return bool(self._full or self._partial)
 
     @property
     def full_count(self) -> int:

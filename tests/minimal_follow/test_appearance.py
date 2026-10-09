@@ -69,3 +69,38 @@ def test_reacquire_requires_two_fresh_matching_results():
         frame=frame, bbox=bbox, score=.95, frame_id=4, now=2.06, frame_width=640, frame_height=480,
     )
     assert second.accepted is True and second.reason == "confirmed"
+
+
+def test_partial_gallery_is_a_valid_cache_and_rejects_unenrolled_reacquire():
+    worker = _Worker()
+    policy = AppearanceIdentityPolicy(
+        AppearanceIdentityConfig(stable_enroll_frames=1, reacquire_confirm_results=1),
+        AppearanceQualityGate(AppearanceQualityConfig(min_height_px=20, min_area_px=100)),
+        worker,
+    )
+    frame = _Frame()
+    edge_bbox = (100.0, 0.0, 220.0, 240.0)
+
+    # Before any trustworthy cache exists, a post-loss candidate cannot take
+    # control merely because it is the largest detected person.
+    policy.target_missing(1.0)
+    pending = policy.search_candidate(
+        frame=frame, bbox=edge_bbox, score=.95, frame_id=1, now=1.01,
+        frame_width=640, frame_height=480,
+    )
+    assert pending.accepted is False and pending.state == "enrollment_pending"
+
+    # Edge-clipped enrollment retains a torso template only; it is still a
+    # valid identity cache for later partial re-identification.
+    policy.visible_target(
+        frame=frame, bbox=edge_bbox, score=.95, frame_id=2, now=2.0,
+        frame_width=640, frame_height=480,
+    )
+    assert worker.requests[-1][0].allow_full is False
+    assert worker.requests[-1][0].compute_partial is True
+    worker.latest = AppearanceResult(2, 2.0, 2.01, "enroll", None, (1.0, 0.0), {})
+    policy.visible_target(
+        frame=frame, bbox=edge_bbox, score=.95, frame_id=3, now=2.02,
+        frame_width=640, frame_height=480,
+    )
+    assert policy.enrolled

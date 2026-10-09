@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -52,6 +53,7 @@ class AppearanceIdentityPolicy:
         self._visible_streak = 0
         self._reacquire_confirmations = 0
         self._latest_reacquire: Optional[AppearanceDecision] = None
+        self._latest_reacquire_bbox: Optional[Tuple[float, float, float, float]] = None
         self._last_worker_timing: Optional[dict] = None
         self._enroll_requests = 0
 
@@ -70,15 +72,27 @@ class AppearanceIdentityPolicy:
         age_ms = age * 1000.0
         if result.error:
             self._latest_reacquire = AppearanceDecision(False, "error", result.error, None, None, age_ms, self._last_worker_timing)
+            self._latest_reacquire_bbox = None
             return
         if result.purpose == "enroll":
+            full_added = False
+            partial_added = False
             if result.full_feature is not None:
-                self.bank.add(result.full_feature, source="full")
+                full_added = self.bank.add(result.full_feature, source="full")
             if result.partial_feature is not None:
-                self.bank.add(result.partial_feature, source="partial")
+                partial_added = self.bank.add(result.partial_feature, source="partial")
+            # This runs only for the bounded enrollment jobs, not per frame.
+            # It makes it explicit in board logs whether ReID has a usable
+            # cache before a loss event occurs.
+            logging.getLogger("minimal_follow").info(
+                "appearance_cache frame=%s full_added=%s partial_added=%s full_templates=%d partial_templates=%d",
+                result.frame_id, full_added, partial_added,
+                self.bank.full_count, self.bank.partial_count,
+            )
             return
         if result.purpose != "reacquire" or age > float(self.config.result_max_age_sec):
             self._latest_reacquire = AppearanceDecision(False, "stale", "result_stale", None, None, age_ms, self._last_worker_timing)
+            self._latest_reacquire_bbox = None
             return
         match = self.bank.match(result.full_feature, result.partial_feature)
         threshold = (
@@ -98,6 +112,35 @@ class AppearanceIdentityPolicy:
                 False, "reacquire_mismatch", "threshold", match.score, match.source,
                 age_ms, self._last_worker_timing,
             )
+        self._latest_reacquire_bbox = result.bbox
+
+    @staticmethod
+    def _same_candidate(
+        evidence_bbox: Optional[Tuple[float, float, float, float]],
+        current_bbox: Tuple[float, float, float, float],
+        frame_width: int,
+    ) -> bool:
+        """Ensure an async result cannot authorize a newly arrived person."""
+        if evidence_bbox is None:
+            # Compatibility with synthetic/unit-test results. Board results
+            # always carry their request bbox and use the stricter path below.
+            return True
+        ax1, ay1, ax2, ay2 = (float(value) for value in evidence_bbox)
+        bx1, by1, bx2, by2 = (float(value) for value in current_bbox)
+        inter = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(0.0, min(ay2, by2) - max(ay1, by1))
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        if union > 1e-6 and inter / union >= 0.15:
+            return True
+        center_a = (ax1 + ax2) * 0.5
+        center_b = (bx1 + bx2) * 0.5
+        return abs(center_a - center_b) <= max(16.0, float(frame_width) * 0.18)
+
+    def _discard_reacquire_evidence(self) -> None:
+        self._latest_reacquire = None
+        self._latest_reacquire_bbox = None
+        self._reacquire_confirmations = 0
 
     def _submit(
         self, *, frame, bbox: Tuple[float, float, float, float], score: float,
@@ -111,7 +154,7 @@ class AppearanceIdentityPolicy:
         # few times at startup and is what makes a later edge-clipped target
         # comparable to the separate partial gallery.
         compute_partial = quality.partial_ok and (
-            purpose == "enroll" or not quality.full_ok
+            purpose == "enroll" or not quality.full_ok or self.bank.partial_count > 0
         )
         request = AppearanceRequest(
             frame_id=frame_id,
@@ -154,8 +197,7 @@ class AppearanceIdentityPolicy:
         if self._visible_streak:
             # A result from an older loss episode must never authorize a new
             # search episode just because it arrived late.
-            self._latest_reacquire = None
-            self._reacquire_confirmations = 0
+            self._discard_reacquire_evidence()
         self._visible_streak = 0
 
     def search_candidate(
@@ -163,13 +205,20 @@ class AppearanceIdentityPolicy:
         frame_width: int, frame_height: int,
     ) -> AppearanceDecision:
         self._consume_result(now)
-        if not self.config.enabled or not self.bank.enrolled:
+        if not self.config.enabled:
             return AppearanceDecision(True, "fallback", "bank_unavailable", None, None, None, self._last_worker_timing)
-        if self._latest_reacquire is not None and self._latest_reacquire.accepted:
-            return self._latest_reacquire
+        if not self.bank.enrolled:
+            # Re-identification is enabled but a gallery has not completed.
+            # Continuing the bounded search is safer than letting a passer-by
+            # take over the vehicle as the first candidate after a loss.
+            return AppearanceDecision(False, "enrollment_pending", "bank_empty", None, None, None, self._last_worker_timing)
         quality = self.quality_gate.evaluate(
             bbox, score=score, frame_width=frame_width, frame_height=frame_height,
         )
+        if self._latest_reacquire is not None and not self._same_candidate(
+            self._latest_reacquire_bbox, bbox, frame_width,
+        ):
+            self._discard_reacquire_evidence()
         submitted = self._submit(
             frame=frame, bbox=bbox, score=score, frame_id=frame_id, now=now,
             purpose="reacquire", quality=quality,

@@ -10,6 +10,7 @@ motion prediction, or legacy action queue.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -111,6 +112,8 @@ class MinimalFollowRuntime:
         self.last_camera_warning_at = 0.0
         self.last_command_key = None
         self.last_stop_at = 0.0
+        self.frame_index = 0
+        self.previous_frame_started_at: Optional[float] = None
         self.motor: Optional[MssdMotorBackend] = None
         self.ir_started = False
 
@@ -283,6 +286,57 @@ class MinimalFollowRuntime:
         right = self.motor.wheel_state_to_target("right", command.right_percent, 0x01)
         self.motor.send_targets(left, right, "minimal_" + command.reason)
 
+    def _log_frame_timing(
+        self,
+        *,
+        frame_started_at: float,
+        capture_ms: float,
+        detect_ms: float,
+        select_ms: float,
+        ir_ms: float,
+        depth_ms: float,
+        decision_ms: float,
+        dispatch_ms: float,
+        detection_count: int,
+        selected: bool,
+        depth_attempted: bool,
+        distance_m: Optional[float],
+        front_blocked: bool,
+        command,
+    ) -> None:
+        """Write one machine-readable latency record for every processed frame."""
+        finished_at = time.perf_counter()
+        previous = self.previous_frame_started_at
+        self.previous_frame_started_at = frame_started_at
+        self.frame_index += 1
+        detector_timing = getattr(self.detector, "last_timing_ms", {}) or {}
+        record = {
+            "frame": self.frame_index,
+            "monotonic_s": round(time.monotonic(), 6),
+            "cycle_ms": None if previous is None else round((frame_started_at - previous) * 1000.0, 3),
+            "capture_ms": round(capture_ms, 3),
+            "detect_ms": round(detect_ms, 3),
+            "detect_preprocess_ms": round(float(detector_timing.get("preprocess", 0.0)), 3),
+            "detect_inference_ms": round(float(detector_timing.get("inference", 0.0)), 3),
+            "detect_decode_ms": round(float(detector_timing.get("decode", 0.0)), 3),
+            "detect_nms_ms": round(float(detector_timing.get("nms", 0.0)), 3),
+            "select_ms": round(select_ms, 3),
+            "ir_ms": round(ir_ms, 3),
+            "depth_ms": round(depth_ms, 3),
+            "decision_ms": round(decision_ms, 3),
+            "dispatch_ms": round(dispatch_ms, 3),
+            "total_ms": round((finished_at - frame_started_at) * 1000.0, 3),
+            "detections": int(detection_count),
+            "person_selected": bool(selected),
+            "depth_attempted": bool(depth_attempted),
+            "distance_m": None if distance_m is None else round(float(distance_m), 4),
+            "front_blocked": bool(front_blocked),
+            "action": command.reason,
+            "left_percent": int(command.left_percent),
+            "right_percent": int(command.right_percent),
+        }
+        LOG.info("minimal_timing %s", json.dumps(record, separators=(",", ":"), sort_keys=True))
+
     def run(self) -> None:
         while self.running:
             if self.camera is None:
@@ -292,31 +346,67 @@ class MinimalFollowRuntime:
                 if not self._open_camera():
                     self.next_camera_retry_at = time.monotonic() + self.config.camera_retry_sec
                     continue
+            frame_started_at = time.perf_counter()
+            capture_started_at = frame_started_at
             ok, frame = self.camera.read()
+            capture_ms = (time.perf_counter() - capture_started_at) * 1000.0
             if not ok or frame is None:
                 self._warn_camera("camera read failed; reconnecting")
                 self.camera.release()
                 self.camera = None
                 self.next_camera_retry_at = time.monotonic() + self.config.camera_retry_sec
                 continue
+            detect_started_at = time.perf_counter()
             detections = self.detector.detect(frame, "BGR")
+            detect_ms = (time.perf_counter() - detect_started_at) * 1000.0
+            select_started_at = time.perf_counter()
             selected = self._select_person(detections, self.config.confidence_threshold)
+            select_ms = (time.perf_counter() - select_started_at) * 1000.0
+            ir_started_at = time.perf_counter()
             front_blocked = self._front_ir_triggered()
+            ir_ms = (time.perf_counter() - ir_started_at) * 1000.0
+            depth_ms = 0.0
+            depth_attempted = selected is not None
+            distance = None
             if selected is None:
+                decision_started_at = time.perf_counter()
                 command = self.controller.step(
                     frame_width=frame.shape[1], bbox=None, distance_m=None, front_obstacle=front_blocked,
                 )
+                decision_ms = (time.perf_counter() - decision_started_at) * 1000.0
             else:
                 bbox, track_id, _area = selected
+                depth_started_at = time.perf_counter()
                 try:
                     distance = self._measure_distance(bbox, track_id, frame.shape[1], frame.shape[0])
                 except Exception as exc:
                     LOG.warning("depth measure failed; stopping: %s", exc)
                     distance = None
+                depth_ms = (time.perf_counter() - depth_started_at) * 1000.0
+                decision_started_at = time.perf_counter()
                 command = self.controller.step(
                     frame_width=frame.shape[1], bbox=bbox, distance_m=distance, front_obstacle=front_blocked,
                 )
+                decision_ms = (time.perf_counter() - decision_started_at) * 1000.0
+            dispatch_started_at = time.perf_counter()
             self._dispatch(command)
+            dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000.0
+            self._log_frame_timing(
+                frame_started_at=frame_started_at,
+                capture_ms=capture_ms,
+                detect_ms=detect_ms,
+                select_ms=select_ms,
+                ir_ms=ir_ms,
+                depth_ms=depth_ms,
+                decision_ms=decision_ms,
+                dispatch_ms=dispatch_ms,
+                detection_count=len(detections),
+                selected=selected is not None,
+                depth_attempted=depth_attempted,
+                distance_m=distance,
+                front_blocked=front_blocked,
+                command=command,
+            )
 
     def close(self) -> None:
         self.running = False

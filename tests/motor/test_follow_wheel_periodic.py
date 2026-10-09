@@ -76,7 +76,13 @@ def test_state_exit_revokes_periodic_pair_once(monkeypatch, change):
     else: owner._runtime_shutdown_requested = True
     rt._service_follow_wheels()
     rt._service_follow_wheels()
-    assert driver.pairs == [(24, -24), (0, 0)]
+    if change == "shutdown":
+        # Shutdown owns a real STOP, never a speed-zero write which can undo
+        # its motor stop mode. Repeated service does not burst-refresh STOP.
+        assert driver.pairs == [(24, -24)]
+        assert driver.stops == [1]
+    else:
+        assert driver.pairs == [(24, -24), (0, 0)]
 
 
 def test_expiry_while_reading_feedback_cannot_write_stale_pair(monkeypatch):

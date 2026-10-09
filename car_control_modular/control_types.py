@@ -6,7 +6,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .depth_continuation import ContinuationMotionEvidence
+    from .sample_braking import SampleBrakingAssessment
 
 
 BBox = Tuple[float, float, float, float]
@@ -27,10 +31,18 @@ class DepthLinearTiming:
     feedforward_timestamp: Optional[float] = None
     feedforward_expires_at: Optional[float] = None
     distance_only_percent: int = 0
-    # Only an already-approved forward grant may use 180..250ms. These
+    # Only an already-approved forward grant may use the extended TTL. These
     # conservative braking inputs stay tied to snapshot[3], never a replay.
     continuation_distance_m: Optional[float] = None
+    # Original admitted outer/travel budget, NOT snapshot[1]'s current
+    # command ceiling. A normal speed reduction/late closer range must keep
+    # this historical bound: earlier legal writes do not become violations,
+    # and already reserved travel cannot be refunded by lowering a command.
     continuation_speed_bound_m_s: Optional[float] = None
+    # Frozen evidence from THIS accepted PI/Depth sample. Read-time feedback
+    # may tighten this grant but can never install a newer motion estimate.
+    continuation_motion: Optional[ContinuationMotionEvidence] = None
+    braking_assessment: Optional[SampleBrakingAssessment] = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,11 @@ class PersonTarget:
     confidence: float
     area: float
     depth_observation: Optional[DepthTargetObservation] = None
+    # Geometry for braking only. NEVER consumed by depth or identity authority.
+    braking_observation: Optional[DepthTargetObservation] = None
+    # True only for a fresh, exact observation of the bank's first enrolled UID.
+    # Skips duplicate startup confirmation, never motion/depth safety checks.
+    initial_identity_confirmed: bool = False
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -166,10 +183,19 @@ class SteeringFeedback:
     # median-filtered value above; startup/brake pulse gates may use this value
     # to react to the first real wheel response without waiting for 3 samples.
     raw_yaw_rate_right_dps: Optional[float] = None
+    # High encoder yaw is accepted for braking only after two consecutive
+    # samples agree. This prevents one mode-switch spike from parking the car.
+    yaw_rate_confirmed: bool = True
     integrated_yaw_right_deg: float = 0.0
     left_error: int = 0
     right_error: int = 0
     trustworthy: bool = False
+    # Read intervals, not simultaneous physical sample times. Diagnostics
+    # only; no extra serial reads and no renewal of the original timestamp.
+    left_read_started: Optional[float] = None
+    left_read_finished: Optional[float] = None
+    right_read_started: Optional[float] = None
+    right_read_finished: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -307,3 +333,6 @@ class ControlDecision:
     # executor must preserve NORMAL parking against subsequent zero-speed
     # refreshes, without turning every longitudinal zero into a full stop.
     near_yaw_park_requested: bool = False
+    # Visual-only update: actions carry yaw intent and a read-only snapshot of
+    # the live depth base. They must NOT be committed as a new depth authority.
+    lateral_only: bool = False

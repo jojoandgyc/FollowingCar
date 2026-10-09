@@ -347,14 +347,20 @@ def test_soft_search_candidate_bridges_strict_reid_distance():
 
 
 def test_soft_search_ignores_small_fragment_competition():
+    from rk_vision.candidate_competition import competition_evidence
+
     bank = IdentityBank(IdentityBankConfig())
+    proof = competition_evidence({0: .20, 1: .70}, uid=1, frame_index=2)[0]
     assert bank._soft_candidate_competition_ok(
         2,
         {
             "candidate_score_gap": 0.194,
             "detector_area_ratio": 0.50,
             "detector_confidence": 0.844,
+            "identity_competition": proof,
+            "source_detection_index": 0,
         },
+        uid=1, frame_index=2,
     )
     assert not bank._soft_candidate_competition_ok(
         2,
@@ -362,7 +368,10 @@ def test_soft_search_ignores_small_fragment_competition():
             "candidate_score_gap": 0.194,
             "detector_area_ratio": 0.017,
             "detector_confidence": 0.844,
+            "identity_competition": proof,
+            "source_detection_index": 0,
         },
+        uid=1, frame_index=2,
     )
 
 

@@ -63,12 +63,26 @@ class TargetDirectionHistory:
         # delayed search cannot erase the final exit trace.
         self._visible_entries: List[TargetFrameEvidence] = []
         self._cached_decision: Optional[TargetDirectionDecision] = None
+        self.not_before_timestamp = float("-inf")
+
+    def discard_through(self, timestamp: float) -> None:
+        """A physical search stop retires direction evidence captured before it.
+
+        Keep a floor as well as clearing the cache: delayed inference/backfill
+        must not reinsert the very evidence which restarted CAP159 leftward.
+        """
+        self.not_before_timestamp = max(self.not_before_timestamp, float(timestamp))
+        self._entries = [e for e in self._entries if e.timestamp > self.not_before_timestamp]
+        self._visible_entries = [e for e in self._visible_entries if e.timestamp > self.not_before_timestamp]
+        self._cached_decision = None
 
     @property
     def entries(self) -> Tuple[TargetFrameEvidence, ...]:
         return tuple(self._entries)
 
     def record(self, evidence: TargetFrameEvidence) -> None:
+        if evidence.timestamp <= self.not_before_timestamp:
+            return
         capture_id = int(evidence.capture_frame_id)
         if capture_id <= 0:
             return

@@ -6,8 +6,11 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 from .control_types import SteeringFeedback
+from .outward_trajectory import OutwardTrajectoryLead
 from .longitudinal_approach import ApproachConfig, approach_reference
 from .distance_pi import DistancePiConfig, DistancePiController
+from .longitudinal_execution import ForwardExecutionAnchor, ForwardRecoveryAnchor
+from .sample_braking import SampleBrakingAssessment
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,43 @@ class DistancePidResult:
     pi_motion_uncertainty_m_s: float = 0.
     pi_brake_recovery_limited: bool = False
     pi_brake_recovery_anchor_rpm: float = 0.
+    pi_memory_time_penalty_m_s: float = 0.
+    pi_memory_rotation_penalty_m_s: float = 0.
+    pi_memory_retained_rate_m_s: Optional[float] = None
+    pi_memory_endpoint_rate_m_s: Optional[float] = None
+    pi_effective_range_rate_m_s: float = 0.
+    pi_target_velocity_bound_m_s: float = 0.
+    pi_braking_distance_input_m: float = 0.
+    pi_brake_settling_limited: bool = False
+    pi_brake_settling_anchor_rpm: float = 0.
+    pi_brake_settling_uncertainty_released: bool = False
+    pi_memory_endpoint_fallback: bool = False
+    pi_memory_endpoint_cap_rpm: float = 0.
+    pi_final_limit_reason: str = "not_evaluated"
+    pi_pre_settling_cap_rpm: float = 0.
+    pi_execution_anchor_rpm: float = 0.
+    pi_execution_ramp_dt_sec: float = 0.
+    pi_ramp_output_rpm: float = 0.
+    pi_brake_recovery_cap_rpm: Optional[float] = None
+    pi_pre_quantization_rpm: float = 0.
+    pi_motion_window_used: bool = False
+    pi_motion_window_target_speed_m_s: Optional[float] = None
+    pi_motion_window_span_sec: float = 0.
+    pi_motion_window_range_rate_m_s: Optional[float] = None
+    pi_depth_expiry_recovery_step_sec: float = 0.
+    pi_depth_expiry_recovery_used: bool = False
+    pi_depth_expiry_completed_anchor_used: bool = False
+    pi_depth_expiry_completed_anchor_rpm: float = 0.
+    pi_fresh_grant_recovery_step_sec: float = 0.
+    pi_fresh_grant_recovery_used: bool = False
+    pi_stationary_preview_status: str = "disabled"
+    pi_stationary_preview_cap_rpm: Optional[float] = None
+    pi_stationary_preview_loss_rpm: float = 0.
+    pi_stationary_preview_margin_m: Optional[float] = None
+    pi_stationary_preview_required_stop_m: Optional[float] = None
+    pi_braking_assessment: Optional[SampleBrakingAssessment] = None
+    pi_brake_settling_preview_released: bool = False
+    pi_execution_recovery_anchor_used: bool = False
 
 
 class LongitudinalDistancePid:
@@ -116,6 +156,10 @@ class LongitudinalDistancePid:
             self._distance_pi.reset()
         self._pi_forward_active = False
 
+    def set_normal_parking(self, active: bool):
+        if self._distance_pi is not None:
+            self._distance_pi.set_normal_parking(active)
+
     def invalidate_motion_memory(self):
         if self._distance_pi is not None:
             self._distance_pi.invalidate_motion_memory()
@@ -133,6 +177,14 @@ class LongitudinalDistancePid:
                 self._sync_pi_feedback()
             return changed
         return False
+
+    def retain_execution_anchor(self, sample_timestamp, rpm, sent_at, now):
+        if self._distance_pi is None or not self._pi_forward_active:
+            return False
+        retained = self._distance_pi.retain_execution_anchor(sample_timestamp, rpm, sent_at, now)
+        if retained:
+            self._sync_pi_feedback()
+        return retained
 
     def _sync_pi_feedback(self) -> None:
         r = self._distance_pi.last_result
@@ -187,14 +239,34 @@ class LongitudinalDistancePid:
         measurement_age_sec: float = 0.0,
         braking_range_rate_m_s: Optional[float] = None,
         raw_closure_valid: bool = False,
+        raw_motion_evidence=None,
         allow_motion_memory: bool = False,
+        allow_motion_memory_endpoint_fallback: bool = False,
+        motion_memory_rotation_bound: float = .25,
         braking_raw_distance_m: Optional[float] = None,
         ego_forward_rpm: Optional[float] = None,
+        preview_outer_forward_rpm: Optional[float] = None,
+        preview_feedback_timestamp: Optional[float] = None,
+        preview_completed_rpm: Optional[float] = None,
+        braking_assessment: Optional[SampleBrakingAssessment] = None,
         execution_now: Optional[float] = None,
         forward_control: bool = True,
+        depth_expiry_recovery_step_sec: float = 0.,
+        depth_expiry_execution_anchor: Optional[ForwardExecutionAnchor] = None,
+        depth_expiry_expected_uid: Optional[int] = None,
+        fresh_grant_recovery_step_sec: float = 0.,
+        execution_recovery_proof: Optional[ForwardRecoveryAnchor] = None,
+        execution_recovery_uid: Optional[int] = None,
     ) -> DistancePidResult:
         c = self.config
         now = time.monotonic() if now is None else float(now)
+        if self._distance_pi is not None and forward_control and not c.pi_profile.use_target_motion:
+            # The estimator remains free to run/log outside this controller.
+            # Its missing/invalid outputs do not veto pure distance control.
+            tracking_base_rpm = braking_range_rate_m_s = raw_motion_evidence = None
+            raw_closure_valid = allow_motion_memory = False
+            allow_motion_memory_endpoint_fallback = False
+            motion_memory_rotation_bound = .25
         raw_actual = float(actual_distance_m)
         actual = raw_actual
         target = float(target_distance_m)
@@ -220,9 +292,22 @@ class LongitudinalDistancePid:
                 rise_rpm_per_sec=c.output_rise_rpm_per_sec,
                 fall_rpm_per_sec=c.output_fall_rpm_per_sec,
                 ego_forward_rpm=ego_forward_rpm, range_rate_m_s=braking_range_rate_m_s,
+                preview_outer_forward_rpm=preview_outer_forward_rpm,
+                preview_feedback_timestamp=preview_feedback_timestamp,
+                preview_completed_rpm=preview_completed_rpm,
+                braking_assessment=braking_assessment,
                 raw_closure_valid=raw_closure_valid, measurement_jump_clamped=jump,
+                raw_motion_evidence=raw_motion_evidence,
                 allow_motion_memory=allow_motion_memory,
+                allow_motion_memory_endpoint_fallback=allow_motion_memory_endpoint_fallback,
+                motion_memory_rotation_bound=motion_memory_rotation_bound,
                 raw_distance_m=braking_raw_distance_m,
+                depth_expiry_recovery_step_sec=depth_expiry_recovery_step_sec,
+                depth_expiry_execution_anchor=depth_expiry_execution_anchor,
+                depth_expiry_expected_uid=depth_expiry_expected_uid,
+                fresh_grant_recovery_step_sec=fresh_grant_recovery_step_sec,
+                execution_recovery_proof=execution_recovery_proof,
+                execution_recovery_uid=execution_recovery_uid,
             )
             scale = 60./c.pi_profile.wheel_circumference_m
             if result.status == "duplicate" and self.last_result is not None:
@@ -252,6 +337,43 @@ class LongitudinalDistancePid:
                 pi_motion_uncertainty_m_s=result.motion_uncertainty_m_s,
                 pi_brake_recovery_limited=result.brake_recovery_limited,
                 pi_brake_recovery_anchor_rpm=result.brake_recovery_anchor_rpm,
+                pi_memory_time_penalty_m_s=result.memory_time_penalty_m_s,
+                pi_memory_rotation_penalty_m_s=result.memory_rotation_penalty_m_s,
+                pi_memory_retained_rate_m_s=result.memory_retained_rate_m_s,
+                pi_memory_endpoint_rate_m_s=result.memory_endpoint_rate_m_s,
+                pi_effective_range_rate_m_s=result.effective_range_rate_m_s,
+                pi_target_velocity_bound_m_s=result.target_velocity_bound_m_s,
+                pi_braking_distance_input_m=result.braking_distance_input_m,
+                pi_brake_settling_limited=result.brake_settling_limited,
+                pi_brake_settling_anchor_rpm=result.brake_settling_anchor_rpm,
+                pi_brake_settling_uncertainty_released=result.brake_settling_uncertainty_released,
+                pi_memory_endpoint_fallback=result.memory_endpoint_fallback,
+                pi_memory_endpoint_cap_rpm=result.memory_endpoint_cap_rpm,
+                pi_final_limit_reason=result.final_limit_reason,
+                pi_pre_settling_cap_rpm=result.pre_settling_cap_rpm,
+                pi_execution_anchor_rpm=result.execution_anchor_rpm,
+                pi_execution_ramp_dt_sec=result.execution_ramp_dt_sec,
+                pi_ramp_output_rpm=result.ramp_output_rpm,
+                pi_brake_recovery_cap_rpm=result.brake_recovery_cap_rpm,
+                pi_pre_quantization_rpm=result.pre_quantization_rpm,
+                pi_motion_window_used=result.motion_window_used,
+                pi_motion_window_target_speed_m_s=result.motion_window_target_speed_m_s,
+                pi_motion_window_span_sec=result.motion_window_span_sec,
+                pi_motion_window_range_rate_m_s=result.motion_window_range_rate_m_s,
+                pi_depth_expiry_recovery_step_sec=result.depth_expiry_recovery_step_sec,
+                pi_depth_expiry_recovery_used=result.depth_expiry_recovery_used,
+                pi_depth_expiry_completed_anchor_used=result.depth_expiry_completed_anchor_used,
+                pi_depth_expiry_completed_anchor_rpm=result.depth_expiry_completed_anchor_rpm,
+                pi_fresh_grant_recovery_step_sec=result.fresh_grant_recovery_step_sec,
+                pi_fresh_grant_recovery_used=result.fresh_grant_recovery_used,
+                pi_stationary_preview_status=result.stationary_preview_status,
+                pi_stationary_preview_cap_rpm=result.stationary_preview_cap_rpm,
+                pi_stationary_preview_loss_rpm=result.stationary_preview_loss_rpm,
+                pi_stationary_preview_margin_m=result.stationary_preview_margin_m,
+                pi_stationary_preview_required_stop_m=result.stationary_preview_required_stop_m,
+                pi_braking_assessment=result.braking_assessment,
+                pi_execution_recovery_anchor_used=result.execution_recovery_anchor_used,
+                pi_brake_settling_preview_released=result.brake_settling_preview_released,
             )
             if result.status not in {"stale_sample", "out_of_order", "execution_out_of_order",
                                      "suspended_duplicate", "measurement_jump", "continuation_only"}:
@@ -469,6 +591,13 @@ def encoder_yaw_rate_right_dps(
 @dataclass(frozen=True)
 class VisualSteeringPidConfig:
     enabled: bool = False
+    image_error_only: bool = False
+    image_brake_assist: bool = False
+    image_capture_motion: bool = False
+    image_motion_response_sec: float = 0.18
+    execution_response_trial_sec: float = 0.0
+    image_slow_brake_continuity_sec: float = 0.0
+    image_center_release_margin_deg: float = 1.8
     camera_hfov_deg: float = 90.0
     camera_latency_sec: float = 0.13
     deadband_deg: float = 1.5
@@ -510,6 +639,15 @@ class VisualSteeringPidConfig:
     predictive_brake_decel_dps2: float = 0.0
     predictive_brake_margin_deg: float = 0.0
     predictive_brake_response_sec: float = 0.0
+    image_brake_latency_max_sec: float = .25
+    # Small, temporary opposite-side brake before the target crosses center.
+    # Zero preserves coast-only behavior for library callers.
+    predictive_countersteer_max_correction_rpm: float = 0.0
+    predictive_countersteer_min_correction_rpm: float = 0.0
+    predictive_countersteer_gain_rpm_per_dps: float = 0.10
+    # Executor's bounded opposite-speed braking phase, pivot profile only.
+    predictive_countersteer_response_sec: float = 0.0
+    predictive_countersteer_min_yaw_rate_dps: float = 8.0
     min_effective_error_deg: float = 0.0
     min_effective_correction_rpm: float = 0.0
     mechanical_tier2_error_deg: float = 0.0
@@ -578,6 +716,16 @@ class VisualSteeringPidResult:
     correction_policy_limit_rpm: Optional[float] = None
     forward_tracking_active: bool = False
     forward_phase: str = "legacy"
+    outward_lead: Optional[OutwardTrajectoryLead] = None
+    post_park_recenter: bool = False
+    braking_image_rate_dps: Optional[float] = None
+    outward_continuity_rate_dps: Optional[float] = None
+    # Pre-quantization evidence, not a phase label. Missing for legacy modes.
+    position_demand_rpm: Optional[float] = None
+    brake_reduction_rpm: Optional[float] = None
+    brake_continuity_reason: str = "none"
+    brake_continuity_elapsed_sec: float = 0.0
+    brake_continuity_remaining_sec: float = 0.0
 
 
 class VisualSteeringPid:
@@ -602,8 +750,26 @@ class VisualSteeringPid:
         self._reversal_settle_quiet_frames = 0
         self.last_result: Optional[VisualSteeringPidResult] = None
         self._forward_direction_since: Optional[float] = None
+        self._image_center_held = False
+        self._image_motion_observation_ts: Optional[float] = None
+        self._image_outward_observation = None
+        self._image_brake_observation_started: Optional[float] = None
+        self._image_brake_observation_spent = False
+        self._image_brake_observation_direction = 0
 
     def reset(self) -> None:
+        self._image_center_held = False
+        self._image_motion_observation_ts = None
+        self._image_outward_observation = None
+        # Quality/mode churn can reset this numerical PID every camera frame.
+        # Drop all positive evidence, but don't turn a used observation budget
+        # into a new 150 ms permission. Only new measured outward motion may
+        # rearm it. This retained bit can only DENY, including on a new UID.
+        spent = bool(self._image_brake_observation_spent
+                     or self._image_brake_observation_started is not None)
+        self._image_brake_observation_started = None
+        self._image_brake_observation_spent = spent
+        self._image_brake_observation_direction = 0
         self._last_ts = None
         self._forward_direction_since = None
         self._filtered_error_deg = 0.0
@@ -636,12 +802,19 @@ class VisualSteeringPid:
         target_rate_feedforward_max_dps_override: Optional[float] = None,
         target_speed_match_max_closing_dps_override: Optional[float] = None,
         forward_tracking: bool = False,
+        braking_image_rate_dps: Optional[float] = None,
+        outward_continuity_rate_dps: Optional[float] = None,
     ) -> VisualSteeringPidResult:
         c = self.config
         now = time.monotonic() if now is None else float(now)
         visual_error_deg = (max(0.0, min(1.0, float(x_ratio))) - 0.5) * max(
             1.0, float(c.camera_hfov_deg)
         )
+        if c.image_error_only:
+            return self._image_error_output(visual_error_deg, base_rpm, feedback, now,
+                                            max_correction_override_rpm, visual_age_sec,
+                                            target_image_rate_dps, braking_image_rate_dps,
+                                            outward_continuity_rate_dps, forward_tracking)
 
         feedback_age_sec: Optional[float] = None
         feedback_used = False
@@ -653,6 +826,8 @@ class VisualSteeringPid:
                 feedback.trustworthy
                 and feedback_age_sec <= max(0.05, float(c.feedback_stale_sec))
                 and math.isfinite(float(feedback.yaw_rate_right_dps))
+                and (abs(float(feedback.yaw_rate_right_dps)) <= float(c.max_yaw_rate_dps)
+                     or getattr(feedback, "yaw_rate_confirmed", True))
             )
             if feedback_used:
                 measured_rate = float(feedback.yaw_rate_right_dps)
@@ -1389,6 +1564,319 @@ class VisualSteeringPid:
             ),
             forward_tracking_active=forward_tracking,
             forward_phase=forward_phase,
+        )
+        self.last_result = result
+        return result
+
+    def _image_error_output(self, error, base_rpm, feedback, now, override, visual_age_sec=None,
+                            target_image_rate_dps=None, braking_image_rate_dps=None,
+                            outward_continuity_rate_dps=None, forward_tracking=False):
+        """Position owns direction; optional qualified yaw only tapers demand.
+
+        No frame reuse integration, opposite kick or angular-rate servo.
+        Caller still owns identity, TTL, longitudinal authority and actual
+        wheel reversal safety. Without brake assist the legacy map is intact.
+        """
+        c = self.config
+        rate_valid = bool(c.image_brake_assist and c.image_capture_motion
+            and target_image_rate_dps is not None and math.isfinite(float(target_image_rate_dps))
+            and abs(float(target_image_rate_dps)) <= 120
+            and visual_age_sec is not None and math.isfinite(float(visual_age_sec))
+            and 0 <= float(visual_age_sec) <= .25)
+        image_rate = float(target_image_rate_dps) if rate_valid else 0.0
+        forward_outward = False
+        limit = max(0.0, float(c.max_correction_rpm))
+        if override is not None:
+            limit = min(limit, max(0.0, float(override)))
+        deadband = max(0.0, float(c.deadband_deg))
+        small = max(deadband, float(c.dynamic_small_error_deg))
+        large = max(small + .01, float(c.dynamic_large_error_deg))
+        floor = min(limit, max(0.0, float(c.dynamic_small_max_correction_rpm)))
+        blend = max(0.0, min(1.0, (abs(error) - small) / (large - small)))
+        magnitude = min(limit, floor + blend * (limit - floor))
+        center_hold = abs(error) <= deadband + 1e-9
+        brake_used, predictive, stopping, latency = False, False, 0.0, 0.0
+        # This trial replaces the old actuator/deceleration model, not adds
+        # another 350ms on top. Image age and the existing dispatch budget
+        # remain separate; no sleep, queued commands or extended authority.
+        response_trial = max(0., min(.5, c.execution_response_trial_sec))
+        phase = "image_error_only"
+        if c.image_brake_assist:
+            # Continuous position curve: no 0 -> 5 RPM step at the band edge.
+            magnitude = limit * max(0.0, min(1.0, (abs(error)-deadband)/(large-deadband)))
+            if center_hold:
+                self._image_center_held = True
+            elif abs(error) > deadband + max(0.0, c.image_center_release_margin_deg):
+                self._image_center_held = False
+            center_hold = center_hold or self._image_center_held
+            phase = "image_brake_assist:no_qualified_yaw"
+        position_demand = magnitude
+        measured, age = 0.0, None
+        if feedback is not None:
+            value = float(feedback.yaw_rate_right_dps)
+            if math.isfinite(value):
+                measured = value
+            age = max(0.0, now - float(feedback.timestamp))
+        if c.image_brake_assist and feedback is not None:
+            raw = getattr(feedback, "raw_yaw_rate_right_dps", None)
+            stamp = float(feedback.timestamp)
+            values = (measured, stamp, feedback.left_forward_rpm, feedback.right_forward_rpm)
+            qualified = bool(feedback.trustworthy and raw is not None
+                and all(math.isfinite(float(v)) for v in (*values, raw))
+                and 0 <= now-stamp <= .10 and abs(measured-float(raw)) <= 10.0
+                and measured * float(raw) > 0 and max(abs(measured), abs(float(raw))) <= 90
+                and (abs(float(raw)) <= float(c.max_yaw_rate_dps)
+                     or getattr(feedback, "yaw_rate_confirmed", True)))
+            # The filter lags during acceleration (CAP170..175). Once both
+            # agree in sign and within the bounded tolerance, use the fresh
+            # interval for braking, not the smaller/older filtered velocity.
+            # This estimate only reduces same-side RPM; it never drives yaw.
+            closing = abs(float(raw)) if qualified and error*measured > 0 else 0.0
+            # CAP266..302/379: yaw is chassis motion, not target closing.
+            # While actually following forward, a fresh three-capture rate
+            # can prove that a FAR target is still moving OUTWARD despite
+            # the turn. In this narrow case retain the position request, not
+            # the old 4 RPM continuity floor. Keep the original conservative
+            # model near center, while parked, with incomplete crop evidence,
+            # unknown/inward motion, or yaw beyond the normal rate limit.
+            # The producer certifies capture continuity; this consumes it
+            # only within its original 250 ms age, never renewing a lease.
+            forward_outward = bool(forward_tracking and base_rpm > limit
+                and qualified and closing > 0 and rate_valid and not center_hold
+                and min(feedback.left_forward_rpm, feedback.right_forward_rpm) >= 0
+                and abs(error) >= max(16., deadband + 6.)
+                and 3 <= abs(image_rate) <= 60 and image_rate * error > 0
+                and max(abs(measured), abs(float(raw))) <= c.max_yaw_rate_dps)
+            if forward_outward:
+                closing = 0.0
+                phase = "image_forward_outward_tracking"
+            decel = max(0.0, c.predictive_brake_decel_dps2)
+            if closing > 0 and decel > 0:
+                brake_used = True
+                # Current fresh, agreeing yaw only reduces SAME-SIDE demand.
+                # It never flips direction or grants longitudinal motion.
+                latency = c.camera_latency_sec if visual_age_sec is None else max(0.0, float(visual_age_sec))
+                latency = min(max(.25, min(.5, c.image_brake_latency_max_sec)),
+                              max(0.0, latency) + max(0.0, c.predictive_brake_response_sec)
+                              + max(0.0, min(.08, c.predictive_countersteer_response_sec)))
+                stopping = closing * latency + closing * closing / (2*decel)
+                if response_trial:
+                    image_age = c.camera_latency_sec if visual_age_sec is None else max(0., visual_age_sec)
+                    latency = image_age + max(0., min(.1, c.predictive_brake_response_sec)) + response_trial
+                    stopping = closing * latency
+                available = max(0.0, abs(error)-deadband-max(0.0, c.predictive_brake_margin_deg))
+                factor = max(0.0, min(1.0, (available-stopping)/max(1.0, .5*stopping)))
+                magnitude *= factor
+                predictive = factor == 0 and not center_hold
+                phase = "image_brake_assist:" + ("predictive_stop" if predictive else "taper")
+        closing_image = max(0., -image_rate * (1 if error > 0 else -1))
+        if rate_valid and closing_image > 0 and not center_hold:
+            # Relative image motion already contains chassis rotation. Do not
+            # add it to yaw, nor apply yaw deceleration to person motion.
+            image_latency = (float(visual_age_sec) + min(.3, max(0., c.image_motion_response_sec))
+                             + max(0.0, min(.08, c.predictive_countersteer_response_sec)))
+            if response_trial:
+                image_latency = (float(visual_age_sec)
+                    + max(0., min(.1, c.predictive_brake_response_sec)) + response_trial)
+            image_travel = closing_image * image_latency
+            available = max(0., abs(error)-deadband-max(0., c.predictive_brake_margin_deg))
+            factor = max(0., min(1., (available-image_travel)/max(1., .5*image_travel)))
+            # Both estimates can only taper the original position demand;
+            # using min avoids counting the same physical motion twice.
+            position_magnitude = limit * max(0., min(1., (abs(error)-deadband)/(large-deadband)))
+            magnitude = min(magnitude, position_magnitude * factor)
+            predictive = predictive or factor == 0
+            if image_travel >= stopping:
+                stopping, latency = image_travel, image_latency
+                phase = "image_visual_brake:" + ("predictive_stop" if predictive else "taper")
+        # Record actual taper BEFORE bounded continuity can restore a small
+        # output. Even a sub-RPM taper must not be amplified after rounding.
+        brake_reduction = max(0., position_demand-magnitude)
+        # CAP660: slow residual yaw is not proof the moving person will reach
+        # center. Preserve only a tiny same-side correction when a qualified
+        # capture-time visual rate predicts it stays outside center for 0.5s.
+        # This is NOT a minimum motor-on time and never renews a visual lease.
+        horizon = max(0.0, min(.5, c.image_slow_brake_continuity_sec))
+        if (horizon > 0 and predictive and brake_used and rate_valid and not center_hold
+                and abs(float(feedback.raw_yaw_rate_right_dps)) <= 10.0
+                and abs(error) - closing_image * (float(visual_age_sec) + horizon)
+                    > deadband + .5):
+            position_magnitude = limit * max(0.0, min(1.0, (abs(error)-deadband)/(large-deadband)))
+            magnitude = min(2.0, position_magnitude)
+            predictive = False
+            phase = "image_brake_assist:slow_visual_continuity"
+        turnaround_used = bool(brake_used and c.image_capture_motion and not center_hold
+            and not rate_valid and braking_image_rate_dps is not None
+            and math.isfinite(float(braking_image_rate_dps))
+            and 3 <= abs(braking_image_rate_dps) <= 60 and braking_image_rate_dps*error < 0
+            and visual_age_sec is not None and math.isfinite(float(visual_age_sec))
+            and 0 <= visual_age_sec <= .25)
+        if turnaround_used:
+            # Reduce same-side demand by at least one quarter of the position
+            # request. This cue cannot certify a lead or opposite brake pulse.
+            position_magnitude = limit * max(0., min(1., (abs(error)-deadband)/(large-deadband)))
+            magnitude = min(magnitude, .75*position_magnitude)
+            phase = "image_inward_turnaround_taper"
+        brake_reduction = max(brake_reduction, position_demand-magnitude)
+        # CAP61..97: body yaw alone cannot prove a moving target is centering.
+        # Do not remove the brake envelope: preserve only a small same-side
+        # demand when three capture-time observations prove outward motion.
+        # Limited crop evidence has its own provenance and lower ceiling; it
+        # never becomes target_rate_valid or enables lead/countersteer/boost.
+        crop_rate = outward_continuity_rate_dps
+        crop_valid = bool(c.image_capture_motion and not rate_valid
+            and crop_rate is not None and math.isfinite(float(crop_rate))
+            and 1 <= abs(float(crop_rate)) <= 60 and float(crop_rate)*error > 0
+            and visual_age_sec is not None and math.isfinite(float(visual_age_sec))
+            and 0 <= visual_age_sec <= .25)
+        outward_valid = bool(rate_valid and 3 <= abs(image_rate) <= 60 and image_rate*error > 0)
+        if (brake_used and not center_hold and abs(error) > deadband + 3
+                and abs(float(feedback.raw_yaw_rate_right_dps)) <= 40
+                and (outward_valid or crop_valid)
+                and not turnaround_used):
+            position_magnitude = limit * max(0., min(1., (abs(error)-deadband)/(large-deadband)))
+            bounded = min(4. if outward_valid else 2., position_magnitude)
+            if magnitude < bounded:
+                magnitude, predictive = bounded, False
+                phase = ("image_outward_continuity" if outward_valid
+                         else "image_crop_outward_continuity")
+        continuity_reason, continuity_elapsed, continuity_remaining = "none", 0.0, 0.0
+        if response_trial and c.image_brake_assist and c.image_capture_motion:
+            # CAP361/378: body yaw alone does not measure the person's motion
+            # toward image center. When relative motion is temporarily missing,
+            # one non-renewable observation episode may REDUCE the measured
+            # differential instead of cancelling it completely. It never
+            # supplies a visual lease, forward permission or a fresh rate.
+            stamp = (now-float(visual_age_sec) if visual_age_sec is not None
+                     and math.isfinite(float(visual_age_sec))
+                     and 0 <= float(visual_age_sec) <= .35 else None)
+            ordered = bool(stamp is not None and stamp > 0 and (
+                self._image_motion_observation_ts is None
+                or stamp >= self._image_motion_observation_ts-1e-6))
+            newer = bool(ordered and (self._image_motion_observation_ts is None
+                or stamp > self._image_motion_observation_ts+1e-6))
+            direction = 1 if error > 0 else -1
+            if newer:
+                self._image_motion_observation_ts = stamp
+                if rate_valid:
+                    self._image_outward_observation = ((stamp, direction)
+                        if outward_valid else None)
+                    # Only new measured outward motion rearms the budget.
+                    # Replaying an old rate, or merely seeing another frame
+                    # with unknown motion, cannot restart these 150 ms.
+                    self._image_brake_observation_started = None
+                    self._image_brake_observation_spent = not outward_valid
+                    self._image_brake_observation_direction = direction
+            inward_cue = bool((rate_valid and image_rate*error < 0)
+                or (braking_image_rate_dps is not None
+                    and math.isfinite(float(braking_image_rate_dps))
+                    and braking_image_rate_dps*error < 0))
+            history = self._image_outward_observation
+            historical_outward = bool(ordered and history is not None
+                and history[1] == direction and history[0] <= stamp+1e-6
+                and 0 <= now-history[0] <= .35)
+            fresh_position = bool(ordered and visual_age_sec <= .25
+                and target_image_rate_dps is None
+                and abs(error) >= max(10., deadband+6.))
+            if (center_hold or inward_cue or (brake_used and abs(float(raw)) > 40)
+                    or (self._image_brake_observation_direction
+                        and direction != self._image_brake_observation_direction)):
+                self._image_brake_observation_spent = True
+            started = self._image_brake_observation_started
+            if started is not None:
+                continuity_elapsed = max(0., now-started)
+                continuity_remaining = max(0., .15-continuity_elapsed)
+                if now < started or now-started >= .15:
+                    self._image_brake_observation_spent = True
+            if self._image_brake_observation_spent:
+                continuity_remaining = 0.
+            candidate = bool(base_rpm > 0 and predictive and brake_used and not center_hold
+                and not rate_valid and not inward_cue and ordered
+                and abs(error) > deadband+3. and abs(float(raw)) <= 40
+                and (feedback.left_forward_rpm-feedback.right_forward_rpm)*error > 0
+                and (historical_outward or fresh_position))
+            if candidate:
+                continuity_reason = ("recent_outward_deceleration" if historical_outward
+                                     else "fresh_position_deceleration")
+                # At most one quarter of the *measured* half-wheel difference,
+                # rounded DOWN. This is not an unrelated fixed launch floor.
+                measured_correction = abs(feedback.left_forward_rpm-feedback.right_forward_rpm)/2.
+                reduced = math.floor(min(2., position_demand, measured_correction*.25))
+                if self._image_brake_observation_spent:
+                    continuity_reason = "observation_budget_spent"
+                elif reduced >= 1:
+                    if started is None:
+                        self._image_brake_observation_started = now
+                        self._image_brake_observation_direction = direction
+                        continuity_elapsed, continuity_remaining = 0., .15
+                    magnitude = min(position_demand, float(reduced))
+                    predictive = False
+                    phase = "image_brake_assist:" + continuity_reason
+                else:
+                    continuity_reason = "insufficient_measured_turn"
+        quantized = int(round(magnitude)) if c.image_brake_assist else int(math.floor(magnitude))
+        output = 0 if center_hold else quantized * (1 if error > 0 else -1)
+        countersteer_limit = min(6.0, max(0.0, float(c.predictive_countersteer_max_correction_rpm)))
+        # A stopped person can provide no useful inward image velocity.  Near
+        # the center, however, a fresh low-rate image plus confirmed residual
+        # yaw is enough to start the small opposite-side brake.  Waiting for
+        # an explicit inward image derivative is what let CAP166 coast across
+        # the target before the next frame could request a correction.
+        stationary_near_center = bool(
+            rate_valid
+            and abs(error) <= deadband + max(3.0, float(c.image_center_release_margin_deg))
+            and abs(image_rate) <= max(
+                2.0,
+                min(4.0, float(c.target_speed_match_max_closing_dps) or 4.0),
+            )
+        )
+        inward_motion = bool(rate_valid and image_rate * error < 0.0)
+        countersteer_active = bool(
+            countersteer_limit > 0 and predictive and not center_hold
+            and brake_used and feedback is not None
+            and abs(measured) >= max(0.0, float(c.predictive_countersteer_min_yaw_rate_dps))
+            and (inward_motion or stationary_near_center)
+        )
+        if countersteer_active:
+            # Stop the residual same-side yaw early. This is deliberately
+            # bounded and only enabled while a fresh capture proves either
+            # inward motion or a near-center stationary target; it never
+            # grants forward authority.
+            demand = max(0.0, c.predictive_countersteer_min_correction_rpm,
+                         abs(measured) * max(0.0, c.predictive_countersteer_gain_rpm_per_dps))
+            output = min(int(countersteer_limit), max(1, int(round(demand))))
+            output *= -1 if measured > 0 else 1
+            reason = "predictive_countersteer"
+        else:
+            reason = "center_hold" if center_hold and c.image_brake_assist else "image_center_hold" if center_hold else "predictive_brake_coast" if predictive else "image_error_only"
+        output = max(-int(limit), min(int(limit), output))
+        result = VisualSteeringPidResult(
+            correction_rpm=output, requested_base_rpm=int(base_rpm), base_rpm=int(base_rpm),
+            braking_image_rate_dps=braking_image_rate_dps if turnaround_used else None,
+            outward_continuity_rate_dps=crop_rate if crop_valid else None,
+            position_demand_rpm=position_demand,
+            brake_reduction_rpm=brake_reduction,
+            brake_continuity_reason=continuity_reason,
+            brake_continuity_elapsed_sec=continuity_elapsed,
+            brake_continuity_remaining_sec=continuity_remaining,
+            yaw_rate_limit_dps=0.0, correction_limit_rpm=limit,
+            correction_limit_reason="image_error_only", visual_error_deg=error,
+            compensated_error_deg=error, filtered_error_deg=error, error_rate_dps=0.0,
+            target_rate_valid=rate_valid, target_image_rate_dps=image_rate, target_bearing_rate_dps=0.0,
+            target_rate_feedforward_dps=0.0, target_speed_match_limited=False,
+            target_speed_match_limit_dps=0.0, desired_yaw_rate_dps=0.0,
+            measured_yaw_rate_dps=measured, feedback_age_sec=age,
+            feedback_used=brake_used or forward_outward,
+            feedforward_rpm=0.0, rate_p_rpm=0.0, rate_i_rpm=0.0, unsaturated_rpm=float(output),
+            opposite_yaw_braking=False, same_direction_overspeed_braking=False,
+            visual_direction_guarded=False, predictive_braking=predictive,
+            remaining_error_deg=abs(error), stopping_distance_deg=stopping,
+            prediction_latency_sec=latency, yaw_rate_overshoot_dps=0.0, overspeed_brake_rpm=0.0,
+            edge_boost_active=False, output_floor_rpm=0.0 if c.image_brake_assist else floor if output else 0.0,
+            output_floor_reason=reason,
+            startup_kick_active=False, startup_kick_elapsed_sec=0.0,
+            startup_kick_release_reason="image_error_only", correction_policy_limit_rpm=limit,
+            forward_tracking_active=forward_outward, forward_phase=phase,
         )
         self.last_result = result
         return result

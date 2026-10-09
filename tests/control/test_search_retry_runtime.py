@@ -105,6 +105,13 @@ def test_post_zero_frame_releases_retry_without_new_identity_permission(owner, m
     result = start(owner, monkeypatch)
     owner._apply_search_candidate_gate_decision(result, prepare_only=True)
     owner._search_retry_zero_sent_at = NOW+.11
+    fb = SimpleNamespace(timestamp=NOW+.15, trustworthy=True,
+                         left_forward_rpm=0., right_forward_rpm=0.)
+    owner._action_runtime = SimpleNamespace(get_steering_feedback=lambda: fb)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: NOW+.2)
+    evidence(owner, 647, NOW+.17)
+    assert tick(owner, 647, NOW+.17).pause_rotation
+    fb.timestamp = NOW+.20
     monkeypatch.setattr(runtime.time, "monotonic", lambda: NOW+.3)
     evidence(owner, 648, NOW+.21)
     result = tick(owner, 648, NOW+.21)

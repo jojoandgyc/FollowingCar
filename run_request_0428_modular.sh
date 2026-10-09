@@ -1,6 +1,27 @@
 #!/bin/sh
 set -u
 
+# Set BEFORE any Python/NumPy import. "inherit" is the unchanged-environment
+# A/B baseline; a parent OPENBLAS_NUM_THREADS=8 must not defeat the default.
+FOLLOW_NUMERIC_THREADS="${FOLLOW_NUMERIC_THREADS:-1}"
+case "$FOLLOW_NUMERIC_THREADS" in
+  inherit) ;;
+  1|2|4|8)
+    export OPENBLAS_NUM_THREADS="$FOLLOW_NUMERIC_THREADS"
+    export OMP_NUM_THREADS="$FOLLOW_NUMERIC_THREADS"
+    export MKL_NUM_THREADS="$FOLLOW_NUMERIC_THREADS"
+    export BLIS_NUM_THREADS="$FOLLOW_NUMERIC_THREADS"
+    ;;
+  *) echo "FOLLOW_NUMERIC_THREADS must be inherit, 1, 2, 4 or 8" >&2; exit 2 ;;
+esac
+export FOLLOW_NUMERIC_THREADS
+FOLLOW_KALMAN_SOLVER="${FOLLOW_KALMAN_SOLVER:-numpy}"
+case "$FOLLOW_KALMAN_SOLVER" in
+  numpy|triangular) ;;
+  *) echo "FOLLOW_KALMAN_SOLVER must be numpy or triangular" >&2; exit 2 ;;
+esac
+export FOLLOW_KALMAN_SOLVER
+
 ROOT="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 cd "$ROOT" || exit 1
 
@@ -22,6 +43,9 @@ Usage:
   ./run_request_0428_modular.sh --config config.ini [optional_model_path]
 
 Environment:
+  FOLLOW_NUMERIC_THREADS=1  # default; inherit preserves parent BLAS/OpenMP settings
+  FOLLOW_KALMAN_SOLVER=numpy  # baseline; triangular enables equivalent SciPy solver trial
+  FOLLOW_VIDEO_EXPORT_MP4=1  # post-run MP4 copy; 0 disables, AVI/CSV always retained
   PY=/path/to/python3
   FOLLOW_DISTANCE_P_TRIAL=36  # optional A/B: only longitudinal P; 24, 27 or 36
   FOLLOW_MATCHING_BIAS_TRIAL=5  # optional matching RPM bias experiment: 0, 5, 10
@@ -107,6 +131,24 @@ fi
 if pgrep -f "$REQUEST_SCRIPT" >/dev/null 2>&1; then
   echo "已有跟随车进程正在运行，拒绝轮换记录或重复启动" >&2
   exit 5
+fi
+
+# Serialize this launcher through post-run video export as well. A new car run
+# must not compete with an older run's encoder or prune its input directory.
+# Missing flock disables export only; it must not bypass motor startup checks.
+MP4_SESSION_LOCKED=0
+if command -v flock >/dev/null 2>&1; then
+  SESSION_LOCK="$ROOT/.follow_session.lock"
+  if [ -L "$SESSION_LOCK" ]; then
+    echo "refusing symlink session lock: $SESSION_LOCK" >&2
+    exit 5
+  fi
+  exec 9>>"$SESSION_LOCK"
+  if ! flock -n 9; then
+    echo "已有跟随运行或录像转码尚未结束，请等待或取消转码后再启动" >&2
+    exit 5
+  fi
+  MP4_SESSION_LOCKED=1
 fi
 
 if [ ! -f "$RUN_LOG_PREPARE_SCRIPT" ]; then
@@ -205,6 +247,7 @@ TEE_PID="$!"
   echo "config=$CONFIG"
   echo "python=$PY"
   echo "python_path=${PYTHONPATH:-}"
+  echo "numeric_threads=$FOLLOW_NUMERIC_THREADS openblas=${OPENBLAS_NUM_THREADS:-unset} omp=${OMP_NUM_THREADS:-unset} kalman_solver=$FOLLOW_KALMAN_SOLVER"
   echo "request_script=$REQUEST_SCRIPT"
   echo "log_dir=$LOG_DIR"
   echo "log_file=$LOG_FILE"
@@ -327,4 +370,27 @@ else
 fi
 
 echo "request_0513_modular rc=$RC log_dir=$LOG_DIR log_file=$LOG_FILE"
+
+# This is deliberately AFTER process exit and all safety/shutdown handling.
+# Never run video encoding inside the car process or its 8-second watchdog.
+case "${FOLLOW_VIDEO_EXPORT_MP4:-1}" in
+  0|false|off|no) ;;
+  *)
+    if [ "$RC" -eq 0 ] && [ "$FORCE_TERMINATED" -eq 0 ] && [ -s "$LOG_DIR/camera_raw.avi" ]; then
+      if [ "$MP4_SESSION_LOCKED" -eq 0 ]; then
+        echo "跳过 MP4 转码：缺少 flock，无法隔离下一次小车运行"
+      elif ! grep -Fq "Camera recording closed:" "$LOG_FILE" ||
+           grep -Eq "Camera recording disabled after writer failure|Camera recorder finalize failed" "$LOG_FILE"; then
+        echo "跳过 MP4 转码：录像未完整关闭；原 AVI 保留"
+      else
+        echo "小车进程已退出，开始生成 MP4（可用 Ctrl+C 取消）；原 AVI 保留"
+        if "$PY" -u "$ROOT/tools/export_recording_mp4.py" "$LOG_DIR/camera_raw.avi" >"$LOG_DIR/video_export.log" 2>&1; then
+          echo "MP4 已生成：$LOG_DIR/camera_raw.mp4"
+        else
+          echo "MP4 转码未完成，原 AVI 保留；详情：$LOG_DIR/video_export.log"
+        fi
+      fi
+    fi
+    ;;
+esac
 exit "$RC"

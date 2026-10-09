@@ -3,6 +3,7 @@
 logs/
 *.log
 *.rc
+.follow_session.lock
 .cache/
 run_request_0428_modular_logs/
 sh_logs/

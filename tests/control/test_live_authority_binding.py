@@ -43,7 +43,14 @@ def test_real_binding_handles_next_positive_pi_sample(authority, state, visual):
     assert result.output_rpm > 0  # Not an exception hidden as zero control.
     if state in {"expired", "revoked"}:
         assert result.pi_status == "recovering"
-        assert result.output_rpm <= 27.5
+        if state == "expired":
+            # The old 250ms lease remains expired. This NEW far, same-UID
+            # physical sample may request one measured-speed + 50ms rise step.
+            assert result.pi_depth_expiry_recovery_used
+            assert 27.5 < result.output_rpm <= 27.5 + 240*.05
+        else:
+            assert not result.pi_depth_expiry_recovery_used
+            assert result.output_rpm <= 27.5
     else:
         assert result.pi_status == ("tracking" if state == "live" else "tracking_gap_no_integral")
         assert result.output_rpm >= 40

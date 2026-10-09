@@ -162,6 +162,12 @@ def test_invalid_depth_authority_never_preserves_translation(owner, snapshot, ac
     owner._depth30_linear_snapshot = snapshot
     owner._follow_controller.active_target_id = active_uid
     owner._publish_lateral_zero(_intent(owner), "test")
+    if active_uid != 1:
+        # Old-UID yaw cannot publish into the new UID's action generation.
+        # The real final reader still rejects the old longitudinal grant.
+        assert not owner._queued_calls
+        assert owner._fresh_depth_linear_snapshot(1) is None
+        return
     assert owner._queued_calls[-1][0] == (runtime.ACTION_STOP,)
 
 

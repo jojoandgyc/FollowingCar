@@ -139,6 +139,38 @@ def approach_reference(config: ApproachConfig, *, error_m: float, deadband_m: fl
                           cap, closing, braking_distance, mode)
 
 
+@dataclass(frozen=True)
+class RawDepthMotionEvidence:
+    """Same-window distance/ego motion, not a forward speed request.
+
+    Rotation's conservative upper bound has already been subtracted. The
+    target-speed bound comes from integrating measured ego speed over the
+    SAME intervals as the raw-depth regression. Pairing the regression rate
+    with only the latest wheel speed would invent target acceleration whenever
+    the car accelerates or brakes. Encoder alignment remains caller-validated;
+    this object never renews either a depth or encoder timestamp.
+    """
+    sample_timestamp: float
+    range_rate_m_s: float
+    target_speed_bound_m_s: float
+    span_sec: float
+    sample_count: int
+
+    def valid_for(self, stamp, rate):
+        values = (self.sample_timestamp, self.range_rate_m_s,
+                  self.target_speed_bound_m_s, self.span_sec, stamp, rate)
+        return bool(all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and math.isfinite(v) for v in values)
+                    and self.sample_timestamp == stamp
+                    and abs(self.range_rate_m_s-rate) <= 1e-9
+                    and abs(self.range_rate_m_s) <= 3.
+                    and abs(self.target_speed_bound_m_s) <= 6.
+                    and .025-1e-9 <= self.span_sec <= .30+1e-9
+                    and isinstance(self.sample_count, int)
+                    and not isinstance(self.sample_count, bool)
+                    and 2 <= self.sample_count <= 17)
+
+
 class RawDepthClosingWindow:
     """Shared short physical-depth regression for closure and target velocity.
 
@@ -163,6 +195,14 @@ class RawDepthClosingWindow:
         self.target_speed = None
         self.instant_rate = None
         self.instant_target_speed = None
+
+    def motion_evidence(self):
+        if (not self.samples or self.rate is None or self.target_speed is None
+                or self.status != "raw_depth_window"):
+            return None
+        evidence = RawDepthMotionEvidence(self.samples[-1][0], self.rate,
+                                          self.target_speed, self.span, len(self.samples))
+        return evidence if evidence.valid_for(self.samples[-1][0], self.rate) else None
 
     def update(self, *, uid, stamp, raw, rotation=None, ego_speed=None, feedback_stamp=None):
         if (uid is None or any(v is None or not math.isfinite(v) for v in (stamp, raw))

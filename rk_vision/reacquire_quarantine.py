@@ -47,12 +47,16 @@ class _HeldIdentity:
     stable_timestamp: Optional[float] = None
     center: Optional[float] = None
     area: Optional[float] = None
+    proof_source: Optional[str] = None
+    proof_started_timestamp: Optional[float] = None
 
     def clear_streak(self) -> None:
         self.streak = 0
         self.stable_timestamp = None
         self.center = None
         self.area = None
+        self.proof_source = None
+        self.proof_started_timestamp = None
 
 
 class ReacquireQuarantine:
@@ -141,6 +145,7 @@ class ReacquireQuarantine:
         strong_distance: Any = None,
         center_x_ratio: Any = None,
         area_ratio: Any = None,
+        region_pair_verified: bool = False,
     ) -> QuarantineDecision:
         identity, track = _identifier(uid), _identifier(track_id)
         if identity is None:
@@ -196,7 +201,14 @@ class ReacquireQuarantine:
         if quality_ok is not True or quality_tier != "strong" or match_source != "strong":
             return reject("not_high_quality_strong")
         distance = _finite(strong_distance)
-        if distance is None or distance < 0.0 or distance > self.max_strong_distance:
+        # A qualifying strong sample remains strong when auxiliary evidence
+        # improves. Otherwise normal torso fluctuations around the paired
+        # threshold switch proof types and clear a valid strong streak.
+        # Regional evidence is only the alternative for a full-body distance
+        # that does not independently meet the original strong threshold.
+        regional = bool(region_pair_verified and distance is not None
+                        and self.max_strong_distance < distance <= .30)
+        if distance is None or distance < 0.0 or (distance > self.max_strong_distance and not regional):
             return reject("frozen_strong_distance")
         center, area = _finite(center_x_ratio), _finite(area_ratio)
         if center is None or not 0.0 <= center <= 1.0 or area is None or not 0.0 < area <= 1.0:
@@ -205,6 +217,14 @@ class ReacquireQuarantine:
         # RGB sequence and timestamp, not control ticks, define a new sample.
         if duplicate:
             return QuarantineDecision(True, "duplicate_capture", state.streak, elapsed)
+        proof_source = "region_pair" if regional else "strong"
+        # No accumulation across different proof types. A regional proof uses
+        # five consecutive new samples AND a full second of qualified evidence,
+        # not time spent waiting since the original arm.
+        if state.proof_source != proof_source:
+            state.clear_streak()
+            state.proof_source = proof_source
+            state.proof_started_timestamp = timestamp
         if state.armed_timestamp is None:
             # A missing arm timestamp never becomes an implicit elapsed timer.
             state.armed_timestamp = timestamp
@@ -219,10 +239,13 @@ class ReacquireQuarantine:
                 return reject("geometry_discontinuity")
         state.streak += 1
         state.stable_timestamp, state.center, state.area = timestamp, center, area
-        if state.streak >= self.required_frames and elapsed >= self.min_duration_sec - 1e-9:
+        required_frames = max(5, self.required_frames) if regional else self.required_frames
+        proof_elapsed = timestamp-state.proof_started_timestamp if regional else elapsed
+        if state.streak >= required_frames and proof_elapsed >= self.min_duration_sec - 1e-9:
             self._held.pop(identity)
-            return QuarantineDecision(False, "released", state.streak, elapsed)
+            return QuarantineDecision(False, "released_region_pair" if regional else "released", state.streak, elapsed)
         return QuarantineDecision(
-            True, "minimum_duration" if state.streak >= self.required_frames else "confirming",
+            True, ("region_pair_confirming" if regional else
+                   "minimum_duration" if state.streak >= self.required_frames else "confirming"),
             state.streak, elapsed,
         )

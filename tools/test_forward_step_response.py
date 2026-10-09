@@ -5,6 +5,9 @@ Only --execute plus the interactive STEP confirmation opens the motor port. The
 controller owns acceleration/deceleration: this tool sends 0 -> 60/100 -> 0 RPM,
 without a software ramp. Zero-target stopping is measured; emergency stopping is
 reserved for startup, watchdog failures and final cleanup. No IMU is required.
+Ramp registers are read-only by default. An explicit --acceleration-rpm-s trial
+changes only the shared acceleration register in RAM; it also affects turning,
+is not restored on exit, and lasts until the controller is power-cycled.
 """
 from __future__ import annotations
 
@@ -42,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--execute", action="store_true", help="实际测试；仍需现场输入 STEP")
+    parser.add_argument(
+        "--acceleration-rpm-s", type=int, default=None,
+        help="可选对照值 10..1000 RPM/s：仅临时写共享加速寄存器 0x005F，影响转向；退出不恢复，断电恢复",
+    )
     parser.add_argument("--rpms", default="60,100", help="仅允许 60、100；例如先用 --rpms 60")
     parser.add_argument("--duration", type=float, default=0.8, help="每次阶跃保持秒数，0.2..1.5")
     parser.add_argument("--repeats", type=int, default=1, help="每档重复次数，1..3")
@@ -72,6 +79,9 @@ def validate_args(args: argparse.Namespace) -> list[int]:
         raise ValueError("repeats 必须在 1..3 范围内")
     if args.max_total_travel < args.max_travel:
         raise ValueError("max_total_travel 不得小于 max_travel")
+    acceleration = getattr(args, "acceleration_rpm_s", None)
+    if acceleration is not None and (type(acceleration) is not int or not 10 <= acceleration <= 1000):
+        raise ValueError("acceleration_rpm_s 必须为 10..1000 的整数；省略时只读，不修改斜坡参数")
     return rpms
 
 
@@ -142,7 +152,8 @@ class ForwardSession(HardwareSession):
         self.stop("step_startup")
         self.backend.set_parking_current(0.0, persist=False)
         # Preserve diagnostics even when validation/read fails before the
-        # first trial. These are read-only; never change mode or ramp settings.
+        # first trial. Mode remains read-only; ramp changes require the explicit
+        # CLI-only attribute below, never a configuration/environment override.
         self.controller_diagnostics = {}
         self.bus_status = self.backend.driver.read_bus_status()
         self.controller_diagnostics["bus_status"] = dict(self.bus_status)
@@ -158,9 +169,28 @@ class ForwardSession(HardwareSession):
         print(f"控制器检查：runtime={self.bus_status['runtime_system_mode']} "
               f"configured={configured} control=0x{self.bus_status['control_mode']:02X} "
               f"policy={policy}（不修改模式）")
-        print("驱动器加速/减速寄存器（非实测）："
+        print("驱动器加速/减速寄存器读回（不是实测加速度）："
               f"{self.controller_diagnostics['closed_loop_acceleration']} / "
               f"{self.controller_diagnostics['closed_loop_deceleration']} RPM/s")
+        acceleration = getattr(self, "trial_acceleration_rpm_s", None)
+        if acceleration is not None:
+            from car_control_modular.motor_ramp import configure_closed_loop_ramp, RampConfigurationError
+
+            try:
+                self.controller_diagnostics["ramp_trial"] = configure_closed_loop_ramp(
+                    self.backend.driver, acceleration_rpm_s=acceleration,
+                )
+            except RampConfigurationError as exc:
+                self.controller_diagnostics["ramp_trial"] = exc.diagnostics
+                if exc.write_attempted:
+                    self.backend._record_motion_write_fault("step_ramp_trial", exc)
+                raise
+            trial_diagnostics = self.controller_diagnostics["ramp_trial"]
+            # Existing consumers read these top-level keys as the trial setting.
+            # Keep the pre-trial acceleration under ramp_trial.before_* instead.
+            self.controller_diagnostics["closed_loop_acceleration"] = trial_diagnostics["acceleration_rpm_s"]
+            self.controller_diagnostics["closed_loop_deceleration"] = trial_diagnostics["deceleration_rpm_s"]
+            print(f"加速度对照已读回验证：0x005F={acceleration} RPM/s；0x0060 减速度未改。")
 
     def read_wheel(self, side: str) -> dict[str, Any]:
         started = time.monotonic()
@@ -456,6 +486,13 @@ def main(argv=None) -> int:
           f"每次 {args.duration:.2f}s；0→目标→0，不加软件斜坡。")
     print(f"轮径 {args.wheel_diameter * 100:g}cm；单次/整组编码器路程上限 "
           f"{args.max_travel:g}/{args.max_total_travel:g}m；停车观测最长 {args.settle_timeout:g}s。")
+    if args.acceleration_rpm_s is None:
+        print("斜坡参数默认只读；不从 INI 或环境变量继承加速度修改。")
+    else:
+        print(f"加速度对照计划：0x005F={args.acceleration_rpm_s} RPM/s，使用 0x06 写入，不持久化；"
+              "不修改 0x0060 减速度。")
+        print("0x005F 是双轮共享加速参数，也影响转向；本进程退出不恢复，"
+              "本次通电会保留该值，控制器断电后恢复原持久化值。")
     print("编码器路程并非地面位移真值；串口采样保护不是硬件急停，需平地、足够直线净空及现场急停。")
     if not args.execute:
         print("实际测试须添加 --execute 并现场输入 STEP；建议先 --rpms 60。")
@@ -488,6 +525,7 @@ def main(argv=None) -> int:
         print(f"未启动电机：{exc}", file=sys.stderr)
         return 2
     session = ForwardSession()
+    session.trial_acceleration_rpm_s = args.acceleration_rpm_s
     payload = {"created_at": datetime.now().astimezone().isoformat(), "mode": "forward_step_response",
                "status": "running", "parameters": vars(args), "trials": [], "cleanup_errors": [],
                "measurement_definitions": {"quiet_rpm": QUIET_RPM, "quiet_sec": QUIET_SEC,
@@ -501,7 +539,9 @@ def main(argv=None) -> int:
                          "acceleration is average threshold velocity / elapsed time, not peak acceleration",
                          "stop travel starts at last pre-zero sample; includes its gap to the zero command",
                          "missing crossings are null; normal stopping uses zero speed target",
-                         "100 RPM command ceiling; controller ramp registers are not changed",
+                         "100 RPM command ceiling; ramp registers are read-only unless --acceleration-rpm-s is explicit",
+                         "optional ramp trial writes shared 0x005F in RAM (0x06), affects turning, does not change 0x0060",
+                         "optional acceleration is not restored on exit; controller power-cycle restores persisted value",
                          "parking current remains zero in RAM; previous current is never restored"]}
     previous_handler = signal.getsignal(signal.SIGTERM)
     def terminate(signum, frame):

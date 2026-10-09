@@ -1,4 +1,5 @@
 """Explicit distance PI selection and reversible, hardware-free configuration."""
+import ast
 import os
 from pathlib import Path
 import subprocess
@@ -25,13 +26,49 @@ def test_runtime_profile_explicitly_selects_pi_and_retains_rollback(monkeypatch)
     assert env["DISTANCE_PI_MEMORY_SEC"] == "0.35"
     assert env["DISTANCE_PI_MOTION_MEMORY_SEC"] == "0.35"
     assert env["DISTANCE_PI_LAUNCH_REQUEST_RPM"] == "180"
-    assert env["ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC"] == "0.25"
+    assert env["DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED"] == "1"
+    assert env["ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC"] == "0.30"
     assert loaded.values["distance_pid"]["control_mode"] == "distance_pi"
+
+
+def test_stationary_stop_preview_has_explicit_process_rollback(monkeypatch):
+    env = {"DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED": "0"}
+    monkeypatch.setattr(os, "environ", env)
+    load_config_to_env(str(CONFIG))
+    assert env["DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED"] == "0"
+
+
+def test_stationary_stop_preview_reaches_runtime_policy_without_hardware():
+    result = subprocess.run(
+        [sys.executable, "-c", "import request_0513_modular as r; "
+         "assert r.DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED is True",
+         "--config", str(CONFIG)],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    tree = ast.parse((ROOT / "request_0513_modular.py").read_text())
+    names = [keyword.value.id for node in ast.walk(tree) if isinstance(node, ast.Call)
+             for keyword in node.keywords
+             if keyword.arg == "distance_pi_stationary_stop_preview_enabled"
+             and isinstance(keyword.value, ast.Name)]
+    assert names == ["DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED"]
+
+
+def test_stationary_stop_preview_rejects_invalid_process_override():
+    env = dict(os.environ, DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED="unknown")
+    result = subprocess.run(
+        [sys.executable, "-c", "import request_0513_modular"],
+        cwd=ROOT, env=env, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED must be a boolean" in result.stderr
 
 
 @pytest.mark.parametrize("mode", ["distance_pi", "approach", "legacy"])
 def test_explicit_process_mode_overrides_ini(monkeypatch, mode):
     env = {"FOLLOW_DISTANCE_CONTROL_MODE": mode}
+    if mode != "distance_pi":
+        env["DISTANCE_TARGET_MOTION_CONTROL_ENABLE"] = "1"
     monkeypatch.setattr(os, "environ", env)
     load_config_to_env(str(CONFIG))
     assert env["DISTANCE_CONTROL_MODE"] == mode
@@ -52,6 +89,7 @@ def test_old_config_falls_back_without_requiring_a_new_option(tmp_path, monkeypa
     load_config_to_env(str(config))
     assert env["DISTANCE_CONTROL_MODE"] == expected
     assert "DISTANCE_PI_LAUNCH_REQUEST_RPM" not in env
+    assert "DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED" not in env
 
 
 @pytest.mark.parametrize("mode", ["pi", "DISTANCE_PI", "typo"])
@@ -76,6 +114,8 @@ def test_pi_p_trial_warns_that_it_does_not_tune_forward_pi(monkeypatch):
 @pytest.mark.parametrize("mode,approach", [("distance_pi", False), ("approach", True), ("legacy", False)])
 def test_entrypoint_mode_override_is_effective_without_hardware(mode, approach):
     env = dict(os.environ, FOLLOW_DISTANCE_CONTROL_MODE=mode)
+    if mode != "distance_pi":
+        env["DISTANCE_TARGET_MOTION_CONTROL_ENABLE"] = "1"
     env.pop("FOLLOW_DISTANCE_P_TRIAL", None)
     result = subprocess.run(
         [sys.executable, "-c", "import request_0513_modular as r; "
@@ -98,8 +138,8 @@ def test_entrypoint_rejects_invalid_pi_gain_without_hardware(value):
     assert "DISTANCE_PI_KI_PER_SEC2 must be finite and nonnegative" in result.stderr
 
 
-@pytest.mark.parametrize("requested,expected", [("0.18", .18), ("0.25", .25), ("0.35", .25)])
-def test_forward_grant_ttl_has_explicit_rollback_and_250ms_ceiling(requested, expected):
+@pytest.mark.parametrize("requested,expected", [("0.18", .18), ("0.25", .25), ("0.30", .30), ("0.35", .30)])
+def test_forward_grant_ttl_has_explicit_rollback_and_300ms_ceiling(requested, expected):
     env = dict(os.environ, ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC=requested,
                ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC="0.18")
     env.pop("FOLLOW_DISTANCE_P_TRIAL", None)
@@ -131,7 +171,7 @@ def test_launch_main_profile_is_loaded_by_real_entrypoint(tmp_path):
          "assert r.DISTANCE_PI_LAUNCH_REQUEST_RPM == 180; "
          "assert r.DISTANCE_PI_KP_PER_SEC == 3; "
          "assert r.DISTANCE_PI_MOTION_MEMORY_SEC == .35; "
-         "assert r.ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC == .25", "--config", str(CONFIG)],
+         "assert r.ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC == .30", "--config", str(CONFIG)],
         cwd=ROOT, env=env, capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr

@@ -17,6 +17,7 @@ from .depth_orientation import configure_orientation, read_orientation
 from .depth_torso_selection import allow_sparse_torso_continuation, select_torso_candidate_group
 from .depth_torso_recovery import assess_torso_recovery, torso_evidence_continuous
 from .depth_temporal_filter import append_depth_sample, reset_depth_window
+from .depth_roi_policy import BoundedDepthSelection
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ class AstraDepthMeasurement:
     filter_expired_count: int = 0
     filter_reset_count: int = 0
     filter_window_count: int = 0
+    bounded_roi_selection: Optional[BoundedDepthSelection] = None
 
 
 @dataclass(frozen=True)
@@ -120,8 +122,14 @@ class _DepthClusterCandidate:
     region_name: str
 
 
+class _DepthComputeExpired(RuntimeError):
+    """An optimistic scan's physical sample expired, not a sensor failure."""
+
+
 class AstraDepthRuntime:
     """Own synchronized OpenNI RGB/depth streams and target ROI ranging."""
+
+    supports_bounded_depth_roi = True
 
     def __init__(
         self,
@@ -139,6 +147,7 @@ class AstraDepthRuntime:
         self._depth_orientation = None
         self._depth_lock = threading.Lock()
         self._measurement_lock = threading.RLock()
+        self._measurement_revision = 0
         self._latest_depth = None
         self._latest_depth_ts = 0.0
         self._last_depth_arrival_ts = 0.0
@@ -354,6 +363,8 @@ class AstraDepthRuntime:
         *,
         reference_timestamp: Optional[float] = None,
         use_latest_depth: bool = False,
+        bounded_roi_capture_timestamp: Optional[float] = None,
+        bounded_roi_max_age_sec: float = .25,
     ):
         """Return the Depth frame closest to the RGB capture time.
 
@@ -362,6 +373,23 @@ class AstraDepthRuntime:
         real RGB capture timestamp is available, it is authoritative; the
         configured delay is only a fallback for older callers.
         """
+        if bounded_roi_capture_timestamp is not None:
+            from .depth_roi_policy import bounded_depth_sample_allowed
+            # Admission must use the time the camera lock was obtained, not
+            # an earlier pre-lock snapshot. Waiting cannot admit an old ROI.
+            now = time.monotonic()
+            # Selection and the latest/history snapshot share the camera lock.
+            # Never fall back to a newer frame outside the ROI's 180ms window.
+            candidates = tuple(self._depth_history) + ((self._latest_depth_ts, self._latest_depth),)
+            eligible = [(stamp, frame) for stamp, frame in candidates
+                        if frame is not None and bounded_depth_sample_allowed(
+                            bounded_roi_capture_timestamp, stamp, now, self.config.max_frame_age_sec,
+                            max_roi_age=bounded_roi_max_age_sec)]
+            if not eligible:
+                return None, 0.0, 0.0
+            sample_ts, depth = max(eligible, key=lambda item: item[0])
+            self._measurement_bounded_selected_at = now
+            return depth, float(sample_ts), float(sample_ts)-bounded_roi_capture_timestamp
         if use_latest_depth:
             return (
                 self._latest_depth,
@@ -652,29 +680,85 @@ class AstraDepthRuntime:
         supported[:, :-1] |= mask[:, :-1] & mask[:, 1:]
         return supported
 
-    def _region_cluster_candidates(self, patch, region_name: str) -> list:
+    def _check_measurement_compute_deadline(self) -> None:
+        # Only an optimistic transaction installs this bound. Direct/live
+        # measurement keeps its existing contract and completion validation.
+        # This is an ACTUAL expiry check, never a predicted scan-time budget.
+        max_age = getattr(self, "_transaction_sample_max_age_sec", None)
+        sample_ts = self._measurement_sample_ts
+        if max_age is not None and sample_ts is not None:
+            age = time.monotonic() - float(sample_ts)
+            if not 0. <= age <= min(max_age, float(self.config.max_frame_age_sec)):
+                raise _DepthComputeExpired
+
+    def _mark_measurement_stage(self, stage, *, pixel_scan_started=False):
+        trace = getattr(self, "_transaction_trace", None)
+        if trace is not None:
+            trace.mark_stage(stage, pixel_scan_started=pixel_scan_started)
+
+    def _region_pixel_evidence(self, patch):
         np = self._np
         min_mm = int(round(max(0.0, float(self.config.min_distance_m)) * 1000.0))
         max_mm = int(round(max(float(self.config.min_distance_m), float(self.config.max_distance_m)) * 1000.0))
         valid_mask = (patch >= min_mm) & (patch <= max_mm)
         valid = patch[valid_mask]
+        return valid_mask, valid, self._dynamic_required_pixels(int(patch.size))
+
+    def _region_cluster_candidates(self, patch, region_name: str, *, _pixel_evidence=None) -> list:
+        np = self._np
+        valid_mask, valid, required = (
+            self._region_pixel_evidence(patch) if _pixel_evidence is None else _pixel_evidence
+        )
         total_valid = int(valid.size)
-        required = self._dynamic_required_pixels(int(patch.size))
         if total_valid < required:
             return []
-        values = np.sort(valid.reshape(-1).astype(np.int32, copy=False))
         span_mm = max(
             50,
             int(round(max(0.05, float(self.config.foreground_cluster_span_m)) * 1000.0)),
         )
+        # On a coherent integer-mm torso patch the old sorted-band loop has
+        # exactly one band: every valid pixel. Retain its spatial mask and
+        # median, avoiding a full sort followed by a second median partition.
+        # Noninteger inputs keep the existing int32 band-boundary semantics.
+        if valid.dtype.kind in "ui" and int(valid.max()) - int(valid.min()) <= span_mm:
+            self._check_measurement_compute_deadline()
+            spatial_mask = self._spatial_support_mask(valid_mask, np)
+            spatial_pixels = int(np.count_nonzero(spatial_mask))
+            spatial_fraction = float(spatial_pixels) / float(total_valid)
+            if (spatial_pixels < required or spatial_fraction < max(
+                    0.0, min(1.0, float(self.config.foreground_spatial_support_fraction)))):
+                return []
+            supported_values = valid if spatial_pixels == total_valid else patch[spatial_mask]
+            return [_DepthClusterCandidate(
+                distance_m=float(np.median(supported_values)) / 1000.0,
+                pixels=spatial_pixels, valid_pixels=total_valid, required_pixels=required,
+                spatial_support_fraction=spatial_fraction, region_name=str(region_name),
+            )]
+        values = np.sort(valid.reshape(-1).astype(np.int32, copy=False))
+        # A band beginning at i can have `required` pixels iff its required-th
+        # sorted value lies within span_mm. The old scalar loop retried every
+        # impossible i, potentially thousands of Python/searchsorted calls per
+        # region. Skip those starts in one exact vector operation; accepted
+        # bands, their spatial masks and medians remain unchanged.
+        possible_starts = None
         candidates = []
         index = 0
         while index < total_valid:
+            self._check_measurement_compute_deadline()
             upper = int(values[index]) + span_mm
             end = int(np.searchsorted(values, upper, side="right"))
             if end - index < required:
-                index += 1
-                continue
+                # Most real torso patches immediately have a coherent band.
+                # Do not allocate the vector index on that common path.
+                if possible_starts is None:
+                    possible_starts = np.flatnonzero(
+                        values[required - 1:] - values[:total_valid - required + 1] <= span_mm
+                    )
+                next_start = int(np.searchsorted(possible_starts, index + 1))
+                if next_start >= int(possible_starts.size):
+                    break
+                index = int(possible_starts[next_start])
+                end = int(np.searchsorted(values, int(values[index]) + span_mm, side="right"))
             low_mm = int(values[index])
             high_mm = int(values[end - 1])
             band_mask = valid_mask & (patch >= low_mm) & (patch <= high_mm)
@@ -726,24 +810,15 @@ class AstraDepthRuntime:
         region_valid_total = 0
         required_max = 0
         for name, left, top, right, bottom in regions:
+            self._mark_measurement_stage("torso_region:" + name)
+            self._check_measurement_compute_deadline()
             patch = depth[top:bottom, left:right]
-            region_candidates = self._region_cluster_candidates(patch, name)
-            if region_candidates:
-                region_valid_total += max(item.valid_pixels for item in region_candidates)
-                required_max = max(required_max, max(item.required_pixels for item in region_candidates))
-                candidates.extend(region_candidates)
-            else:
-                min_mm = int(round(max(0.0, float(self.config.min_distance_m)) * 1000.0))
-                max_mm = int(round(max(float(self.config.min_distance_m), float(self.config.max_distance_m)) * 1000.0))
-                region_valid_total += int(self._np.count_nonzero(
-                    (patch >= min_mm) & (patch <= max_mm)
-                ))
-                required_max = max(required_max, self._dynamic_required_pixels(int(patch.size)))
-            region_valid = int(self._np.count_nonzero(
-                (patch >= int(round(max(0.0, float(self.config.min_distance_m)) * 1000.0)))
-                & (patch <= int(round(max(float(self.config.min_distance_m), float(self.config.max_distance_m)) * 1000.0)))
-            ))
-            region_required = self._dynamic_required_pixels(int(patch.size))
+            evidence = self._region_pixel_evidence(patch)
+            region_candidates = self._region_cluster_candidates(patch, name, _pixel_evidence=evidence)
+            region_valid, region_required = int(evidence[1].size), evidence[2]
+            region_valid_total += region_valid
+            required_max = max(required_max, region_required)
+            candidates.extend(region_candidates)
             self._measurement_regions.append({
                 "name": name, "roi": [left, top, right, bottom],
                 "pixels": int(patch.size), "valid": region_valid,
@@ -769,6 +844,7 @@ class AstraDepthRuntime:
                     "none" if best_distance is None else "%.3fm" % float(best_distance),
                 )
             )
+        self._mark_measurement_stage("torso_consensus")
         if not candidates:
             now = time.monotonic()
             if now - self._last_region_log_ts >= max(0.1, float(self.config.log_every_sec)):
@@ -846,6 +922,7 @@ class AstraDepthRuntime:
 
     def _select_foreground_cluster(self, valid):
         """Return the closest coherent depth surface in the person torso ROI."""
+        self._check_measurement_compute_deadline()
         values = self._np.sort(valid.reshape(-1).astype(self._np.int32, copy=False))
         total = int(values.size)
         min_fraction = max(
@@ -913,6 +990,7 @@ class AstraDepthRuntime:
         bottom: int,
     ) -> Tuple[Optional[float], int, int, int]:
         """Measure the target from robust central samples in a 16x16 patch."""
+        self._check_measurement_compute_deadline()
         np = self._np
         patch_size = max(4, int(self.config.center_patch_size))
         keep_count = max(1, int(self.config.center_patch_keep_count))
@@ -985,6 +1063,10 @@ class AstraDepthRuntime:
             return "far_background_guard_bbox"
         return None
 
+    def prepare_target_measurement(self, bbox, frame_width, frame_height, **kwargs):
+        from .depth_measurement_transaction import DepthMeasurementTransaction
+        return DepthMeasurementTransaction.begin(self, (bbox, frame_width, frame_height), kwargs)
+
     def measure_target(
         self,
         bbox: Tuple[float, float, float, float],
@@ -996,12 +1078,19 @@ class AstraDepthRuntime:
         steering_feedback=None,
         reference_timestamp: Optional[float] = None,
         evidence_capture_frame_id: Optional[int] = None,
+        bounded_roi_capture_timestamp: Optional[float] = None,
+        bounded_roi_max_age_sec: float = .25,
     ) -> AstraDepthMeasurement:
         # Search reacquisition can also measure outside the main control
         # mutex. Keep sample deduplication, filtering and confirmation atomic.
         with self._measurement_lock:
+            # Every live attempt invalidates older optimistic snapshots,
+            # including duplicate samples and attempts that raise exceptions.
+            self._measurement_revision += 1
             started = time.monotonic()
             self._measurement_sample_ts = None
+            self._measurement_bounded_selection = None
+            self._measurement_bounded_selected_at = None
             self._measurement_temporal_status = "no_sample"
             self._last_torso_selection = None
             self._measurement_regions = []
@@ -1011,11 +1100,18 @@ class AstraDepthRuntime:
             self._measurement_torso_recovery_status = "not_evaluated"
             self._measurement_filter_expired_count = 0
             self._measurement_filter_reset_count = 0
+            bounded_kwargs = ({} if bounded_roi_capture_timestamp is None else {
+                "bounded_roi_capture_timestamp": bounded_roi_capture_timestamp,
+                "bounded_roi_max_age_sec": bounded_roi_max_age_sec,
+                "evidence_capture_frame_id": evidence_capture_frame_id,
+            })
             result = self._measure_target_locked(
                 bbox, frame_width, frame_height, target_id=target_id,
                 use_latest_depth=use_latest_depth, steering_feedback=steering_feedback,
                 reference_timestamp=reference_timestamp,
+                **bounded_kwargs,
             )
+            self._mark_measurement_stage("reporting")
             # Only a genuinely new failed observation breaks the accepted
             # torso shortcut. Old/duplicate reads cannot revoke newer evidence.
             if result.raw_distance_m is None and (
@@ -1024,7 +1120,23 @@ class AstraDepthRuntime:
                 or (use_latest_depth and self._measurement_temporal_status == "no_sample")
             ):
                 self._last_torso_recovery_evidence = None
-            source = "latest" if use_latest_depth else "rgb_aligned"
+            source = ("roi_bounded_history" if bounded_roi_capture_timestamp is not None
+                      else "latest" if use_latest_depth else "rgb_aligned")
+            if bounded_roi_capture_timestamp is not None:
+                selection = self._measurement_bounded_selection
+                self.logger.info(
+                    "Depth ROI bounded history: capture=%s roi_capture_ts=%s sample_ts=%s "
+                    "skew_ms=%s latest_ts=%s selected_ts=%s selection_roi_age_ms=%s "
+                    "completion_roi_age_ms=%.1f physical_deadline_unchanged=True",
+                    evidence_capture_frame_id, bounded_roi_capture_timestamp, self._measurement_sample_ts,
+                    None if self._measurement_sample_ts is None else
+                    (self._measurement_sample_ts-bounded_roi_capture_timestamp)*1000.,
+                    self._latest_depth_ts,
+                    None if selection is None else selection.selected_timestamp,
+                    None if selection is None else
+                    (selection.selected_timestamp-bounded_roi_capture_timestamp)*1000.,
+                    (time.monotonic()-bounded_roi_capture_timestamp)*1000.,
+                )
             result = replace(
                 result, observation_sample_timestamp=self._measurement_sample_ts,
                 observation_source=source, temporal_status=self._measurement_temporal_status,
@@ -1035,6 +1147,7 @@ class AstraDepthRuntime:
                 filter_expired_count=self._measurement_filter_expired_count,
                 filter_reset_count=self._measurement_filter_reset_count,
                 filter_window_count=len(self._distance_history),
+                bounded_roi_selection=self._measurement_bounded_selection,
             )
             finished = time.monotonic()
             if (result.sample_timestamp is not None and result.raw_distance_m is not None
@@ -1124,7 +1237,11 @@ class AstraDepthRuntime:
         use_latest_depth: bool = False,
         steering_feedback=None,
         reference_timestamp: Optional[float] = None,
+        bounded_roi_capture_timestamp: Optional[float] = None,
+        bounded_roi_max_age_sec: float = .25,
+        evidence_capture_frame_id: Optional[int] = None,
     ) -> AstraDepthMeasurement:
+        self._mark_measurement_stage("sample_selection")
         now = time.monotonic()
         current_target_id = None if target_id is None else int(target_id)
         if current_target_id != self._last_target_id:
@@ -1147,12 +1264,39 @@ class AstraDepthRuntime:
                 now,
                 reference_timestamp=reference_timestamp,
                 use_latest_depth=bool(use_latest_depth),
+                **({} if bounded_roi_capture_timestamp is None else
+                   {"bounded_roi_capture_timestamp": bounded_roi_capture_timestamp,
+                    "bounded_roi_max_age_sec": bounded_roi_max_age_sec}),
             )
+        if bounded_roi_capture_timestamp is not None:
+            # The camera lock may have blocked while a new frame arrived.
+            # All following age/hold checks must use post-selection time,
+            # never the earlier function-entry time (which can predate it).
+            now = time.monotonic()
         if depth is None or not math.isfinite(float(sample_ts)) or sample_ts <= 0.0:
             if use_latest_depth:
                 self._reset_pending_jump()
-            return self._held_measurement(now, "no_depth_frame")
+            return self._held_measurement(now, "no_bounded_roi_depth_frame"
+                                          if bounded_roi_capture_timestamp is not None else "no_depth_frame")
         self._measurement_sample_ts = float(sample_ts)
+        self._mark_measurement_stage("sample_validation")
+        if bounded_roi_capture_timestamp is not None:
+            self._measurement_bounded_selection = BoundedDepthSelection(
+                capture_timestamp=bounded_roi_capture_timestamp,
+                sample_timestamp=float(sample_ts),
+                selected_timestamp=getattr(self, "_measurement_bounded_selected_at", None),
+                target_id=current_target_id, capture_frame_id=evidence_capture_frame_id,
+                bbox=tuple(bbox),
+                max_roi_age_sec=bounded_roi_max_age_sec,
+            )
+            if not self._measurement_bounded_selection.valid_for(
+                capture_timestamp=bounded_roi_capture_timestamp, sample_timestamp=sample_ts,
+                now=now, target_id=current_target_id, capture_frame_id=evidence_capture_frame_id,
+                bbox=bbox, max_sample_age=self.config.max_frame_age_sec,
+            ):
+                self._measurement_temporal_status = "bounded_selection_invalid"
+                self._measurement_bounded_selection = None
+                return self._held_measurement(now, "invalid_bounded_roi_selection")
         previous_attempt_ts = self._last_processed_depth_ts
         sample_age = now - sample_ts
         if sample_age < 0.0 or sample_age > max(0.01, float(self.config.max_frame_age_sec)):
@@ -1202,8 +1346,10 @@ class AstraDepthRuntime:
                 else "reused_depth_frame", rejection_reason="reused_depth_frame",
             )
 
+        self._check_measurement_compute_deadline()
         self._update_encoder_motion(steering_feedback)
 
+        self._mark_measurement_stage("roi_geometry")
         left, top, right, bottom = self._scaled_target_roi(
             bbox,
             frame_width,
@@ -1215,6 +1361,7 @@ class AstraDepthRuntime:
         roi = depth[top:bottom, left:right]
         min_mm = int(round(max(0.0, float(self.config.min_distance_m)) * 1000.0))
         max_mm = int(round(max(float(self.config.min_distance_m), float(self.config.max_distance_m)) * 1000.0))
+        self._mark_measurement_stage("roi_pixels", pixel_scan_started=True)
         valid = roi[(roi >= min_mm) & (roi <= max_mm)]
         valid_pixels = int(valid.size)
         required_valid_pixels = self._dynamic_required_pixels(int(roi.size))
@@ -1253,6 +1400,7 @@ class AstraDepthRuntime:
             frame_height,
             anchor_age_sec,
         )
+        self._mark_measurement_stage("distance_validation")
         if valid_pixels < required_valid_pixels:
             sparse_continuation = allow_sparse_torso_continuation(
                 self._last_torso_selection,
@@ -1282,9 +1430,10 @@ class AstraDepthRuntime:
             valid_pixels = foreground_pixels
             required_valid_pixels = region_required_pixels
         required_valid_pixels = max(required_valid_pixels, region_required_pixels)
-        _center_patch_distance, center_patch_valid, center_patch_pixels, center_patch_kept = (
-            self._select_center_patch_distance(depth, left, top, right, bottom)
-        )
+        # The central-patch distance is not a control input. Its three counts
+        # are only logged below, where the same patch is already extracted.
+        # Keep the former helper's expiry check at this exact boundary.
+        self._check_measurement_compute_deadline()
         measurement_detail = (
             "depth_torso_continuation" if self._measurement_sparse else "depth_multiregion"
         )
@@ -1476,7 +1625,17 @@ class AstraDepthRuntime:
                     region_count=region_count,
                 )
         sampled_now = time.monotonic()
-        if not 0.0 <= sampled_now - sample_ts <= max(0.01, float(self.config.max_frame_age_sec)):
+        bounded_sample_valid = True
+        if bounded_roi_capture_timestamp is not None:
+            selection = self._measurement_bounded_selection
+            bounded_sample_valid = isinstance(selection, BoundedDepthSelection) and selection.valid_for(
+                capture_timestamp=bounded_roi_capture_timestamp, sample_timestamp=sample_ts,
+                now=sampled_now, target_id=current_target_id,
+                capture_frame_id=evidence_capture_frame_id, bbox=bbox,
+                max_sample_age=self.config.max_frame_age_sec,
+            )
+        if (not bounded_sample_valid or
+                not 0.0 <= sampled_now - sample_ts <= max(0.01, float(self.config.max_frame_age_sec))):
             self._measurement_temporal_status = "expired_during_sampling"
             if is_new_depth and not out_of_order:
                 self._reset_pending_jump()
@@ -1503,22 +1662,35 @@ class AstraDepthRuntime:
             float(self.config.anchor_expire_age_sec),
         )
         # A continuous torso moving across 2.5m is not a new background
-        # surface. This narrow boundary path requires proof on BOTH endpoints;
-        # it does not bootstrap identity, renew a stale anchor or admit jumps.
+        # surface. Compare physical raw samples, not a lagging median paired
+        # with the newest timestamp. The filter already keeps accepted raw
+        # values/times atomically (including optimistic Depth30 commits); do
+        # not create a second independently renewable authority/anchor clock.
         boundary = float(self.config.large_bbox_guard_max_distance_m)
         boundary_dt = float(sample_ts) - self._last_accepted_ts
+        raw_anchor = None
+        if (
+            self._distance_history
+            and len(self._distance_history) == len(self._distance_history_timestamps)
+            and self._distance_history_timestamps[-1] == self._last_accepted_ts
+        ):
+            candidate_anchor = float(self._distance_history[-1])
+            if math.isfinite(candidate_anchor) and candidate_anchor > 0.0:
+                raw_anchor = candidate_anchor
         old_bbox = self._last_accepted_bbox
+        # Freshness is checked above against the unchanged physical sample
+        # TTL. Continuity uses sample-to-sample time; adding processing age to
+        # that gap spuriously re-confirmed a 2.535 -> 2.553m continuous torso.
+        boundary_max_gap = max(0.01, float(self.config.max_frame_age_sec))
         boundary_continuous = bool(
             high_risk_far and multi_region_consensus and not out_of_order
             and current_target_id is not None and current_target_id > 0
-            and last is not None and boundary-.10 <= float(last) <= boundary
+            and raw_anchor is not None and boundary-.10 <= raw_anchor <= boundary+.10
             and boundary < raw_distance_m <= boundary+.10
             and self._last_accepted_region_count >= 3
-            and anchor_age_sec is not None and 0 <= anchor_age_sec <= .18
-            and 0 <= sampled_now-sample_ts <= .18
-            and 0 < boundary_dt <= .18
-            and abs(raw_distance_m-float(last)) <= min(.08, jump_limit)
-            and abs(raw_distance_m-float(last))/boundary_dt <= min(
+            and 0 < boundary_dt <= boundary_max_gap
+            and abs(raw_distance_m-raw_anchor) <= min(.10, jump_limit)
+            and abs(raw_distance_m-raw_anchor)/boundary_dt <= min(
                 1.5, float(self.config.max_unconfirmed_jump_rate_m_s))
             and bbox_area_change_ratio is not None and .85 <= bbox_area_change_ratio <= 1.15
             and old_bbox is not None
@@ -1530,10 +1702,12 @@ class AstraDepthRuntime:
         if boundary_continuous:
             self.logger.info(
                 "depth_boundary_continuity uid=%s sample_ts=%.6f anchor_ts=%.6f "
-                "candidate_m=%.3f anchor_m=%.3f region_count=%d previous_regions=%d "
+                "candidate_m=%.3f anchor_raw_m=%.3f anchor_filtered_m=%.3f "
+                "sample_gap_ms=%.1f sample_age_ms=%.1f region_count=%d previous_regions=%d "
                 "pending_bypassed=True identity_changed=False",
                 current_target_id, sample_ts, self._last_accepted_ts,
-                raw_distance_m, last, region_count, self._last_accepted_region_count,
+                raw_distance_m, raw_anchor, last, boundary_dt * 1000.,
+                (sampled_now - sample_ts) * 1000., region_count, self._last_accepted_region_count,
             )
         needs_far_consensus_confirmation = bool(
             high_risk_far
@@ -1856,9 +2030,12 @@ class AstraDepthRuntime:
             patch_y0 = max(0, min(int(depth.shape[0]) - patch_size, patch_cy - patch_size // 2 + 1))
             log_patch = depth[patch_y0 : patch_y0 + patch_size, patch_x0 : patch_x0 + patch_size]
             log_valid = log_patch[(log_patch >= min_mm) & (log_patch <= max_mm)]
+            center_patch_valid = int(log_valid.size)
+            center_patch_pixels = int(patch_size * patch_size)
+            center_patch_kept = min(max(1, int(self.config.center_patch_keep_count)), center_patch_valid)
             if int(log_valid.size) > 0:
                 p10_mm, p25_mm, p50_mm = self._np.percentile(
-                    self._np.sort(log_valid.reshape(-1)),
+                    log_valid.reshape(-1),
                     (10.0, 25.0, 50.0),
                 )
             else:

@@ -1,0 +1,14 @@
+run,capture_window,measurement,ttl_ms,count,median_ms,p95_ms,max_ms,total_ms,interpretation
+run_20261007_231808_28036_2f2705cc,205-454,accepted_sample_spacing,,86,135.443,252.919,712.846,13041.403,Physical capture spacing of accepted new depth samples; not raw camera frame spacing
+run_20261007_231808_28036_2f2705cc,205-454,sample_age_at_fusion_completion,,86,64.700,138.175,153.600,6022.400,Depth timeline sample timestamp plus monotonic sample_age_ms; not end-to-end visual processing duration
+run_20261007_231808_28036_2f2705cc,205-454,sample_age_at_control_commit_entry,,86,66.150,140.125,154.700,6221.100,Commit function entry clock; lower-bound proxy for final control publication
+run_20261007_231808_28036_2f2705cc,205-454,ideal_capture_only_uncovered_time,250,5,46.080,423.931,462.846,803.345,Counterfactual assumes accepted depth is instantly usable at its capture timestamp
+run_20261007_231808_28036_2f2705cc,205-454,delivered_depth_uncovered_time,250,25,34.933,275.156,604.146,1801.612,Complement of union of intervals from fusion completion to sample timestamp plus TTL; not zero motor commands
+run_20261007_231808_28036_2f2705cc,205-454,control_entry_uncovered_time,250,25,36.733,277.173,605.146,1867.812,Same coverage test at control entry; does not include final identity feedback braking and motor checks
+run_20261007_231808_28036_2f2705cc,205-454,delivered_depth_uncovered_time,500,2,207.560,339.487,354.146,415.121,Counterfactual TTL only; no runtime configuration change and no claim that motor zero episodes disappear
+run_20261007_231808_28036_2f2705cc,205-454,control_entry_uncovered_time,500,2,208.960,340.527,355.146,417.921,Counterfactual TTL only; visual expiry and braking remain separate
+run_20261007_231808_28036_2f2705cc,205-454,vision_compute_ms,,71,118.770,160.305,273.920,8464.000,Includes detector tracking identity and associated processing; not YOLO NPU inference alone
+run_20261007_231808_28036_2f2705cc,205-454,vision_post_identity_control_ms,,71,53.250,123.685,173.420,4387.580,Visual main-thread ranging and control phase; wall-clock durations overlap depth worker
+run_20261007_231808_28036_2f2705cc,205-454,depth30_discard_compute_ms,,72,84.975,143.604,159.370,6476.340,Rejected prepared computations: 66 same context and 5 changed context and 1 other; elapsed times are not CPU occupancy
+run_20261008_003319_40874_ce3b8d53,205-401,delivered_depth_uncovered_time,250,12,7.522,255.599,384.941,727.392,Newer run ends at CAP401; cannot compare this directly with old CAP205-454 as same trajectory
+run_20261008_003319_40874_ce3b8d53,205-401,delivered_depth_uncovered_time,500,1,134.941,134.941,134.941,134.941,Counterfactual TTL only for newer shorter run

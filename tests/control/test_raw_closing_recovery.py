@@ -189,7 +189,7 @@ def test_runtime_and_ini_budget_do_not_make_sixty_a_floor(monkeypatch):
     env={};monkeypatch.setattr(os,'environ',env)
     load_config_to_env(str(Path(__file__).resolve().parents[2]/'car_control_modular/config/reid_runtime.ini'))
     assert float(env['DISTANCE_APPROACH_NO_MATCHING_MAX_RPM'])==60
-    assert float(env['ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC'])==.25
+    assert float(env['ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC'])==.30
     assert rt.ASTRA_DEPTH_LONGITUDINAL_CONTROL_SAMPLE_MAX_AGE_SEC==.18
     for name,value in dict(DISTANCE_APPROACH_ENABLE=True,DISTANCE_APPROACH_NO_MATCHING_MAX_RPM=60,
             FORWARD_MAX_RPM=200,FOLLOW_ROTATION_ONLY=False,ASTRA_DEPTH_LONGITUDINAL_FAR_FORWARD_PERCENT=100).items():

@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="2110" viewBox="0 0 2000 2110" role="img">
+<title>身份确认、转身丢失与重新接回</title><desc>不要把“检测到同一轨迹”当成“确认还是同一个人”；身份输出、模板学习、电机授权是三件事。</desc>
+<rect width="2000" height="2110" fill="#F7F9FC"/>
+<text x="60" y="35" font-family="Noto Sans CJK SC, sans-serif" font-size="48" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">02 / 身份确认、转身丢失与重新接回</text>
+<text x="60" y="105" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">不要把“检测到同一轨迹”当成“确认还是同一个人”；身份输出、模板学习、电机授权是三件事。</text>
+<polyline points="60,153 1940,153" fill="none" stroke="#CED8E3" stroke-width="2"/>
+<rect x="60" y="190" width="560" height="185" rx="16" fill="#EAF2FF" stroke="#CED8E3" stroke-width="2"/>
+<text x="82" y="206" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">首次启动：静止等待</text>
+<rect x="518" y="207" width="76" height="36" rx="8" fill="#FFF3D9" stroke="#996000" stroke-width="2"/>
+<text x="529" y="212" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="700" dominant-baseline="text-before-edge" fill="#996000">F1</text>
+<text x="82" y="248" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">第一位唯一、质量合格的人体候选</text>
+<text x="82" y="281" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">连续 2 张真实新图，外观 / 位置连续</text>
+<text x="82" y="314" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">建立 UID 后仍须通过距离与电机条件</text>
+<rect x="720" y="190" width="560" height="185" rx="16" fill="#FFFFFF" stroke="#CED8E3" stroke-width="2"/>
+<text x="742" y="206" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">每次新图：YOLO / 跟踪</text>
+<text x="742" y="248" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">过滤检测质量，区分强候选与弱观察</text>
+<text x="742" y="281" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">raw track 连续不保证 UID 可信</text>
+<text x="742" y="314" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">已排除背景不必强迫全画面只有一人</text>
+<rect x="1380" y="190" width="560" height="185" rx="16" fill="#FFFFFF" stroke="#CED8E3" stroke-width="2"/>
+<text x="1402" y="206" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">当前检测可复用完整证明？</text>
+<text x="1402" y="248" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">已有 2 次完整验证，且新框连续</text>
+<text x="1402" y="281" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">没有新竞争者、交叉或证明过期</text>
+<text x="1402" y="314" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">满足才走快通道，否则完整核验</text>
+<polyline points="620,280 720,280" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="720,280 707.3937405670625,286.08951747755725 707.3937405670625,273.91048252244275" fill="#70859A"/>
+<polyline points="1280,280 1380,280" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1380,280 1367.3937405670624,286.08951747755725 1367.3937405670624,273.91048252244275" fill="#70859A"/>
+<rect x="60" y="455" width="900" height="188" rx="16" fill="#EAF2FF" stroke="#CED8E3" stroke-width="2"/>
+<text x="82" y="471" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">完整身份核验 / CPU + NPU</text>
+<rect x="858" y="472" width="76" height="36" rx="8" fill="#FFF3D9" stroke="#996000" stroke-width="2"/>
+<text x="869" y="477" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="700" dominant-baseline="text-before-edge" fill="#996000">F1</text>
+<text x="82" y="513" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">全身与可比躯干 OSNet、颜色、几何、近期 / 长期模板、同帧身份竞争。</text>
+<text x="82" y="547" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">低 ReID 距离只是相似证据，不能压过明确位置矛盾。</text>
+<text x="82" y="581" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">躯干当前确认阈值 0.40；区域不可比 ≠ 已证明换人。</text>
+<rect x="1040" y="455" width="900" height="188" rx="16" fill="#E8F5F1" stroke="#CED8E3" stroke-width="2"/>
+<text x="1062" y="471" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">有界快通道 / CPU</text>
+<text x="1062" y="513" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">当前框 + 颜色 + 几何接续；跳过本轮 OSNet，不写模板。</text>
+<text x="1062" y="547" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">最多连续 2 帧；距完整验证图像采集达 200ms 回全通道。</text>
+<text x="1062" y="581" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">完整证明自原图采集最长 600ms；快帧不能给它无限续期。</text>
+<polyline points="1500,375 1500,415 510,415 510,455" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="510,455 503.91048252244275,442.39374056706254 516.0895174775573,442.39374056706254" fill="#70859A"/>
+<rect x="604" y="394" width="146.328125" height="32" rx="3" fill="#F7F9FC" stroke="#F7F9FC" stroke-width="2"/>
+<text x="610" y="397" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#70859A">否 / 周期复核</text>
+<polyline points="1710,375 1710,455" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1710,455 1703.9104825224429,442.39374056706254 1716.0895174775571,442.39374056706254" fill="#70859A"/>
+<rect x="1716" y="395" width="35.0" height="32" rx="3" fill="#F7F9FC" stroke="#F7F9FC" stroke-width="2"/>
+<text x="1722" y="398" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#70859A">是</text>
+<polyline points="510,643 510,695 1000,695 1000,740" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1000,740 993.9104825224427,727.3937405670625 1006.0895174775573,727.3937405670625" fill="#70859A"/>
+<polyline points="1490,643 1490,695 1000,695" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1000,695 1012.6062594329375,688.9104825224427 1012.6062594329375,701.0895174775573" fill="#70859A"/>
+<rect x="720" y="740" width="560" height="130" rx="16" fill="#FFFFFF" stroke="#CED8E3" stroke-width="2"/>
+<text x="742" y="756" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">本帧身份决策</text>
+<text x="742" y="798" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">可信通过 / 证据不足 / 明确身份冲突</text>
+<text x="742" y="831" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">三种状态不可混为同一种“没检测到”</text>
+<rect x="60" y="940" width="560" height="183" rx="16" fill="#E8F5F1" stroke="#CED8E3" stroke-width="2"/>
+<text x="82" y="956" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">通过：本帧可信 UID</text>
+<text x="82" y="998" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">发布测距框、更新可信方向历史</text>
+<text x="82" y="1031" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">进入图 3 的控制资格检查</text>
+<text x="82" y="1064" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">刚接回可跟随，但模板仍处隔离期</text>
+<rect x="720" y="940" width="560" height="183" rx="16" fill="#FFF3D9" stroke="#CED8E3" stroke-width="2"/>
+<text x="742" y="956" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">不足：待核验 / 弱观察</text>
+<rect x="1178" y="957" width="76" height="36" rx="8" fill="#FFF3D9" stroke="#996000" stroke-width="2"/>
+<text x="1189" y="962" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="700" dominant-baseline="text-before-edge" fill="#996000">F1</text>
+<text x="742" y="998" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">通常本帧 UID0，内部仍可保留候选</text>
+<text x="742" y="1031" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">只保留有限观察，不给候选写模板</text>
+<text x="742" y="1064" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">特定已验证裁切接续另有严格入口</text>
+<rect x="1380" y="940" width="560" height="183" rx="16" fill="#FBEDEF" stroke="#CED8E3" stroke-width="2"/>
+<text x="1402" y="956" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">冲突：撤销身份资格</text>
+<text x="1402" y="998" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">明确几何 / 外观 / 可信竞争矛盾</text>
+<text x="1402" y="1031" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">负面证据关联候选，跨搜索保留</text>
+<text x="1402" y="1064" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">两帧自身连续不能洗掉既有矛盾</text>
+<polyline points="810,870 810,903 340,903 340,940" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="340,940 333.91048252244275,927.3937405670625 346.08951747755725,927.3937405670625" fill="#70859A"/>
+<rect x="394" y="880" width="58.0" height="32" rx="3" fill="#F7F9FC" stroke="#F7F9FC" stroke-width="2"/>
+<text x="400" y="883" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#70859A">通过</text>
+<polyline points="1000,870 1000,940" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1000,940 993.9104825224427,927.3937405670625 1006.0895174775573,927.3937405670625" fill="#70859A"/>
+<rect x="1006" y="887" width="58.0" height="32" rx="3" fill="#F7F9FC" stroke="#F7F9FC" stroke-width="2"/>
+<text x="1012" y="890" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#70859A">不足</text>
+<polyline points="1190,870 1190,903 1660,903 1660,940" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1660,940 1653.9104825224429,927.3937405670625 1666.0895174775571,927.3937405670625" fill="#70859A"/>
+<rect x="1434" y="880" width="58.0" height="32" rx="3" fill="#F7F9FC" stroke="#F7F9FC" stroke-width="2"/>
+<text x="1440" y="883" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#70859A">冲突</text>
+<rect x="60" y="1200" width="560" height="220" rx="16" fill="#EDF0F4" stroke="#CED8E3" stroke-width="2"/>
+<text x="82" y="1216" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">模板隔离 / 独立状态</text>
+<text x="82" y="1258" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">接回不立即给图库写入资格</text>
+<text x="82" y="1291" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">近期可靠库与长期代表分开老化</text>
+<text x="82" y="1324" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">稳定新证据、竞争 / 几何 / 区域验证</text>
+<text x="82" y="1357" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">达到隔离解除条件后才更新模板</text>
+<polyline points="340,1123 340,1200" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="340,1200 333.91048252244275,1187.3937405670624 346.08951747755725,1187.3937405670624" fill="#70859A"/>
+<rect x="720" y="1200" width="1220" height="220" rx="16" fill="#EAF2FF" stroke="#CED8E3" stroke-width="2"/>
+<text x="742" y="1216" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">无法持续确认 → 丢失 / 搜索原 UID</text>
+<rect x="1838" y="1217" width="76" height="36" rx="8" fill="#FFF3D9" stroke="#996000" stroke-width="2"/>
+<text x="1849" y="1222" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="700" dominant-baseline="text-before-edge" fill="#996000">F2</text>
+<text x="742" y="1258" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">撤销不合法前进；丢失确认后，按最新可信位置与转动补偿决定左右搜索。</text>
+<text x="742" y="1292" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">停车补看、候选居中、转向与搜索期限独立管理；停车期间仍可更新可信方向。</text>
+<text x="742" y="1326" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">发现候选 → 有界减速 / 停车补看 → 完整核验，不因“只有一个人”直接接回。</text>
+<text x="742" y="1360" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">当前默认不因丢失就换 UID；全周搜索失败或兜底超时则停车退出。</text>
+<polyline points="1000,1123 1000,1200" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1000,1200 993.9104825224427,1187.3937405670624 1006.0895174775573,1187.3937405670624" fill="#70859A"/>
+<polyline points="1660,1123 1660,1200" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1660,1200 1653.9104825224429,1187.3937405670624 1666.0895174775571,1187.3937405670624" fill="#70859A"/>
+<rect x="60" y="1500" width="900" height="238" rx="16" fill="#FFF3D9" stroke="#CED8E3" stroke-width="2"/>
+<text x="82" y="1516" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">保留旧保护锚点</text>
+<rect x="858" y="1517" width="76" height="36" rx="8" fill="#FFF3D9" stroke="#996000" stroke-width="2"/>
+<text x="869" y="1522" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="700" dominant-baseline="text-before-edge" fill="#996000">F1</text>
+<text x="82" y="1558" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">用途：检查已经成立的跨人 / 跨侧矛盾。</text>
+<text x="82" y="1592" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">参考过期只表示无法精确预测，不自动等于身份冲突。</text>
+<text x="82" y="1626" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">不能要求过期锚点先证明连续，才允许新候选开始观察。</text>
+<text x="82" y="1660" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">历史 CAP844 类“旧锚点自锁”已有专门恢复入口。</text>
+<rect x="1040" y="1500" width="900" height="238" rx="16" fill="#E8F5F1" stroke="#CED8E3" stroke-width="2"/>
+<text x="1062" y="1516" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">独立候选轨迹与接回确认</text>
+<text x="1062" y="1558" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">保存局部连续性；重新检查身份、竞争、区域与矛盾。</text>
+<text x="1062" y="1592" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">晚到 / 弱候选首帧只观察；严格强匹配另有单帧入口。</text>
+<text x="1062" y="1626" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">核验通过 → 本帧 UID → 模板隔离 → 控制重新核验。</text>
+<text x="1062" y="1660" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">候选穿过画面中心不应直接改写原可信搜索方向。</text>
+<polyline points="1330,1420 1330,1450 510,1450 510,1500" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="510,1500 503.91048252244275,1487.3937405670624 516.0895174775573,1487.3937405670624" fill="#70859A"/>
+<polyline points="1640,1420 1640,1500" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1640,1500 1633.9104825224429,1487.3937405670624 1646.0895174775571,1487.3937405670624" fill="#70859A"/>
+<text x="60" y="1810" font-family="Noto Sans CJK SC, sans-serif" font-size="29" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">最容易卡的场景：转身 / 背身、近景裁切变远景、相似衣着、多人交叉、隔离期证据更新不足。</text>
+<text x="60" y="1865" font-family="Noto Sans CJK SC, sans-serif" font-size="27" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">已有针对性保护与恢复代码 ≠ 所有场景已验证。验收必须同时看“正确人有限时间接回”和“错误人不接回”，不能只统计 ReID 是否变小。</text>
+<polyline points="60,2010 1940,2010" fill="none" stroke="#CED8E3" stroke-width="2"/>
+<text x="60" y="2028" font-family="Noto Sans CJK SC, sans-serif" font-size="20" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">源码：rk_vision/{initial_enrollment,pipeline,identity_bank,template_memory,reacquire_quarantine}.py · controllers.py</text>
+<text x="60" y="2062" font-family="Noto Sans CJK SC, sans-serif" font-size="21" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">2026-10-09 当前工作区 / 默认启动配置；环境覆盖另计。示意图，不是实测性能或停车距离保证。</text>
+<text x="1840" y="2062" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">2 / 4</text>
+</svg>

@@ -108,6 +108,48 @@ class AssociationSession:
         self.last_success = None
         self.generation = None
         self.pose_segment = None
+        self.last_roi_probe_stamp = 0.
+
+    def probe_turn_roi(self, anchor, range_evidence, now):
+        """Shadow-only check even when component tracker seeding has failed.
+
+        Reuses the worker's downsampled Depth and bracketed encoder history.
+        At most one physical frame per tick; no main-loop computation or I/O.
+        """
+        if anchor is None or not self.frames:
+            return []
+        o = anchor.observation
+        stamp, depth, stride, shape = self.frames[-1]
+        if stamp <= self.last_roi_probe_stamp or not .18 < now-o.capture_timestamp <= .25:
+            return []
+        source_pose, depth_pose = self.poses.at(o.capture_timestamp), self.poses.at(stamp)
+        if depth_pose is None and 0 <= now-stamp <= .06:
+            return []  # Same short bracket wait as the component observer.
+        self.last_roi_probe_stamp = stamp
+        row = dict(self._event(anchor, now, "roi_turn_probe"), phase="roi_turn_validation",
+                   sample_timestamp=stamp, sample_age_ms=(now-stamp)*1000,
+                   roi_probe_status="pose_or_range_missing")
+        if (source_pose is None or depth_pose is None or range_evidence is None
+                or range_evidence[0] != o.target_id):
+            return [row]
+        uid, range_ts, distance = range_evidence
+        if (not 0 <= now-stamp <= .18 or abs(range_ts-o.capture_timestamp) > .18
+                or not 0 <= now-range_ts <= .25 or shape != (anchor.height, anchor.width)
+                or not math.isfinite(distance)):
+            row["roi_probe_status"] = "range_alignment_or_grid"
+            return [row]
+        from .depth_roi_turn_probe import project_bbox, validate_regions
+        bbox, expected, status = project_bbox(
+            tuple(v/stride for v in o.bbox), width=depth.shape[1], height=depth.shape[0],
+            hfov_deg=self.hfov, distance=distance, source_pose=source_pose, depth_pose=depth_pose)
+        row.update(roi_probe_status=status, projected_bbox=bbox, expected_z_m=expected,
+                   yaw_delta_deg=math.degrees(depth_pose.yaw_rad-source_pose.yaw_rad),
+                   range_timestamp=range_ts, range_hint_m=distance)
+        if bbox is not None:
+            ok, regions = validate_regions(depth, bbox, expected)
+            row.update(roi_probe_status="candidate_consistent" if ok else "regions_rejected",
+                       projected_regions=regions)
+        return [row]
 
     def add_frames(self, frames):
         for stamp, depth in frames:
@@ -290,7 +332,9 @@ class DepthTrackOnlineObserver:
             self.counts["orientation_unavailable"] += 1
             self.session.tracker = None
             return []
-        records = self.session.process(state[1], getattr(self.depth, "_shadow_range_evidence", None), now)
+        range_evidence = getattr(self.depth, "_shadow_range_evidence", None)
+        records = self.session.process(state[1], range_evidence, now)
+        records.extend(self.session.probe_turn_roi(state[1], range_evidence, now))
         elapsed = (self.clock()-now)*1000
         if state != self._state:
             self.session.tracker = None
@@ -315,6 +359,8 @@ class DepthTrackOnlineObserver:
                 self._last_wait, self._last_wait_ts = key, now
             row["tick_processing_ms"] = elapsed
             self.counts[row["phase"]+":"+row["status"]] += 1
+            if "roi_probe_status" in row:
+                self.counts["roi_turn_probe:"+row["roi_probe_status"]] += 1
             if row.get("potential_range_gap_fill"):
                 self.counts["potential_range_gap_fill"] += 1
             output.append(row)

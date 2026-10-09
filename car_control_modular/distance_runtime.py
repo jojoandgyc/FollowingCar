@@ -15,6 +15,17 @@ from .control_types import (
 from .distance_fusion import DistanceFusionConfig, VisionRadarEncoderDistanceFusion
 
 
+@dataclass
+class PreparedDepthMeasurement:
+    target: PersonTarget
+    width: int
+    height: int
+    geometry_reason: str
+    transaction: Any
+    steering_feedback: Any = None
+    measurement: Any = None
+
+
 @dataclass(frozen=True)
 class DistanceRuntimeConfig:
     distance_source: str
@@ -1002,6 +1013,7 @@ class DistanceRuntime:
         brake_distance_m: Optional[float] = None,
         depth_use_latest: bool = False,
         capture_timestamp: Optional[float] = None,
+        prepared_depth: Optional[PreparedDepthMeasurement] = None,
     ) -> DistanceState:
         if self.config.distance_source in self.config.vision_depth_source_aliases:
             return self.get_vision_depth_state(
@@ -1013,6 +1025,7 @@ class DistanceRuntime:
                 brake_distance_m=brake_distance_m,
                 use_latest_depth=bool(depth_use_latest),
                 capture_timestamp=capture_timestamp,
+                prepared_depth=prepared_depth,
             )
         if self.config.distance_source in self.config.vision_mmwave_source_aliases:
             radar_distance_m = self.get_vision_mmwave_distance(width, target)
@@ -1211,6 +1224,8 @@ class DistanceRuntime:
         use_latest_depth: bool,
         capture_timestamp: Optional[float],
         steering_feedback: Optional[SteeringFeedback] = None,
+        allow_bounded_depth_history: bool = False,
+        log_extension: bool = True,
     ) -> Tuple[Optional[PersonTarget], str]:
         """Validate a bound detector snapshot without altering steering geometry."""
         observation = getattr(target, "depth_observation", None)
@@ -1271,15 +1286,19 @@ class DistanceRuntime:
             if not math.isfinite(age) or age < 0.0 or age > max_age:
                 return None, "depth_detector_bbox_stale"
             if use_latest_depth:
-                from .depth_roi_policy import roi_age_status
+                from .depth_roi_policy import roi_age_status, bounded_roi_history_allowed
                 status = roi_age_status(capture_ts, now, max_age, steering_feedback)
-                if age > .18:
+                if age > .18 and log_extension:
                     self.logger.info(
                         "depth_roi_extension capture_frame_id=%s uid=%s age_ms=%.1f "
                         "status=%s physical_depth_ttl_ms=180",
                         observation.capture_frame_id, observation.target_id, age*1000, status,
                     )
                 if status not in {"normal", "extended"}:
+                    if (allow_bounded_depth_history and
+                            bounded_roi_history_allowed(capture_ts, now, max_age)):
+                        return (replace(target, bbox=bbox, area=(x2-x1)*(y2-y1)),
+                                "yolo_detector_bounded_history")
                     return None, "depth_detector_bbox_stale"
         except (TypeError, ValueError, OverflowError):
             return None, "depth_detector_bbox_invalid_observation"
@@ -1327,6 +1346,77 @@ class DistanceRuntime:
         self.last_distance_state = state
         return state
 
+    def prepare_depth_measurement(self, width, height, target, *, steering_feedback=None):
+        """Snapshot only; caller runs transaction outside the control mutex."""
+        if (self.config.distance_source not in self.config.vision_depth_source_aliases
+                or not self.config.module_astra_depth_enable or target is None):
+            return None
+        ranging_target, reason = self._depth_target_for_ranging(
+            target, width, height, now=time.monotonic(), use_latest_depth=True, capture_timestamp=None,
+            steering_feedback=steering_feedback,
+            allow_bounded_depth_history=(
+                getattr(self.sensor_runtime, "supports_bounded_depth_roi", False) is True),
+        )
+        observation = getattr(target, "depth_observation", None)
+        if ranging_target is None or observation is None:
+            return None
+        prepare = getattr(self.sensor_runtime, "prepare_astra_target_distance", None)
+        if not callable(prepare):
+            return None
+        kwargs = dict(target_id=int(target.track_id), use_latest_depth=True,
+                      evidence_capture_frame_id=int(observation.capture_frame_id),
+                      steering_feedback=steering_feedback)
+        if reason == "yolo_detector_bounded_history":
+            kwargs["bounded_roi_capture_timestamp"] = float(observation.capture_timestamp)
+            kwargs["bounded_roi_max_age_sec"] = float(self.config.vision_depth_detector_bbox_max_age_sec)
+        transaction = prepare(ranging_target.bbox, int(width), int(height), **kwargs)
+        if transaction is None:
+            return None
+        return PreparedDepthMeasurement(target, int(width), int(height), reason, transaction,
+                                        steering_feedback=steering_feedback)
+
+    def _prepared_depth_geometry(self, prepared, target, *, now):
+        """Validate frozen frame selection, not permission to start new work."""
+        if prepared.target != target or not prepared.transaction.selected_at <= now:
+            return None, "prepared_target_changed"
+        ranging_target, reason = self._depth_target_for_ranging(
+            target, prepared.width, prepared.height, now=prepared.transaction.selected_at,
+            use_latest_depth=True, capture_timestamp=None,
+            steering_feedback=prepared.steering_feedback, log_extension=False,
+            allow_bounded_depth_history=(
+                getattr(self.sensor_runtime, "supports_bounded_depth_roi", False) is True),
+        )
+        if (ranging_target is None or reason != prepared.geometry_reason
+                or tuple(ranging_target.bbox) != tuple(prepared.transaction.args[0])):
+            return None, "prepared_geometry_changed"
+        result = prepared.transaction.result
+        if result is None:
+            return None, "prepared_result_missing"
+        if reason == "yolo_detector_bounded_history":
+            selection = result.bounded_roi_selection
+            observation = target.depth_observation
+            if selection is None or not selection.valid_for(
+                    capture_timestamp=observation.capture_timestamp,
+                    sample_timestamp=result.observation_sample_timestamp, now=now,
+                    target_id=target.track_id, capture_frame_id=observation.capture_frame_id,
+                    bbox=ranging_target.bbox,
+                    max_roi_age=self.config.vision_depth_detector_bbox_max_age_sec):
+                return None, "prepared_bounded_provenance_invalid"
+        elif (result.observation_source != "latest"
+              or result.observation_sample_timestamp != prepared.transaction.private._latest_depth_ts):
+            return None, "prepared_latest_provenance_invalid"
+        return ranging_target, reason
+
+    def commit_prepared_depth(self, prepared, *, target, steering_feedback=None):
+        """Validate post-compute geometry before publishing any sensor history."""
+        if prepared.measurement is not None or target != prepared.target:
+            return False
+        prepared.measurement = prepared.transaction.commit(
+            now=time.monotonic(), max_sample_age_sec=.18,
+            validate=lambda now: self._prepared_depth_geometry(prepared, target, now=now)[0] is not None,
+        )
+        return prepared.measurement is not None
+
     def get_vision_depth_state(
         self,
         width: int,
@@ -1338,6 +1428,7 @@ class DistanceRuntime:
         brake_distance_m: Optional[float] = None,
         use_latest_depth: bool = False,
         capture_timestamp: Optional[float] = None,
+        prepared_depth: Optional[PreparedDepthMeasurement] = None,
     ) -> DistanceState:
         if not self.config.module_astra_depth_enable or target is None or width <= 0 or height <= 0:
             return self._clear_vision_depth_state(
@@ -1346,11 +1437,17 @@ class DistanceRuntime:
                 brake_distance_m=brake_distance_m,
             )
 
-        ranging_target, geometry_reason = self._depth_target_for_ranging(
-            target, width, height, now=time.monotonic(),
-            use_latest_depth=use_latest_depth, capture_timestamp=capture_timestamp,
-            steering_feedback=steering_feedback,
-        )
+        if prepared_depth is None:
+            ranging_target, geometry_reason = self._depth_target_for_ranging(
+                target, width, height, now=time.monotonic(),
+                use_latest_depth=use_latest_depth, capture_timestamp=capture_timestamp,
+                steering_feedback=steering_feedback,
+                allow_bounded_depth_history=(
+                    getattr(self.sensor_runtime, "supports_bounded_depth_roi", False) is True),
+            )
+        else:
+            ranging_target, geometry_reason = self._prepared_depth_geometry(
+                prepared_depth, target, now=time.monotonic())
         observation = getattr(target, "depth_observation", None)
         self.logger.info(
             "Depth geometry: target=%s raw_track=%s capture=%s capture_ts=%s "
@@ -1379,6 +1476,9 @@ class DistanceRuntime:
             measurement_kwargs["evidence_capture_frame_id"] = int(observation.capture_frame_id)
         if use_latest_depth:
             measurement_kwargs["use_latest_depth"] = True
+        if geometry_reason == "yolo_detector_bounded_history":
+            measurement_kwargs["bounded_roi_capture_timestamp"] = float(observation.capture_timestamp)
+            measurement_kwargs["bounded_roi_max_age_sec"] = float(self.config.vision_depth_detector_bbox_max_age_sec)
         if steering_feedback is not None:
             measurement_kwargs["steering_feedback"] = steering_feedback
         if observation is not None and not use_latest_depth:
@@ -1390,12 +1490,42 @@ class DistanceRuntime:
                 capture_ts = 0.0
             if math.isfinite(capture_ts) and capture_ts > 0.0:
                 measurement_kwargs["reference_timestamp"] = capture_ts
-        measurement = self.sensor_runtime.get_astra_target_distance(
-            ranging_target.bbox,
-            int(width),
-            int(height),
-            **measurement_kwargs,
-        )
+        if prepared_depth is None:
+            measurement = self.sensor_runtime.get_astra_target_distance(
+                ranging_target.bbox, int(width), int(height), **measurement_kwargs,
+            )
+        else:
+            # No fallback scan here: this path must stay bounded while holding
+            # the control lock, even if a caller violates the preparation contract.
+            if (prepared_depth.target != target or prepared_depth.width != int(width)
+                    or prepared_depth.height != int(height) or not use_latest_depth
+                    or prepared_depth.measurement is None):
+                raise ValueError("Mismatched/uncommitted prepared depth measurement")
+            measurement = prepared_depth.measurement
+        if geometry_reason == "yolo_detector_bounded_history" and measurement.raw_distance_m is not None:
+            from .depth_roi_policy import BoundedDepthSelection
+            stamp = getattr(measurement, "sample_timestamp", None)
+            selection = getattr(measurement, "bounded_roi_selection", None)
+            valid = bool(
+                getattr(measurement, "observation_source", None) == "roi_bounded_history"
+                and getattr(measurement, "observation_sample_timestamp", None) == stamp
+                and isinstance(selection, BoundedDepthSelection)
+                and selection.valid_for(
+                    capture_timestamp=observation.capture_timestamp, sample_timestamp=stamp,
+                    now=time.monotonic(), target_id=target.track_id,
+                    capture_frame_id=observation.capture_frame_id, bbox=ranging_target.bbox,
+                    max_roi_age=self.config.vision_depth_detector_bbox_max_age_sec,
+                )
+            )
+            if not valid:
+                # Fail closed even if a backend accidentally returns latest or
+                # retimestamps a sample. Do not erase a newer fusion anchor.
+                self.logger.warning("Depth bounded ROI provenance rejected capture=%s sample_ts=%s",
+                                    observation.capture_frame_id, stamp)
+                state = DistanceState(source="vision_depth", source_detail="bounded_roi_provenance_rejected",
+                                      target_threshold_m=target_distance_m, brake_threshold_m=brake_distance_m)
+                self.last_distance_state = state
+                return state
         return self._build_vision_depth_state(
             measurement,
             target=ranging_target,
@@ -1404,6 +1534,46 @@ class DistanceRuntime:
             target_distance_m=target_distance_m,
             brake_distance_m=brake_distance_m,
         )
+
+    def get_cropped_observation_state(self, width, height, observation, *, steering_feedback=None):
+        """RGB-aligned ranging only; never publish a motion ROI or fusion anchor."""
+        state = DistanceState(source="cropped_depth_observation", source_detail="crop_depth_unavailable")
+        if (not self.config.module_astra_depth_enable
+                or not isinstance(observation, DepthTargetObservation)
+                or observation.source != "yolo_cropped_observation"):
+            return state
+        # Reuse the ordinary age/bounds validator locally. The original typed
+        # observation is NEVER promoted or cached for the latest-depth worker.
+        target = PersonTarget(bbox=observation.bbox, track_id=observation.target_id,
+                              confidence=0., area=0., depth_observation=replace(observation, source="yolo_detector"))
+        target, reason = self._depth_target_for_ranging(
+            target, width, height, now=time.monotonic(), use_latest_depth=False,
+            capture_timestamp=observation.capture_timestamp, steering_feedback=steering_feedback)
+        if target is None:
+            return replace(state, source_detail="crop_observation:" + reason)
+        measurement = self.sensor_runtime.get_astra_target_distance(
+            observation.bbox, width, height, target_id=observation.target_id,
+            reference_timestamp=observation.capture_timestamp,
+            evidence_capture_frame_id=observation.capture_frame_id,
+            steering_feedback=steering_feedback)
+        try:
+            stamp = float(measurement.sample_timestamp)
+            age = time.monotonic() - stamp
+            distance = float(measurement.distance_m)
+            raw = float(measurement.raw_distance_m)
+            valid = (math.isfinite(distance) and distance > 0 and math.isfinite(raw) and raw > 0
+                     and 0 <= age <= .25 and measurement.temporal_status == "new_sample"
+                     and measurement.detail.startswith("depth_")
+                     and not any(x in measurement.detail for x in ("hold", "pending", "guard", "reanchored")))
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        return replace(state, source_detail="crop_observation:" + measurement.detail,
+            raw_distance_m=raw if valid else None, used_distance_m=distance if valid else None,
+            safety_distance_m=min(raw, distance) if valid else None,
+            filtered_distance_m=distance if valid else None, sample_count=1 if valid else 0,
+            sample_timestamp=stamp if valid else None, sample_age_sec=age if valid else None,
+            observation_timestamp=measurement.observation_sample_timestamp,
+            temporal_status=measurement.temporal_status, fusion_mode="observation_only")
 
     def get_recent_vision_depth_state(
         self,

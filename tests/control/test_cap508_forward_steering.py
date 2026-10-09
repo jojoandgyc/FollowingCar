@@ -197,9 +197,10 @@ def test_runtime_config_opts_in_without_changing_other_limits(monkeypatch):
     path = Path(__file__).resolve().parents[2] / 'car_control_modular/config/reid_runtime.ini'
     load_config_to_env(str(path))
     assert os.environ['VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE'] == '1'
+    # Current user-approved trial: 10 per wheel = 20 RPM total differential.
     assert float(os.environ['VISIBLE_STEERING_PID_MAX_CORRECTION_RPM']) == 10
     assert float(os.environ['LATERAL_INTENT_TTL_SEC']) == .15
-    assert float(os.environ['ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC']) == .25
+    assert float(os.environ['ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC']) == .30
 
 
 @pytest.mark.parametrize('mode', ['center', 'near', 'explicit_hold', 'stale_image'])

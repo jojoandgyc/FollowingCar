@@ -168,10 +168,11 @@ def test_motor_write_rechecks_ff_deadline_and_preserves_yaw(owner, monkeypatch):
     motor._visible_wheel_control_active = lambda: True
     owner._has_fresh_lateral_yaw = lambda uid: True
     # Isolate clock validation from physical zero-cross dynamics.
-    motor._visible_wheel_guard = SimpleNamespace(reset=lambda: None,
-        limit=lambda request, feedback, now, *, allow_forward_handoff=False: (request, "continuous"),
+    motor._visible_wheel_guard = SimpleNamespace(reset=lambda: None, pending_signs=None,
+        limit=lambda request, feedback, now, **kwargs: (request, "continuous"),
         note_sent=lambda *args: None)
-    motor.get_steering_feedback = lambda: None
+    motor.get_steering_feedback = lambda: SimpleNamespace(timestamp=NOW+.05,
+        trustworthy=True, left_forward_rpm=0., right_forward_rpm=0.)
     monkeypatch.setattr(runtime.time, "monotonic", lambda: NOW+.05)
     sent = []
     backend.send_targets = lambda left, right, label, **kw: sent.append((left, right))

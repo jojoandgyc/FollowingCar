@@ -12,6 +12,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+from .camera_geometry import yaw_image_shift_ratio
+
 
 BBox = Tuple[float, float, float, float]
 
@@ -99,7 +101,7 @@ class IdentityExclusionMemory:
         if previous.yaw is not None and current.yaw is not None:
             # Positive encoder yaw is a right turn: a stationary person's
             # image position moves left, not in either arbitrary direction.
-            shift = -(current.yaw - previous.yaw) / self.camera_hfov_deg
+            shift = yaw_image_shift_ratio(previous.yaw, current.yaw, self.camera_hfov_deg)
             px1 += shift
             px2 += shift
         pw, ph = px2 - px1, py2 - py1

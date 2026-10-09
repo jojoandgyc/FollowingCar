@@ -127,6 +127,11 @@ class MotionObservation:
     integrated_yaw_deg: Optional[float] = None
     feedback_age_ms: Optional[float] = None
     feedback_trustworthy: bool = False
+    left_forward_rpm: Optional[float] = None
+    right_forward_rpm: Optional[float] = None
+    feedback_timestamp: Optional[float] = None
+    left_position_deg: Optional[int] = None
+    right_position_deg: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -755,13 +760,16 @@ class SearchDiagnosticsObserver:
             "search_motion_diag session=%d frame=%d command=%s request=%d/%s "
             "encoder=(left=%sRPM right=%sRPM yaw=%sdps raw_yaw=%sdps frame_yaw=%sdeg "
             "integrated=%sdeg age=%sms trustworthy=%s) transport=(frame_gap=%sms "
-            "camera_read=%.2fms drained=%d)",
+            "camera_read=%.2fms drained=%d) feedback_forward_rpm=(%s,%s) "
+            "feedback_timestamp=%s position_deg=(%s,%s) speed_fields_above=raw_serial",
             self._session_id, sample.frame_index, m.command_name, m.requested_rotate_raw,
             m.requested_rotate_source, "none" if m.left_speed_rpm is None else m.left_speed_rpm,
             "none" if m.right_speed_rpm is None else m.right_speed_rpm,
             self._fmt(m.yaw_rate_dps), self._fmt(m.raw_yaw_rate_dps), self._fmt(frame_yaw),
             self._fmt(m.integrated_yaw_deg), self._fmt(m.feedback_age_ms),
             m.feedback_trustworthy, self._fmt(t.frame_gap_ms), t.camera_read_ms, t.camera_drained,
+            self._fmt(m.left_forward_rpm), self._fmt(m.right_forward_rpm),
+            m.feedback_timestamp, m.left_position_deg, m.right_position_deg,
         )
         if ending:
             outcome = (

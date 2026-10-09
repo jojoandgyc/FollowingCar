@@ -86,6 +86,27 @@ def test_expired_anchor_recovers_without_waiting_for_height_under_90_percent(sen
     assert tuple(runtime._distance_history) == (2.9,)
 
 
+def test_cap162_172_real_sample_gap_restarts_confirmation_not_live_authority(sensor):
+    """A 344ms acquisition gap is distinct from a few-ms processing expiry.
+
+    The 20261007 run went 2451 -> 2597 (1/3) -> 2751 (1/3).
+    Keep this physical-evidence check while fixing command handoffs elsewhere.
+    """
+    runtime, _clock, sample = sensor
+    assert sample(2451).distance_m == 2.451
+    first = sample(2597, advance=.207289576)
+    assert first.confirm_count == 1 and first.jump_confirmation is None
+    late = sample(2751, advance=.343815116)
+    assert late.confirm_count == 1 and late.distance_m is None
+    assert late.jump_confirmation is None
+    repeated = sample(2751, advance=0.)
+    assert repeated.confirm_count == 1 and repeated.jump_confirmation is None
+    assert sample(2811, advance=.12).confirm_count == 2
+    final = sample(2890, advance=.107196)
+    assert_proof(final, kind="large_clipped_consensus")
+    assert runtime._last_accepted_distance_m == 2.89
+
+
 def test_recent_anchor_keeps_rate_guard_even_below_50_ms(sensor):
     _runtime, _clock, sample = sensor
     assert sample(900, age=0.0).distance_m == 0.9

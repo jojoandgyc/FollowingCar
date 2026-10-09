@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import os
 import time
+from .follow_bbox_policy import lower_compact_bbox_reason
 from dataclasses import dataclass, replace
 from typing import Any, List, Optional, Sequence, Tuple
 
+from .deepsort.linear_assignment import prepare_assignment_backend
 from .frames import FramePacket, numpy_from_frame
-from .reid import OSNetConfig, OSNetRKNNExtractor
+from .reid import OSNetConfig, OSNetRKNNExtractor, _color_signature
 from .reid_diagnostics import ReIDDiagnosticsWriter
 from .tracker import DeepSortTracker, DeepSortTrackerConfig, TrackRecord
 from .yolo11 import Detection, YOLO11Config, YOLO11RKNNDetector
@@ -173,6 +175,9 @@ class RKNNVisionConfig:
     yolo_model_path: str
     reid_model_path: str = ""
     reid_enable: bool = True
+    # Only stable, already verified bindings may use detector-only geometry.
+    # The board config opts in; legacy callers keep the full pipeline.
+    detector_continuation_enable: bool = False
     person_class_id: int = 0
     conf_threshold: float = 0.25
     search_diagnostic_conf_threshold: float = 0.10
@@ -225,6 +230,7 @@ class RKNNVisionConfig:
     identity_max_features: int = 20
     identity_template_memory_enable: bool = False
     identity_template_crosscheck_enable: bool = False
+    identity_appearance_region_safety_enable: bool = False
     identity_template_recent_sec: float = 30.0
     identity_template_archive_sec: float = 120.0
     identity_max_weak_features: int = 8
@@ -291,6 +297,7 @@ class RKNNVisionConfig:
     identity_preferred_search_soft_min_confidence: float = 0.80
     identity_partial_appearance_enable: bool = True
     identity_partial_match_threshold: float = 0.34
+    identity_partial_confirm_threshold: float = 0.34
     identity_partial_max_features: int = 8
     identity_partial_update_threshold: float = 0.30
     identity_preferred_search_reacquire_side_ratio: float = 0.05
@@ -317,6 +324,8 @@ class RKNNVisionConfig:
             yolo_model_path=os.environ.get("VISION_MODEL_PATH", "models/yolo11s.rknn").strip(),
             reid_model_path=os.environ.get("VISION_REID_MODEL_PATH", "models/deepsort.rknn").strip(),
             reid_enable=os.environ.get("VISION_REID_ENABLE", "1").strip() != "0",
+            detector_continuation_enable=os.environ.get(
+                "Y8_DETECTOR_CONTINUATION_ENABLE", "0").strip().lower() in {"1", "true", "yes"},
             person_class_id=int(os.environ.get("PERSON_CLASS_ID", "0")),
             conf_threshold=float(os.environ.get("CONFIDENCE_THRESHOLD", "0.25")),
             search_diagnostic_conf_threshold=float(
@@ -385,6 +394,7 @@ class RKNNVisionConfig:
             identity_max_features=max(1, int(os.environ.get("Y8_IDENTITY_MAX_FEATURES", "20"))),
             identity_template_memory_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_MEMORY_ENABLE", "0").strip() == "1",
             identity_template_crosscheck_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_CROSSCHECK_ENABLE", "0").strip() == "1",
+            identity_appearance_region_safety_enable=os.environ.get("Y8_IDENTITY_APPEARANCE_REGION_SAFETY_ENABLE", "0").strip() == "1",
             identity_template_recent_sec=max(1.0, float(os.environ.get("Y8_IDENTITY_TEMPLATE_RECENT_SEC", "30"))),
             identity_template_archive_sec=max(1.0, float(os.environ.get("Y8_IDENTITY_TEMPLATE_ARCHIVE_SEC", "120"))),
             identity_max_weak_features=max(0, int(os.environ.get("Y8_IDENTITY_MAX_WEAK_FEATURES", "8"))),
@@ -614,6 +624,9 @@ class RKNNVisionConfig:
             identity_partial_match_threshold=float(
                 os.environ.get("Y8_IDENTITY_PARTIAL_MATCH_THRESHOLD", "0.34")
             ),
+            identity_partial_confirm_threshold=float(
+                os.environ.get("Y8_IDENTITY_PARTIAL_CONFIRM_THRESHOLD", "0.34")
+            ),
             identity_partial_max_features=max(
                 1, int(os.environ.get("Y8_IDENTITY_PARTIAL_MAX_FEATURES", "8"))
             ),
@@ -667,6 +680,18 @@ class RKNNVisionPipeline:
     def __init__(self, config: Optional[RKNNVisionConfig] = None, logger: Any = None) -> None:
         self.config = config or RKNNVisionConfig.from_env()
         self.logger = logger
+        # The runtime constructs this pipeline before starting frame/control
+        # work and does not necessarily call load(). Prepare the optional CPU
+        # solver here, not on the first multi-person frame during motion.
+        assignment_start = time.perf_counter()
+        self.assignment_backend = prepare_assignment_backend()
+        self.assignment_prepare_ms = _elapsed_ms(assignment_start, time.perf_counter())
+        if self.logger is not None:
+            self.logger.info(
+                "deepsort_assignment_prepared backend=%s elapsed_ms=%.3f",
+                self.assignment_backend,
+                self.assignment_prepare_ms,
+            )
         self.detector = YOLO11RKNNDetector(
             YOLO11Config(
                 model_path=self.config.yolo_model_path,
@@ -724,6 +749,7 @@ class RKNNVisionPipeline:
                 identity_max_features=self.config.identity_max_features,
                 identity_template_memory_enable=self.config.identity_template_memory_enable,
                 identity_template_crosscheck_enable=self.config.identity_template_crosscheck_enable,
+                identity_appearance_region_safety_enable=self.config.identity_appearance_region_safety_enable,
                 identity_template_recent_sec=self.config.identity_template_recent_sec,
                 identity_template_archive_sec=self.config.identity_template_archive_sec,
                 identity_max_weak_features=self.config.identity_max_weak_features,
@@ -797,6 +823,7 @@ class RKNNVisionPipeline:
                 identity_preferred_search_reacquire_side_ratio=self.config.identity_preferred_search_reacquire_side_ratio,
                 identity_partial_appearance_enable=self.config.identity_partial_appearance_enable,
                 identity_partial_match_threshold=self.config.identity_partial_match_threshold,
+                identity_partial_confirm_threshold=self.config.identity_partial_confirm_threshold,
                 identity_partial_max_features=self.config.identity_partial_max_features,
                 identity_partial_update_threshold=self.config.identity_partial_update_threshold,
                 identity_duplicate_box_suppression_enable=self.config.identity_duplicate_box_suppression_enable,
@@ -811,6 +838,9 @@ class RKNNVisionPipeline:
         )
         self.last_detections: List[Detection] = []
         self._frame_context: dict = {}
+        self._detector_continuation_active_uid = None
+        self._detector_continuation_allowed = False
+        self.last_identity_processing = {"mode": "full", "reason": "startup"}
         self._reid_diagnostics = None
         if self.config.reid_diagnostics_enable and self.config.reid_diagnostics_dir:
             self._reid_diagnostics = ReIDDiagnosticsWriter(
@@ -860,6 +890,12 @@ class RKNNVisionPipeline:
                 ("area", area, float(getattr(self.config, "identity_min_area", 0.0))),
             )
             reasons = [f"{name}<{limit:g}" for name, value, limit in limits if value < limit]
+            shape_reason = lower_compact_bbox_reason(
+                detection.bbox, getattr(self, "last_frame_width", None),
+                getattr(self, "last_frame_height", None),
+            )
+            if shape_reason:
+                reasons.append(shape_reason)
             if not reasons:
                 accepted.append(detection)
                 continue
@@ -893,6 +929,9 @@ class RKNNVisionPipeline:
             if int(det.class_id) == int(self.config.person_class_id)
             and float(det.score) >= float(self.config.conf_threshold)
         ]
+        # A rejected small person is still a competing detector hypothesis.
+        # Do not turn a multi-person image into a singleton fast-path proof.
+        self.last_raw_person_count = len(persons)
         persons = self._follow_size_candidates(persons, source="formal")
         raw_probe_persons = tuple(
             det
@@ -924,6 +963,7 @@ class RKNNVisionPipeline:
         else:
             probe_persons = raw_probe_persons
             cluster_diagnostics = ()
+        probe_persons = tuple(self._follow_size_candidates(probe_persons, source="probe_cluster"))
         self.last_search_probe_clusters = list(probe_persons)
         self.last_search_probe_cluster_diagnostics = tuple(cluster_diagnostics)
         self.last_search_candidate_evidence = SearchCandidateEvidence(
@@ -939,6 +979,8 @@ class RKNNVisionPipeline:
         frame_format: Optional[str] = None,
     ) -> List[TrackRecord]:
         """Run detector-only recovery without advancing ReID or tracker state."""
+        self.last_identity_processing = {"mode": "probe", "reason": "search_observation_only",
+                                         "full_features_current": False}
         frame_start = time.perf_counter()
         arr, width, height, fmt = numpy_from_frame(frame, frame_format)
         self.last_frame_width = width
@@ -1000,31 +1042,49 @@ class RKNNVisionPipeline:
         detections = self.detector.detect(packet, fmt)
         detect_end = time.perf_counter()
         persons = self._record_detector_output(detections)
-        features = self.reid.extract(packet, persons, fmt)
-        partial_features = list(getattr(self.reid, "last_partial_features", ()))
-        if len(partial_features) != len(persons):
-            partial_features = [None for _ in persons]
-        partial_feature_sources = list(
-            getattr(self.reid, "last_partial_feature_sources", ())
-        )
-        if len(partial_feature_sources) != len(persons):
-            partial_feature_sources = [None for _ in persons]
-        reid_end = time.perf_counter()
-        records = self.tracker.update(
-            persons,
-            features,
-            partial_features=partial_features,
-            partial_feature_sources=partial_feature_sources,
-            image_width=width, image_height=height,
-            frame_context=self._frame_context,
-        )
+        check_start = time.perf_counter()
+        records = self._try_detected_continuation(packet, persons, fmt)
+        fast_check_ms = _elapsed_ms(check_start, time.perf_counter())
+        self.last_identity_processing.update(
+            capture_frame_id=self._frame_context.get("capture_frame_id"),
+            capture_timestamp=self._frame_context.get("capture_timestamp"))
+        detector_only = records is not None
+        if not detector_only:
+            # No tracker/bank state has been advanced by a failed fast plan.
+            # Process this same physical frame once through the normal path.
+            features = self.reid.extract(packet, persons, fmt)
+            self.last_identity_processing["full_features_current"] = bool(
+                persons and len(features) == len(persons) and all(f is not None for f in features))
+            partial_features = list(getattr(self.reid, "last_partial_features", ()))
+            if len(partial_features) != len(persons):
+                partial_features = [None for _ in persons]
+            partial_feature_sources = list(getattr(self.reid, "last_partial_feature_sources", ()))
+            if len(partial_feature_sources) != len(persons):
+                partial_feature_sources = [None for _ in persons]
+            color_features = getattr(self.reid, "last_color_features", None)
+            if color_features is not None and len(color_features) != len(persons):
+                color_features = None
+            reid_end = time.perf_counter()
+            color_kwargs = {} if color_features is None else {"color_features": color_features}
+            records = self.tracker.update(
+                persons, features, partial_features=partial_features,
+                partial_feature_sources=partial_feature_sources,
+                image_width=width, image_height=height,
+                frame_context=self._frame_context, **color_kwargs,
+            )
+            reid_timing = dict(self.reid.last_timing_ms)
+        else:
+            reid_end = time.perf_counter()
+            # Never expose the last full frame's embedding timings/features as
+            # fresh evidence. The detector path carries its own provenance.
+            reid_timing = {}
         tracker_end = time.perf_counter()
         yolo_timing = self.detector.last_timing_ms
-        reid_timing = dict(self.reid.last_timing_ms)
         verify_timing = None
         verify_start = tracker_end
         if (
             self.config.predicted_reid_verify_enable
+            and not detector_only
             and self.config.identity_bank_enable
             and self.config.reid_enable
             and records
@@ -1032,8 +1092,19 @@ class RKNNVisionPipeline:
             records, verify_timing = self._verify_predicted_records(packet, records, fmt)
         if self.config.identity_suppress_duplicate_uids and records:
             records = self._suppress_duplicate_reid_uids(records)
+        if (not detector_only and getattr(self.config, "detector_continuation_enable", False)
+                and callable(getattr(self.tracker, "note_full_identity_verification", None))):
+            self.tracker.note_full_identity_verification(
+                records, detections=persons, color_features=color_features,
+                frame_context=self._frame_context, image_width=width, image_height=height,
+                now=time.monotonic(), active_uid=(
+                    getattr(self, "_detector_continuation_active_uid", None)
+                    if getattr(self, "_detector_continuation_allowed", False) else None),
+                raw_candidate_count=self.last_raw_person_count,
+            )
         diagnostics_start = time.perf_counter()
-        self._record_reid_diagnostics(packet, fmt)
+        if not detector_only:
+            self._record_reid_diagnostics(packet, fmt)
         diagnostics_ms = _elapsed_ms(diagnostics_start, time.perf_counter())
         verify_end = time.perf_counter()
         combined_reid_timing = dict(reid_timing)
@@ -1069,20 +1140,39 @@ class RKNNVisionPipeline:
             "reid_verify_detections": float((verify_timing or {}).get("detections", 0.0)),
             "reid_verify_features": float((verify_timing or {}).get("features", 0.0)),
             "tracker": _elapsed_ms(reid_end, tracker_end),
+            "detector_continuation_check": fast_check_ms,
+            "detector_continuation_used": float(detector_only),
             "reid_diagnostics": diagnostics_ms,
             "predicted_reid_verify": _elapsed_ms(verify_start, verify_end) if verify_timing is not None else 0.0,
             "total": _elapsed_ms(frame_start, verify_end),
         }
-        for key, value in getattr(self.tracker, "last_timing_ms", {}).items():
+        for key, value in ({} if detector_only else getattr(self.tracker, "last_timing_ms", {})).items():
             self.last_timing_ms["tracker_" + key] = value
         inner_tracker = getattr(getattr(self.tracker, "deepsort", None), "tracker", None)
-        for key, value in getattr(inner_tracker, "last_timing_ms", {}).items():
+        for key, value in ({} if detector_only else getattr(inner_tracker, "last_timing_ms", {})).items():
             self.last_timing_ms["deepsort_" + key] = value
         bank = getattr(self.tracker, "identity_bank", None)
-        if getattr(bank, "_assign_timing_frame", None) == getattr(self.tracker, "_frame_index", -1):
+        if not detector_only and getattr(bank, "_assign_timing_frame", None) == getattr(self.tracker, "_frame_index", -1):
             for key, value in getattr(bank, "last_assign_timing_ms", {}).items():
                 self.last_timing_ms["identity_" + key] = value
         if self.logger is not None:
+            if getattr(self.config, "detector_continuation_enable", False):
+                processing = self.last_identity_processing
+                obs = getattr(self.tracker, "last_identity_observations", ())
+                current = [item.get("assignment", {}) for item in obs
+                           if item.get("uid") == getattr(self, "_detector_continuation_active_uid", None)]
+                assignment = current[0] if len(current) == 1 else {}
+                self.logger.info(
+                    "identity_processing capture_frame_id=%s mode=%s reason=%s "
+                    "verified_capture=%s identity_valid_until=%s fast_check_ms=%.2f "
+                    "reid_ms=%.2f total_ms=%.2f next_proof_reason=%s known_background_count=%d",
+                    self._frame_context.get("capture_frame_id"), processing["mode"],
+                    processing["reason"], assignment.get("identity_verified_capture"),
+                    assignment.get("identity_valid_until"), fast_check_ms,
+                    self.last_timing_ms["reid_total"], self.last_timing_ms["total"],
+                    getattr(self.tracker, "last_detector_continuation_reason", "unavailable"),
+                    len(getattr(getattr(self.tracker, "_detector_proof", None), "backgrounds", ())),
+                )
             self.logger.debug(
                 "rknn vision frame processed width=%d height=%d detections=%d persons=%d tracks=%d",
                 width,
@@ -1091,6 +1181,40 @@ class RKNNVisionPipeline:
                 len(persons),
                 len(records),
             )
+        return records
+
+    def set_detector_continuation_context(self, *, active_uid, allowed: bool) -> None:
+        self._detector_continuation_active_uid = active_uid
+        self._detector_continuation_allowed = bool(allowed)
+        setter = getattr(self.tracker, "set_detector_continuation_context", None)
+        if callable(setter):
+            setter(active_uid=active_uid, allowed=allowed)
+
+    def _try_detected_continuation(self, packet, persons, fmt):
+        self.last_identity_processing = {"mode": "full", "reason": "disabled"}
+        if not (getattr(self.config, "detector_continuation_enable", False)
+                and self.config.reid_enable and self.config.identity_bank_enable):
+            return None
+        if not getattr(self, "_detector_continuation_allowed", False):
+            self.last_identity_processing["reason"] = "control_context_requires_full"
+            return None
+        plan_fn = getattr(self.tracker, "plan_detected_continuation", None)
+        if not callable(plan_fn):
+            self.last_identity_processing["reason"] = "tracker_unsupported"
+            return None
+        plan = plan_fn(
+            persons, image_width=self.last_frame_width, image_height=self.last_frame_height,
+            frame_context=self._frame_context,
+            active_uid=getattr(self, "_detector_continuation_active_uid", None),
+            now=time.monotonic(), raw_candidate_count=self.last_raw_person_count,
+            color_features=lambda: _detector_color_features(packet, persons, fmt),
+        )
+        records = None if plan is None else self.tracker.commit_detected_continuation(
+            plan, now=time.monotonic())
+        self.last_identity_processing = {
+            "mode": "detector_continuation" if records is not None else "full",
+            "reason": getattr(self.tracker, "last_detector_continuation_reason", "unavailable"),
+        }
         return records
 
     def set_frame_context(
@@ -1313,6 +1437,23 @@ class RKNNVisionPipeline:
                 )
         self.detector.release()
         self.reid.release()
+
+
+def _detector_color_features(frame, detections, frame_format):
+    """Small CPU-only check, in the same BGR/crop convention as full ReID.
+
+    No embedding extraction, gallery mutation, model call or old-feature reuse.
+    Called lazily, only after the tracker's cheap continuation preconditions.
+    """
+    arr, width, height, fmt = numpy_from_frame(frame, frame_format)
+    colors = []
+    for detection in detections:
+        x1, y1, x2, y2 = [int(round(float(v))) for v in detection.bbox]
+        x1, y1 = max(0, min(width-1, x1)), max(0, min(height-1, y1))
+        x2, y2 = max(0, min(width, x2)), max(0, min(height, y2))
+        crop = arr[y1:y2, x1:x2]
+        colors.append(_color_signature(crop[..., ::-1] if fmt == "RGB" else crop))
+    return colors
 
 
 def _elapsed_ms(start: float, end: float) -> float:

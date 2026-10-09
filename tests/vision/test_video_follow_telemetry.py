@@ -92,6 +92,19 @@ def builder_inputs():
     return c,f,ControlDecision(reason='test')
 
 
+def test_disabled_target_motion_is_not_displayed_as_a_measured_zero():
+    c, f, d = builder_inputs()
+    c.cfg.distance_target_motion_control_enable = False
+    # Even a stale/injected estimator result must not pretend this mode is
+    # still measuring the human's speed. Distance/PID diagnostics stay visible.
+    s = build_follow_snapshot(c, f, d, 'depth30', 100.05)
+    assert s.speed_timestamp is None and s.target_speed_m_s is None
+    assert s.relative_speed_m_s is None and s.speed_status == 'disabled'
+    v = FollowRecordingView.from_snapshot(s, timing(), 100.1)
+    assert 'Vt n/a Vrel n/a m/s DISABLED' in v.labels()[0]
+    assert v.pid_rpm == 55 and v.used_distance_m == 1.98
+
+
 @pytest.mark.parametrize('case',['uid','lost','search'])
 def test_unconfirmed_other_uid_or_missing_person_cannot_inherit_speed(case):
     c,f,d = builder_inputs()

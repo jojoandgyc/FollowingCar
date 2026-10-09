@@ -403,7 +403,7 @@ def _assert_depth_longitudinal_stage2_speed_cap(mod) -> None:
         mod.ControlAction.steer_left(70, 100, 100, "visual_yaw", correction_rpm=4),
     ]
     capped = mod.PersonTracker._cap_depth_longitudinal_actions(actions)
-    if [int(action.speed_percent) for action in capped] != [20, 20, 70]:
+    if [int(action.speed_percent) for action in capped] != [10, 10, 70]:
         raise AssertionError(
             "Stage-2 Depth must cap only longitudinal speeds: "
             f"{[(action.kind, action.speed_percent) for action in capped]}"
@@ -431,7 +431,8 @@ def _expected_send_diff(backend, m1_percent: int, m1_state: int, m2_percent: int
 
 def _assert_parking_lifecycle(mod) -> None:
     backend = mod.MssdMotorBackend(
-        replace(mod.MSSD_MOTOR_CONFIG, stop_zero_delay_sec=0.0),
+        replace(mod.MSSD_MOTOR_CONFIG, stop_zero_delay_sec=0.0,
+                stop_mode="normal", parking_current_a=5.0),
         logger=mod.logger,
     )
     driver = FakeDriver()
@@ -475,7 +476,8 @@ def _assert_parking_lifecycle(mod) -> None:
 
 def _assert_normal_stop_keeps_parking_mode(mod) -> None:
     backend = mod.MssdMotorBackend(
-        replace(mod.MSSD_MOTOR_CONFIG, stop_zero_delay_sec=0.0),
+        replace(mod.MSSD_MOTOR_CONFIG, stop_zero_delay_sec=0.0,
+                stop_mode="normal", parking_current_a=5.0),
         logger=mod.logger,
     )
     driver = FakeDriver()
@@ -486,6 +488,7 @@ def _assert_normal_stop_keeps_parking_mode(mod) -> None:
     expected_normal = [
         ("right_speed", 0),
         ("left_speed", 0),
+        ("stop", 1),
         ("stop", 0),
     ]
     if driver.calls != expected_normal:
@@ -498,14 +501,10 @@ def _assert_normal_stop_keeps_parking_mode(mod) -> None:
     backend.motion_armed = True
     backend.send_stop("emergency_test", mode="emergency")
     expected_emergency = [
-        ("right_speed", 0),
-        ("left_speed", 0),
         ("stop", 1),
-        ("right_speed", 0),
-        ("left_speed", 0),
     ]
     if driver.calls != expected_emergency:
-        raise AssertionError(f"emergency stop sequence changed unexpectedly: {driver.calls}")
+        raise AssertionError(f"emergency stop must not enter speed mode: {driver.calls}")
     print("normal_stop_keeps_parking_mode: PASS")
 
 
@@ -934,6 +933,7 @@ def main() -> int:
 
     tracker.frame_index = 320
     tracker._follow_controller = SimpleNamespace(
+        active_target_id=1,
         target_stop_latched=False,
         defer_search_timeout=lambda _seconds: None,
     )
@@ -1361,9 +1361,14 @@ def main() -> int:
         )
     backend.motion_armed = True
     runtime.send_robot_command(mod.ACTION_BACKWARD)
+    # _current_forward_percent is a percentage, not an RPM value. This
+    # transition test follows the configured conversion without changing it.
+    reverse_rpm = (int(runtime.config.motor_forward_raw_target)
+        if runtime.config.motor_forward_raw_target > 0 else
+        round(int(runtime.config.motor_forward_max_target_rpm) * 32 / 100.0))
     expected_reverse = (
-        backend.wheel_raw_state_to_target("left", 32, 0x02),
-        backend.wheel_raw_state_to_target("right", 32, 0x02),
+        backend.wheel_raw_state_to_target("left", reverse_rpm, 0x02),
+        backend.wheel_raw_state_to_target("right", reverse_rpm, 0x02),
     )
     _assert_pair(
         "queued_reverse_first_write_nonzero",

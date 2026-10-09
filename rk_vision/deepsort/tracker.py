@@ -30,6 +30,7 @@ class Tracker:
         self._next_id = 1
 
     def predict(self) -> None:
+        self.kf.timing = {}  # one physical frame, including all track predictions
         for track in self.tracks:
             track.predict(self.kf)
 
@@ -66,6 +67,9 @@ class Tracker:
         self.metric.partial_fit(features, targets, active_targets)
         timer.mark("metric_update")
         self.last_timing_ms = timer.finish()
+        self.last_timing_ms.update({"kf_" + key: value for key, value in self.kf.timing.items()})
+        self.last_timing_ms.update(tracks_count=len(self.tracks), detections_count=len(detections),
+                                   matched_count=len(matches), initiated_count=len(unmatched_detections))
 
     def _match(self, detections: Sequence, match_validator: Optional[MatchValidator] = None):
         validation_results = {}

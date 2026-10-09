@@ -422,6 +422,13 @@ def _assert_preferred_search_reacquire_rules() -> None:
         )
 
     bank, preferred_uid, _ = _preferred_search_bank(0.35, 0.21)
+    def competition_metadata(frame):
+        # Isolate the missing-geometry gate after valid same-frame competition.
+        return {"frame_index": frame, "source_detection_index": 0,
+                "identity_competition": {"uid": preferred_uid,
+                    "frame_index": frame, "source_detection_index": 0,
+                    "candidate_count": 2, "passed": True}}
+
     wait = bank.assign(
         track_id=3,
         feature=query,
@@ -431,7 +438,7 @@ def _assert_preferred_search_reacquire_rules() -> None:
         candidate_count=2,
         preferred_uid=preferred_uid,
         preferred_candidate_ok=True,
-        sample_metadata={"candidate_score_gap": 0.40},
+        sample_metadata=competition_metadata(5),
     )
     recovered_wait = bank.assign(
         track_id=3,
@@ -442,7 +449,7 @@ def _assert_preferred_search_reacquire_rules() -> None:
         candidate_count=2,
         preferred_uid=preferred_uid,
         preferred_candidate_ok=True,
-        sample_metadata={"candidate_score_gap": 0.40},
+        sample_metadata=competition_metadata(6),
     )
     recovered = bank.assign(
         track_id=3,
@@ -453,7 +460,7 @@ def _assert_preferred_search_reacquire_rules() -> None:
         candidate_count=2,
         preferred_uid=preferred_uid,
         preferred_candidate_ok=True,
-        sample_metadata={"candidate_score_gap": 0.40},
+        sample_metadata=competition_metadata(7),
     )
     state = bank.debug_state()
     if wait != 0 or recovered_wait != 0 or recovered != 0:
@@ -628,8 +635,8 @@ def _assert_preferred_search_reacquire_rules() -> None:
         raise AssertionError("preferred uid more than 0.15 behind the best identity must be rejected")
 
 
-def _assert_search_candidate_competition_uses_confidence_gap() -> None:
-    """Low-confidence detector fragments must not block a strong locked UID."""
+def _assert_search_candidate_competition_uses_identity_proof() -> None:
+    """Detector score differences cannot substitute for same-frame UID proof."""
     bank = IdentityBank(
         IdentityBankConfig(
             new_identity_confirm_frames=1,
@@ -645,26 +652,37 @@ def _assert_search_candidate_competition_uses_confidence_gap() -> None:
         area=1000,
         frame_index=1,
     )
+    def evidence(score_gap, *, passed=True):
+        return {
+            "frame_index": 2,
+            "source_detection_index": 0,
+            "candidate_score_gap": score_gap,
+            "identity_competition": {
+                "uid": uid, "frame_index": 2, "source_detection_index": 0,
+                "candidate_count": 2, "passed": passed,
+            },
+        }
+
     accepted = bank._preferred_search_reacquire_candidate(
         feature=feature,
         partial_feature=None,
         preferred_uid=uid,
         candidate_ok=True,
         candidate_count=2,
-        sample_metadata={"candidate_score_gap": 0.60},
+        sample_metadata=evidence(0.08),
     )
     if accepted is None:
-        raise AssertionError("a clearly stronger candidate should pass competition gating")
+        raise AssertionError("valid UID competition must survive a small YOLO score gap")
     rejected = bank._preferred_search_reacquire_candidate(
         feature=feature,
         partial_feature=None,
         preferred_uid=uid,
         candidate_ok=True,
         candidate_count=2,
-        sample_metadata={"candidate_score_gap": 0.08},
+        sample_metadata=evidence(0.60, passed=False),
     )
     if rejected is not None:
-        raise AssertionError("close-confidence candidates must remain gated")
+        raise AssertionError("a large YOLO score gap cannot override identity competition")
 
     opposite_override = bank._preferred_search_reacquire_candidate(
         feature=feature,
@@ -673,7 +691,7 @@ def _assert_search_candidate_competition_uses_confidence_gap() -> None:
         candidate_ok=False,
         candidate_count=2,
         sample_metadata={
-            "candidate_score_gap": 0.08,
+            **evidence(0.08),
             "bbox_quality_tier": "strong",
             "search_reacquire_context_active": True,
             "search_direction_compatible": False,
@@ -1467,7 +1485,9 @@ def main() -> int:
     if state["identity_count"] != 2:
         raise AssertionError(f"expected 2 identities, got {state['identity_count']}")
     uid1_state = next(item for item in state["identities"] if item["uid"] == uid1)
-    if uid1_state["last_frame"] != 2 or uid1_state["last_seen_frame"] != 4:
+    # Changing raw tracks arms template quarantine. Seeing the identity is
+    # not permission to learn that first unverified handoff crop.
+    if uid1_state["last_frame"] != 1 or uid1_state["last_seen_frame"] != 4:
         raise AssertionError(f"expected seen time to advance without feature update, got {uid1_state}")
     _assert_multi_candidate_reacquire_rules()
     _assert_reacquire_uses_last_seen_frame()
@@ -1475,7 +1495,7 @@ def main() -> int:
     _assert_controlled_handoff_requires_consecutive_matches()
     _assert_center_jump_releases_stale_claim()
     _assert_preferred_search_reacquire_rules()
-    _assert_search_candidate_competition_uses_confidence_gap()
+    _assert_search_candidate_competition_uses_identity_proof()
     _assert_preferred_search_blocks_global_fallback()
     _assert_partial_search_reacquire_uses_torso_descriptor()
     _assert_gallery_keeps_diverse_templates()

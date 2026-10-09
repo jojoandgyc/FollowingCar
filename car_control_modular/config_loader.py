@@ -90,6 +90,14 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         control_mode = "approach" if _as_bool_env(approach) == "1" else "legacy"
     if control_mode not in {"distance_pi", "approach", "legacy"}:
         raise ValueError("FOLLOW_DISTANCE_CONTROL_MODE / [distance_pid] control_mode must be distance_pi, approach or legacy")
+    target_motion = os.environ.get("DISTANCE_TARGET_MOTION_CONTROL_ENABLE",
+        parser.get("distance_pid", "target_motion_control_enable", fallback="true")).strip().lower()
+    if target_motion not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+        raise ValueError("distance_pid.target_motion_control_enable must be a boolean")
+    if target_motion in {"0", "false", "no", "off"} and control_mode != "distance_pi":
+        raise ValueError(
+            "DISTANCE_TARGET_MOTION_CONTROL_ENABLE=false requires distance_pi; "
+            "set DISTANCE_TARGET_MOTION_CONTROL_ENABLE=1 explicitly for approach/legacy rollback")
 
     # Narrow, opt-in A/B experiment. Normal DISTANCE_PID_* environment values
     # are overwritten by INI below; this explicit switch changes ONLY P.
@@ -343,7 +351,9 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "longitudinal_control_hz",
         "ASTRA_DEPTH_LONGITUDINAL_CONTROL_HZ",
     )
-    _set_env_if_present(
+    # Keep an explicit shorter ROI scheduling window usable as a rollback.
+    # This setting does not change physical Depth or motor authorization TTL.
+    _set_env_if_unset(
         parser,
         "astra_depth",
         "longitudinal_bbox_max_age_sec",
@@ -356,6 +366,9 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "ASTRA_DEPTH_LONGITUDINAL_MAX_FORWARD_PERCENT",
     )
     # Forward grant TTL only; fresh PI integration/ROI/reverse clocks stay separate.
+    _set_bool_env_if_present(parser, "astra_depth", "continuation_speed_cap_enable", "ASTRA_DEPTH_CONTINUATION_SPEED_CAP_ENABLE")
+    _set_bool_env_if_present(parser, "astra_depth", "relative_continuation_enable", "ASTRA_DEPTH_RELATIVE_CONTINUATION_ENABLE")
+    _set_env_if_present(parser, "astra_depth", "continuation_overshoot_m", "ASTRA_DEPTH_CONTINUATION_OVERSHOOT_M")
     _set_env_if_present(parser, "astra_depth", "longitudinal_sample_max_age_sec",
                         "ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC")
     _set_env_if_present(
@@ -414,6 +427,8 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "vision", "model_path", "VISION_MODEL_PATH")
     _set_env_if_present(parser, "vision", "engine", "VISION_ENGINE")
     _set_bool_env_if_present(parser, "vision", "reid_enable", "VISION_REID_ENABLE")
+    _set_bool_env_if_present(parser, "vision", "detector_continuation_enable", "Y8_DETECTOR_CONTINUATION_ENABLE")
+    _set_env_if_unset(parser, "vision", "depth_visibility_max_age_sec", "VISUAL_DEPTH_VISIBILITY_MAX_AGE_SEC")
     _set_env_if_present(parser, "vision", "reid_model_path", "VISION_REID_MODEL_PATH")
     _set_env_if_present(parser, "vision", "sample_workdir", "VISION_SAMPLE_WORKDIR")
     _set_env_if_present(parser, "vision", "sample_binary", "VISION_SAMPLE_BINARY")
@@ -581,6 +596,7 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "identity_bank", "max_features", "Y8_IDENTITY_MAX_FEATURES")
     _set_bool_env_if_present(parser, "identity_bank", "template_memory_enable", "Y8_IDENTITY_TEMPLATE_MEMORY_ENABLE")
     _set_bool_env_if_present(parser, "identity_bank", "template_crosscheck_enable", "Y8_IDENTITY_TEMPLATE_CROSSCHECK_ENABLE")
+    _set_bool_env_if_present(parser, "identity_bank", "appearance_region_safety_enable", "Y8_IDENTITY_APPEARANCE_REGION_SAFETY_ENABLE")
     _set_env_if_present(parser, "identity_bank", "template_recent_sec", "Y8_IDENTITY_TEMPLATE_RECENT_SEC")
     _set_env_if_present(parser, "identity_bank", "template_archive_sec", "Y8_IDENTITY_TEMPLATE_ARCHIVE_SEC")
     _set_env_if_present(parser, "identity_bank", "max_weak_features", "Y8_IDENTITY_MAX_WEAK_FEATURES")
@@ -853,6 +869,7 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "Y8_IDENTITY_PARTIAL_APPEARANCE_ENABLE",
     )
     _set_env_if_present(parser, "identity_bank", "partial_match_threshold", "Y8_IDENTITY_PARTIAL_MATCH_THRESHOLD")
+    _set_env_if_present(parser, "identity_bank", "partial_confirm_threshold", "Y8_IDENTITY_PARTIAL_CONFIRM_THRESHOLD")
     _set_env_if_present(parser, "identity_bank", "partial_max_features", "Y8_IDENTITY_PARTIAL_MAX_FEATURES")
     _set_env_if_present(parser, "identity_bank", "partial_update_threshold", "Y8_IDENTITY_PARTIAL_UPDATE_THRESHOLD")
     _set_bool_env_if_present(
@@ -1136,8 +1153,21 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
 
     # Longitudinal cascade outer loop: depth distance error -> target wheel RPM.
     os.environ["DISTANCE_CONTROL_MODE"] = control_mode
-    for key in ("kp_per_sec", "ki_per_sec2", "integral_max_m_s", "memory_sec", "launch_request_rpm", "motion_memory_sec"):
+    os.environ["DISTANCE_TARGET_MOTION_CONTROL_ENABLE"] = _as_bool_env(target_motion)
+    for key in ("kp_per_sec", "ki_per_sec2", "integral_max_m_s", "memory_sec", "launch_request_rpm", "motion_memory_sec", "launch_full_error_m"):
         _set_env_if_present(parser, "distance_pid", "pi_" + key, "DISTANCE_PI_" + key.upper())
+    _set_env_if_present(parser, "distance_pid", "pi_braking_stop_distance_m",
+                        "DISTANCE_PI_BRAKING_STOP_DISTANCE_M")
+    _set_env_if_unset(parser, "distance_pid", "pi_observed_feedback_reserve",
+                      "DISTANCE_PI_OBSERVED_FEEDBACK_RESERVE")
+    _set_env_if_unset(parser, "distance_pid", "pi_feedback_interval_deduplication",
+                      "DISTANCE_PI_FEEDBACK_INTERVAL_DEDUPLICATION")
+    # Keep a process-level rollback switch for the fresh-sample braking trial.
+    # Unlike old PI tuning keys, an explicit 0 must survive the runtime INI.
+    if "DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED" not in os.environ:
+        _set_bool_env_if_present(
+            parser, "distance_pid", "pi_stationary_stop_preview_enabled",
+            "DISTANCE_PI_STATIONARY_STOP_PREVIEW_ENABLED")
     _set_bool_env_if_present(parser, "distance_pid", "enable", "DISTANCE_PID_ENABLE")
     _set_env_if_present(parser, "distance_pid", "kp_rpm_per_m", "DISTANCE_PID_KP_RPM_PER_M")
     _set_env_if_present(parser, "distance_pid", "ki_rpm_per_m_s", "DISTANCE_PID_KI_RPM_PER_M_S")
@@ -1322,6 +1352,8 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "motor", "rs485_timeout", "MOTOR_RS485_TIMEOUT")
     _set_env_if_present(parser, "motor", "rs485_lib_dir", "MOTOR_RS485_LIB_DIR")
     _set_env_if_present(parser, "motor", "rs485_max_target", "MOTOR_RS485_MAX_TARGET")
+    _set_bool_env_if_present(parser, "motor", "ramp_diagnostics_enable", "MOTOR_RAMP_DIAGNOSTICS_ENABLE")
+    _set_env_if_unset(parser, "motor", "closed_loop_acceleration_rpm_s", "MOTOR_CLOSED_LOOP_ACCELERATION_RPM_S")
     _set_env_if_present(parser, "motor", "forward_raw_target", "MOTOR_FORWARD_RAW_TARGET")
     _set_env_if_present(parser, "motor", "forward_max_target_rpm", "MOTOR_FORWARD_MAX_TARGET_RPM")
     _set_env_if_present(
@@ -1772,6 +1804,14 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     # Visible-target steering cascade: camera angle outer loop plus ABZ
     # encoder-derived yaw-rate feedback. Search rotation remains independent.
     _set_bool_env_if_present(parser, "steering_pid", "enable", "VISIBLE_STEERING_PID_ENABLE")
+    _set_bool_env_if_present(parser, "steering_pid", "image_error_only", "VISIBLE_STEERING_PID_IMAGE_ERROR_ONLY")
+    _set_bool_env_if_present(parser, "steering_pid", "image_brake_assist", "VISIBLE_STEERING_PID_IMAGE_BRAKE_ASSIST")
+    _set_bool_env_if_present(parser, "steering_pid", "image_capture_motion", "VISIBLE_STEERING_PID_IMAGE_CAPTURE_MOTION")
+    _set_env_if_present(parser, "steering_pid", "image_motion_response_sec", "VISIBLE_STEERING_PID_IMAGE_MOTION_RESPONSE_SEC")
+    _set_env_if_present(parser, "steering_pid", "execution_response_trial_sec", "VISIBLE_STEERING_PID_EXECUTION_RESPONSE_TRIAL_SEC")
+    _set_env_if_present(parser, "steering_pid", "image_slow_brake_continuity_sec", "VISIBLE_STEERING_PID_IMAGE_SLOW_BRAKE_CONTINUITY_SEC")
+    _set_env_if_present(parser, "steering_pid", "outward_lead_enable", "VISIBLE_STEERING_PID_OUTWARD_LEAD_ENABLE")
+    _set_env_if_present(parser, "steering_pid", "image_center_release_margin_deg", "VISIBLE_STEERING_PID_IMAGE_CENTER_RELEASE_MARGIN_DEG")
     _set_bool_env_if_present(parser, "steering_pid", "forward_tracking_enable", "VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE")
     _set_env_if_present(parser, "steering_pid", "camera_hfov_deg", "VISIBLE_STEERING_PID_CAMERA_HFOV_DEG")
     _set_env_if_present(parser, "steering_pid", "camera_latency_sec", "VISIBLE_STEERING_PID_CAMERA_LATENCY_SEC")
@@ -1802,6 +1842,10 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "steering_pid", "predictive_brake_decel_dps2", "VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_DECEL_DPS2")
     _set_env_if_present(parser, "steering_pid", "predictive_brake_margin_deg", "VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_MARGIN_DEG")
     _set_env_if_present(parser, "steering_pid", "predictive_brake_response_sec", "VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_RESPONSE_SEC")
+    _set_env_if_present(parser, "steering_pid", "predictive_countersteer_max_correction_rpm", "VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MAX_CORRECTION_RPM")
+    _set_env_if_present(parser, "steering_pid", "predictive_countersteer_min_correction_rpm", "VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MIN_CORRECTION_RPM")
+    _set_env_if_present(parser, "steering_pid", "predictive_countersteer_gain_rpm_per_dps", "VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_GAIN_RPM_PER_DPS")
+    _set_env_if_present(parser, "steering_pid", "predictive_countersteer_min_yaw_rate_dps", "VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MIN_YAW_RATE_DPS")
     _set_env_if_present(parser, "steering_pid", "min_effective_error_deg", "VISIBLE_STEERING_PID_MIN_EFFECTIVE_ERROR_DEG")
     _set_env_if_present(parser, "steering_pid", "min_effective_correction_rpm", "VISIBLE_STEERING_PID_MIN_EFFECTIVE_CORRECTION_RPM")
     _set_env_if_present(parser, "steering_pid", "mechanical_tier2_error_deg", "VISIBLE_STEERING_PID_MECHANICAL_TIER2_ERROR_DEG")
@@ -1846,6 +1890,13 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "lateral_intent", "motor_publish_interval_sec", "LATERAL_INTENT_MOTOR_PUBLISH_INTERVAL_SEC")
     _set_env_if_present(parser, "lateral_intent", "follow_wheel_period_sec", "FOLLOW_WHEEL_PERIOD_SEC")
     _set_bool_env_if_present(parser, "lateral_intent", "follow_forward_handoff_enable", "FOLLOW_FORWARD_HANDOFF_ENABLE")
+    _set_env_if_present(parser, "lateral_intent", "follow_residual_reverse_max_rpm", "FOLLOW_RESIDUAL_REVERSE_MAX_RPM")
+    _set_bool_env_if_present(parser, "lateral_intent", "follow_forward_loss_handoff_enable", "FOLLOW_FORWARD_LOSS_HANDOFF_ENABLE")
+    _set_env_if_present(parser, "lateral_intent", "follow_turn_residual_max_rpm", "FOLLOW_TURN_RESIDUAL_MAX_RPM")
+    _set_bool_env_if_present(parser, "lateral_intent", "follow_turn_acceleration_priority_enable", "FOLLOW_TURN_ACCELERATION_PRIORITY_ENABLE")
+    _set_bool_env_if_present(parser, "lateral_intent", "follow_turn_response_assist_enable", "FOLLOW_TURN_RESPONSE_ASSIST_ENABLE")
+    _set_bool_env_if_present(parser, "lateral_intent", "follow_cross_brake_enable", "FOLLOW_CROSS_BRAKE_ENABLE")
+    _set_env_if_present(parser, "lateral_intent", "follow_cross_brake_mode", "FOLLOW_CROSS_BRAKE_MODE")
     _set_env_if_present(parser, "lateral_intent", "log_interval_sec", "LATERAL_INTENT_LOG_INTERVAL_SEC")
     _set_bool_env_if_present(parser, "safety", "side_ir_blocks_rotation", "SIDE_IR_BLOCKS_ROTATION")
     _set_env_if_present(parser, "safety", "side_ir_confirm_sec", "SIDE_IR_CONFIRM_SEC")

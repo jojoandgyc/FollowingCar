@@ -151,6 +151,7 @@ def test_confirmed_candidate_keeps_directional_search_state() -> None:
         frame_width=640,
         confirmed=True,
         source="formal",
+        candidate_confirmed_uid=1,
     )
     assert item.search_status().state == "searching"
     assert item.search_status().direction == "right"
@@ -220,7 +221,7 @@ def test_missing_centering_candidate_keeps_search_side() -> None:
     assert resumed.reason in ("search_right", "lost_wait_yaw_right")
 
 
-def test_blocked_opposite_candidate_flips_search_side_after_candidate_gate() -> None:
+def test_blocked_opposite_candidate_preserves_search_side_after_candidate_gate() -> None:
     item = controller()
     item.cfg = replace(item.cfg, lost_confirm_frames=3)
     establish_target(item)
@@ -236,16 +237,15 @@ def test_blocked_opposite_candidate_flips_search_side_after_candidate_gate() -> 
         confirmed=True,
         source="formal",
     )
-    # CandidateGate has already selected this as the highest valid detector
-    # candidate for the capture frame. The search controller therefore accepts
-    # one blocked/low-confidence side observation without waiting another frame.
+    # CandidateGate completion is not formal identity confirmation. This
+    # observation cannot reverse a trusted search direction.
     assert not item.note_search_candidate_evidence(
         (400.0, 40.0, 540.0, 460.0),
         frame_width=640,
         confirmed=False,
         source="blocked",
     )
-    assert item.search_direction == "right"
+    assert item.search_direction == "left"
 
 
 def test_opposite_candidate_does_not_pause_active_search() -> None:
@@ -254,8 +254,7 @@ def test_opposite_candidate_does_not_pause_active_search() -> None:
     item.search_state = "searching"
     item.search_direction = "left"
 
-    # A detector-only right-side box during a left search immediately flips
-    # the active scan direction.
+    # A detector-only right-side box cannot change the active scan direction.
     assert not item.note_search_candidate_evidence(
         (410.0, 40.0, 560.0, 460.0),
         frame_width=640,
@@ -263,7 +262,7 @@ def test_opposite_candidate_does_not_pause_active_search() -> None:
         source="formal",
     )
     assert item.search_state == "searching"
-    assert item.search_direction == "right"
+    assert item.search_direction == "left"
 
 
 def main() -> int:
@@ -274,7 +273,7 @@ def main() -> int:
     test_confirmed_candidate_keeps_directional_search_state()
     test_confirmed_candidate_interrupts_locked_search_and_switches_on_opposite_side()
     test_missing_centering_candidate_keeps_search_side()
-    test_blocked_opposite_candidate_flips_search_side_after_candidate_gate()
+    test_blocked_opposite_candidate_preserves_search_side_after_candidate_gate()
     test_opposite_candidate_does_not_pause_active_search()
     print("stale_direction_recovery_ok")
     return 0

@@ -21,6 +21,15 @@ class FakeDriver:
         self.left = self.right = 0
         self.pairs = []
         self.stops = []
+        self.registers = {'left_parking_current': 0., 'right_parking_current': 0.}
+        self.register_writes = []
+
+    def write_register(self, name, value, persist=False):
+        self.registers[name] = value
+        self.register_writes.append((name, value, persist))
+
+    def read_register(self, name):
+        return self.registers[name]
 
     def set_right_speed(self, value):
         self.right = int(value)

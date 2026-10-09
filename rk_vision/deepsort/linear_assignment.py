@@ -116,12 +116,48 @@ def gate_cost_matrix(
 
 
 def _linear_sum_assignment(cost_matrix):
+    shape = getattr(cost_matrix, "shape", ())
+    if len(shape) == 2 and min(shape) == 1:
+        np = _np()
+        if (
+            cost_matrix.dtype.kind in "biuf"
+            and np.can_cast(cost_matrix.dtype, np.float64, casting="safe")
+            and np.isfinite(cost_matrix).all()
+        ):
+            # With one row or column the exact assignment is its minimum.
+            # Match scipy's float64 comparison (including large integer ties)
+            # and first-index tie break; keep exceptional inputs on the old
+            # solver/fallback path. min_cost_matching still rejects gated or
+            # over-threshold pairs after this choice.
+            index = int(np.argmin(np.asarray(cost_matrix, dtype=np.float64)))
+            row, col = (0, index) if shape[0] == 1 else (index, 0)
+            return np.asarray([row], dtype=int), np.asarray([col], dtype=int)
     try:
         from scipy.optimize import linear_sum_assignment
 
         return linear_sum_assignment(cost_matrix)
     except Exception:
         return _greedy_linear_assignment(cost_matrix)
+
+
+def prepare_assignment_backend() -> str:
+    """Pay optional solver import/first-call costs before processing frames.
+
+    This creates no tracks and touches no models or hardware. The general
+    assignment path deliberately keeps its existing fallback behavior if
+    scipy is unavailable or rejects a matrix; preparation must not make an
+    optional dependency mandatory.
+    """
+    np = _np()
+    matrix = np.asarray([[0.3, 0.1], [0.2, 0.4]], dtype="float32")
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        linear_sum_assignment(matrix)
+        return "scipy"
+    except Exception:
+        _greedy_linear_assignment(matrix)
+        return "fallback"
 
 
 def _greedy_linear_assignment(cost_matrix):

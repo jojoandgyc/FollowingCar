@@ -1,5 +1,6 @@
 """Pure temporal/geometry replay: no camera, driver or identity bank writes."""
 import pytest
+from types import SimpleNamespace
 
 from car_control_modular.search_observation_retry import SearchObservationRetry
 
@@ -25,11 +26,14 @@ def entered():
 
 def test_capture643_646_can_retry_once_after_already_observed():
     gate = entered()
-    decision = tick(gate, 10.2, 648, zero_sent_at=10.21)
+    feedback = SimpleNamespace(timestamp=10.23, trustworthy=True,
+                               left_forward_rpm=0., right_forward_rpm=0.)
+    decision = tick(gate, 10.2, 648, zero_sent_at=10.21, feedback=feedback)
     assert decision.pause_rotation and not decision.completed  # captured before zero
-    decision = tick(gate, 10.30, 651, zero_sent_at=10.21)
+    feedback.timestamp = 10.28
+    decision = tick(gate, 10.30, 651, zero_sent_at=10.21, feedback=feedback)
     assert decision.completed and not decision.pause_rotation
-    assert decision.reason == "search_retry_post_zero_capture"
+    assert decision.reason == "search_retry_post_settled_capture"
     for i in range(30):
         assert tick(gate, 10.4+i*.1, 652+i) is None
     assert gate.spent

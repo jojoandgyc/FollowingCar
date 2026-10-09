@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple
 
 
@@ -42,6 +43,9 @@ class SearchCandidateGateConfig:
     # callers' legacy behavior. Full/partial identity matching is unaffected.
     probe_edge_min_score: float = 0.0
     probe_edge_center_ratio: float = 0.15
+    # Stop-observation eligibility only, not the detector/ReID threshold.
+    # A current identity-supported preferred box can still request a look.
+    probe_observation_min_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,7 @@ class SearchCandidateGate:
         self._blocked_missing_frames = 0
         self._last_timestamp: Optional[float] = None
         self.last_ignored_edge_probes: Tuple[CandidateObservation, ...] = ()
+        self.last_ignored_weak_probes: Tuple[CandidateObservation, ...] = ()
 
     @property
     def hold_active(self) -> bool:
@@ -97,6 +102,7 @@ class SearchCandidateGate:
         self._blocked_missing_frames = 0
         self._last_timestamp = None
         self.last_ignored_edge_probes = ()
+        self.last_ignored_weak_probes = ()
 
     @staticmethod
     def _iou(first: BBox, second: BBox) -> float:
@@ -123,11 +129,13 @@ class SearchCandidateGate:
         valid = []
         for candidate in candidates:
             score = float(candidate.score)
-            if score < float(min_score):
+            if not math.isfinite(score) or score < float(min_score):
                 continue
             if below_score is not None and score >= float(below_score):
                 continue
             x1, y1, x2, y2 = (float(value) for value in candidate.bbox)
+            if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+                continue
             box_width = max(0.0, x2 - x1)
             box_height = max(0.0, y2 - y1)
             if box_width <= 0.0 or box_height <= 0.0:
@@ -197,6 +205,15 @@ class SearchCandidateGate:
             (ignored if weak_edge and not preferred else accepted).append(item)
         return tuple(accepted), tuple(ignored)
 
+    def _stop_observation_probes(self, probes, preferred_bbox):
+        accepted, ignored = [], []
+        for item in probes:
+            supported = preferred_bbox is not None and self._iou(
+                preferred_bbox, item.bbox) >= max(.5, self.config.consistency_iou)
+            weak = item.score < self.config.probe_observation_min_score
+            (ignored if weak and not supported else accepted).append(item)
+        return tuple(accepted), tuple(ignored)
+
     def _start_hold(
         self,
         candidate: CandidateObservation,
@@ -254,6 +271,7 @@ class SearchCandidateGate:
             below_score=self.config.formal_min_score,
         )
         probe, ignored = self._observation_probes(probe, width=width, preferred_bbox=preferred_bbox)
+        probe, weak = self._stop_observation_probes(probe, preferred_bbox)
         candidate, source, preferred_match = self._select_current(
             formal,
             probe,
@@ -261,6 +279,7 @@ class SearchCandidateGate:
         )
         if candidate is None:
             return SearchCandidateGateDecision(reason=(
+                "weak_probe_observation_only" if weak else
                 "edge_low_score_probe_ignored" if ignored else "no_candidate"
             ))
         return SearchCandidateGateDecision(
@@ -285,18 +304,29 @@ class SearchCandidateGate:
         formal_candidates: Tuple[CandidateObservation, ...] = (),
         probe_candidates: Tuple[CandidateObservation, ...] = (),
         preferred_bbox: Optional[BBox] = None,
+        deferred_observation_bboxes: Tuple[BBox, ...] = (),
     ) -> SearchCandidateGateDecision:
         now = float(timestamp)
+        if not self.config.enabled or not search_active:
+            self.reset()
+            return SearchCandidateGateDecision(reason="search_inactive")
+        if not math.isfinite(now) or (self._last_timestamp is not None and now <= self._last_timestamp):
+            # A replay cannot consume hold frames, missing-frame budgets, or
+            # rearm a previously observed candidate. The processing-time
+            # settlement wrapper still enforces the bounded hold deadline.
+            return SearchCandidateGateDecision(
+                pause_rotation=self.hold_active, source=self._hold_source if self.hold_active else "none",
+                reason="candidate_observation_duplicate_or_old",
+                bbox=self._hold_bbox if self.hold_active else None,
+                score=self._hold_score if self.hold_active else 0.,
+                hold_frames=max(1, int(self.config.hold_frames)),
+            )
         defer_sec = (
             0.0
             if self._last_timestamp is None
             else max(0.0, now - float(self._last_timestamp))
         )
         self._last_timestamp = now
-        if not self.config.enabled or not search_active:
-            self.reset()
-            return SearchCandidateGateDecision(reason="search_inactive")
-
         formal = self._valid_candidates(
             formal_candidates,
             width=width,
@@ -312,11 +342,31 @@ class SearchCandidateGate:
         )
         probe, ignored = self._observation_probes(probe, width=width, preferred_bbox=preferred_bbox)
         self.last_ignored_edge_probes = ignored
+        probe, weak = self._stop_observation_probes(probe, preferred_bbox)
+        self.last_ignored_weak_probes = weak
         current, current_source, preferred_match = self._select_current(
             formal,
             probe,
             preferred_bbox,
         )
+
+        if (current is not None and not preferred_match
+                and any(self._iou(current.bbox, bbox) >= .85 for bbox in deferred_observation_bboxes)):
+            held = self.hold_active
+            if held:
+                # An already-started look remains spent; coverage flicker
+                # cannot buy another pause. An unstarted look spends nothing.
+                self._blocked_bbox = self._hold_bbox
+                self._blocked_missing_frames = 0
+            self._hold_remaining = 0
+            self._hold_started_at = None
+            self._hold_bbox = None
+            self._probe_bbox = None
+            self._probe_streak = 0
+            return SearchCandidateGateDecision(
+                source=current_source, reason="candidate_observation_deferred_edge_coverage",
+                completed=held, bbox=current.bbox, score=current.score,
+            )
 
         # A previously eligible probe may degrade into a weak edge sliver.
         # Release ITS observation immediately, but never cancel an unrelated
@@ -325,18 +375,19 @@ class SearchCandidateGate:
             current is None and self.hold_active and self._hold_source == "probe"
             and self._hold_bbox is not None
             and any(self._iou(self._hold_bbox, item.bbox) >= float(self.config.consistency_iou)
-                    for item in ignored)
+                    for item in ignored + weak)
         )
         if cancelled:
             self._hold_remaining = 0
             self._hold_started_at = None
             self._hold_bbox = None
             self._hold_source = "none"
-        if current is None and ignored and not self.hold_active:
+        if current is None and (ignored or weak) and not self.hold_active:
             self._probe_bbox = None
             self._probe_streak = 0
             return SearchCandidateGateDecision(
-                reason="edge_low_score_probe_ignored", completed=cancelled,
+                reason=("weak_probe_observation_only" if weak else
+                        "edge_low_score_probe_ignored"), completed=cancelled,
             )
 
         if self._hold_remaining > 0:

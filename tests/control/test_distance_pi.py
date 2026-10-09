@@ -357,7 +357,7 @@ def test_explicit_reverse_keeps_legacy_pid_and_clears_forward_memory():
 
 
 @pytest.mark.parametrize("field,value", [("kp_per_sec", 0.), ("ki_per_sec2", float("nan")),
-                                         ("integral_max_m_s", -1.), ("physical_ttl_sec", .251),
+                                         ("integral_max_m_s", -1.), ("physical_ttl_sec", .301),
                                          ("fresh_update_max_age_sec", .181),
                                          ("max_integration_gap_sec", .181),
                                          ("stationary_confirm_samples", 1)])

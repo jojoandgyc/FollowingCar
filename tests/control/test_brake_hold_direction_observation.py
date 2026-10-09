@@ -221,3 +221,132 @@ def test_real_logged_detector_boxes_choose_left_without_hardware(owner):
     c._capture_lost_exit_direction(frame, search_entry=True)
     assert c._lost_exit_direction == "left"
     assert c._target_direction_history.latest_reliable_side().last_visible_capture_frame_id == 666
+
+
+@pytest.mark.parametrize("age", [.2132, .2239, .30, .50])
+def test_delayed_verified_geometry_is_history_only(owner, monkeypatch, age, caplog):
+    monkeypatch.setattr(runtime, "VISION_CONTROL_MAX_RESULT_AGE_SEC", .210)
+    r = sample(owner, 666, .83)
+    owner.clock = owner._active_capture_timestamp + age
+    with caplog.at_level("INFO"):
+        consume(owner, [r])
+    c = owner._follow_controller
+    assert c._direction_latest_visible_capture_id == 666
+    assert c._target_direction_history.latest_visible_evidence().timestamp == owner._active_capture_timestamp
+    assert c.search_direction == "right"  # actuator state not changed by observation
+    assert owner._current_forward_percent == 0
+    assert owner._longitudinal_valid_until == 99.8
+    assert "motion_authorized=False" in caplog.text
+    assert "history_max_age_ms=500.0 motion_max_age_ms=210.0" in caplog.text
+
+
+@pytest.mark.parametrize("age", [.501, 1., -0.01, float("nan"), float("inf")])
+def test_history_window_does_not_accept_unbounded_or_invalid_age(owner, age):
+    r = sample(owner, 666, .83)
+    owner.clock = owner._active_capture_timestamp + age
+    consume(owner, [r])
+    assert owner._follow_controller._direction_latest_visible_capture_id == 651
+    assert owner._longitudinal_valid_until == 99.8
+
+
+@pytest.mark.parametrize("reject", ["uid0", "geometry", "competition", "identity", "quality", "predicted"])
+def test_late_window_does_not_bypass_identity_gates(owner, reject):
+    r = sample(owner, 666, .83)
+    owner.clock = owner._active_capture_timestamp + .30
+    obs = owner._rknn_pipeline.tracker.last_identity_observations[0]
+    if reject == "uid0": r.reid_uid = 0
+    elif reject == "geometry": obs["assignment"]["reacquire_geometry_ok"] = False
+    elif reject == "competition": obs["sample_metadata"]["identity_competition"] = dict(passed=False)
+    elif reject == "identity": obs["assignment"]["identity_control_rejected"] = True
+    elif reject == "quality": obs["assignment"]["bbox_quality_ok"] = False
+    elif reject == "predicted": r.time_since_update = 1
+    consume(owner, [r])
+    assert owner._follow_controller._direction_latest_visible_capture_id == 651
+
+
+def test_cap1226_to1240_replay_searches_right_after_hold(owner, monkeypatch):
+    monkeypatch.setattr(runtime, "VISION_CONTROL_MAX_RESULT_AGE_SEC", .210)
+    t, c = owner, owner._follow_controller
+    # The controller's pre-brake selected tracking box was still on the left.
+    c.note_brake_hold_observation(SensorFrame(width=640, height=480,
+        capture_frame_id=1226, capture_timestamp=29182.192740054),
+        PersonTarget((10, 20, 235.4, 459), 1, .904, 98950.6))
+    c.search_direction = c._lost_exit_direction = "left"
+    rows = [
+        (1228, 29182.293986404, .2409, (65.6242,27.7799,284.9793,474.5524)),
+        (1237, 29182.786996651, .2239, (353.2532,38.2220,565.9906,475.7416)),
+        (1240, 29182.957708978, .2132, (426.8488,32.7195,639.2535,474.2030)),
+    ]
+    for cap, stamp, age, bbox in rows:
+        r = sample(t, cap, .5)
+        t.clock, t._active_capture_timestamp = stamp + age, stamp
+        obs = t._rknn_pipeline.tracker.last_identity_observations[0]
+        obs["detector_bbox"] = bbox
+        obs["sample_metadata"]["capture_timestamp"] = stamp
+        consume(t, [r])
+        assert c.search_direction == "left"  # hold still owns all motion
+        assert t._longitudinal_valid_until == 99.8
+    assert c._direction_latest_visible_capture_id == 1240
+    consume(t, [sample(t, 1244, .917, uid=0)])
+    t.pending = False
+    t._finish_search_brake_observation_hold()
+    assert c.search_direction is None and c._lost_exit_direction is None
+    for cap in (1252, 1254, 1257):
+        frame = SensorFrame(width=640, height=480, capture_frame_id=cap,
+                            capture_timestamp=29183.5 + (cap-1252)*.054)
+        c._record_target_direction_evidence(frame, None, reliable=True)
+    c._capture_lost_exit_direction(frame, search_entry=True)
+    assert c._lost_exit_direction == "right"
+    assert c._target_direction_history.latest_reliable_side().last_visible_capture_frame_id == 1240
+    assert t._current_forward_percent == 0
+
+
+@pytest.mark.parametrize("pending", [True, False])
+def test_stale_pipeline_branch_keeps_safety_and_only_records_during_hold(owner, pending):
+    # Execute the production branch itself; no camera, inference or motor thread.
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(runtime.PersonTracker.process_external_frame)))
+    branch = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Name) and n.test.id == "stale_result_discarded"
+        and any(isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute)
+                and x.func.attr == "_handle_stale_vision_result" for x in ast.walk(n)))
+    r = sample(owner, 666, .83)
+    owner.clock = owner._active_capture_timestamp + .30
+    owner.pending = pending
+    owner.frame_index = 529
+    calls = []
+    def invalidate(**kwargs):
+        calls.append(kwargs)
+        # Same ordering as the real safety handler; recording before this call
+        # would lose the new visible slot again.
+        owner._follow_controller.note_stale_visual_result(frame_width=640,
+            now=owner.clock, capture_frame_id=666,
+            capture_timestamp=owner._active_capture_timestamp)
+    owner._handle_stale_vision_result = invalidate
+    env = dict(vars(runtime), self=owner, width=640, height=480, records=[r],
+               stale_result_discarded=True, vision_result_age_sec=.25)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[])),
+                 "production_stale_branch", "exec"), env)
+    assert len(calls) == 1
+    assert owner._follow_controller._direction_latest_visible_capture_id == (666 if pending else 651)
+    assert owner._longitudinal_valid_until == 99.8
+    if pending:
+        owner._finish_search_brake_observation_hold()
+        assert not owner._follow_controller.stale_direction_recovery_active
+        assert owner._follow_controller.search_direction is None
+
+
+def test_brake_history_timing_is_current_capture_only(owner, caplog):
+    r = sample(owner, 666, .83)
+    owner._brake_observation_pipeline_timing = dict(capture_frame_id=666,
+        capture_timestamp=owner._active_capture_timestamp,
+        capture_to_pipeline_ms=66.4, vision_processing_ms=146.8)
+    with caplog.at_level("INFO"):
+        consume(owner, [r])
+    assert "capture_to_pipeline_ms=66.4 vision_processing_ms=146.8" in caplog.text
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        consume(owner, [sample(owner, 668, .85)])
+    assert "capture_to_pipeline_ms=None vision_processing_ms=None" in caplog.text

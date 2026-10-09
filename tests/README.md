@@ -1,11 +1,15 @@
 # Runtime Module Tests
 
-These tests are executable scripts.  They are intentionally split by module so
-board-side checks can be run one at a time.
+The tests include pytest cases and executable legacy scripts, split by module.
+The default suite collects the reviewed hardware-free scripts through
+`test_legacy_script_checks.py`; arbitrary `main()` functions are never executed
+automatically. Identity script assertions are also individually collected so a
+failure cannot hide the remaining cases.
 
 ## Safe local checks
 
 ```bash
+python3 -m pytest -q
 python3 tests/config/test_rk3588_runtime_config.py car_control_modular/config/reid_runtime.ini
 python3 tests/control/test_controller_logic.py
 python3 tests/vision/test_deepsort_tracker.py
@@ -14,6 +18,9 @@ python3 tests/motor/test_mssd_mapping.py --config car_control_modular/config/rei
 python3 tests/sensors/test_ir_iio.py --fake
 python3 tests/sensors/test_ultrasonic_iio.py --fake
 ```
+
+Default discovery is restricted to `tests/`. Live motor and IIO commands below
+remain manual, explicitly selected checks; do not run them as routine regression.
 
 On Windows without local `numpy`/`requests`, run the dependency-light checks via
 `uv`, and run the vision checks in the RKNN Docker image:

@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import os
 import queue
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -20,7 +21,7 @@ class VideoRecorderConfig:
     output_path: str
     fps: float
     fourcc: str = "MJPG"
-    queue_capacity: int = 60
+    queue_capacity: int = 12
     # Detection metadata arrives after the camera frame has been captured.
     # Waiting happens only in the recorder thread, never in control or capture.
     overlay_wait_sec: float = 0.25
@@ -31,6 +32,7 @@ class VideoRecorderConfig:
     # thread settings shared by the control/vision pipeline.
     fast_mjpeg: bool = True
     jpeg_quality: int = 90
+    worker_nice: int = 5
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,8 @@ class VideoTrackOverlay:
     quality_reason: str = ""
     fresh: bool = True
     active_target: bool = False
+    initial_enrollment_detail: str = ""
+    initial_enrollment_blocker: str = ""
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,52 @@ class VideoFrameOverlay:
     detections: tuple[VideoDetectionOverlay, ...] = ()
     tracks: tuple[VideoTrackOverlay, ...] = ()
     control: VideoControlOverlay = VideoControlOverlay()
+
+
+def startup_status(overlay: VideoFrameOverlay) -> str:
+    """Explain detection vs enrollment vs control lock; diagnostic only."""
+    control = overlay.control
+    if control.active_target_id is not None:
+        return f'TARGET U{control.active_target_id} - {control.search_state.upper()}'
+    if control.decision_reason.startswith('initial_'):
+        return 'START WAIT LOCK - STOPPED'
+    tracks = [t for t in overlay.tracks if t.fresh]
+    if any(t.reid_uid > 0 for t in tracks):
+        return 'START WAIT LOCK - ID READY'
+    reasons = {t.assignment_reason for t in tracks}
+    details = {t.initial_enrollment_detail for t in tracks}
+    blockers = {t.initial_enrollment_blocker for t in tracks}
+    if 'pending_initial_track_rebind' in reasons:
+        return 'START VERIFY FIRST PERSON - NEW TRACK 1/2'
+    if 'startup_anchor_expired' in blockers:
+        return 'START FIRST ID EXPIRED - RESTART TO RESELECT'
+    if 'initial_candidate_track_changed' in reasons:
+        return 'START WAIT FIRST CANDIDATE - RESET IF LOST'
+    if blockers & {'continuity_broken', 'pose_window_expired', 'clipped_side_changed'}:
+        return 'START FIRST ID UNRESOLVED - RESTART TO RESELECT'
+    if 'initial_candidate_appearance_mismatch' in reasons:
+        return 'START VERIFY FIRST CANDIDATE - STOPPED'
+    if 'initial_candidate_ambiguous' in reasons or 'multiple_candidates' in details:
+        return 'START WAIT - ONE PERSON REQUIRED'
+    if 'pending_initial_identity' in reasons:
+        return 'START ENROLL 1/2 - WAIT NEW FRAME'
+    if 'initial_capture_not_new' in reasons:
+        return 'START ENROLL - WAIT NEW FRAME'
+    for reason, label in (
+        ('lateral_crop', 'LEFT / RIGHT CROP'),
+        ('aspect_ratio_out_of_range', 'ASPECT RATIO'),
+        ('body_too_small', 'BODY TOO SMALL'),
+        ('stale_observation', 'STALE IMAGE'),
+        ('bbox_quality', 'BBOX QUALITY'),
+        ('geometry_unavailable', 'GEOMETRY MISSING'),
+    ):
+        if reason in details:
+            return 'START WAIT BODY - ' + label
+    if 'initial_crop_incomplete' in reasons:
+        return 'START WAIT BODY - SIDE CROP / SIZE'
+    if tracks or any(d.class_id == 0 for d in overlay.detections):
+        return 'START PERSON DETECTED - WAIT QUALITY / TRACK'
+    return 'START WAIT PERSON'
 
 
 class AsyncVideoRecorder:
@@ -163,11 +213,15 @@ class AsyncVideoRecorder:
         self._overlay_condition = threading.Condition()
         self._overlays: dict[int, VideoFrameOverlay] = {}
         self._submitted_capture_ids: set[int] = set()
-        self._written_capture_ids: set[int] = set()
+        self._text_layout_cache = OrderedDict()
+        self._text_raster_cache = OrderedDict()
+        self._text_raster_bytes = 0
+        self._metadata_dropped = 0
         self._sharpness_error_logged = False
         self._depth_sample_provider = depth_sample_provider
         self._depth_overlay_error_logged = False
         self._recording_timings = deque(maxlen=120)
+        self._submission_timings = deque(maxlen=120)
         self._recording_timing_last_log = 0.0
         self._last_seen_capture_id = None
 
@@ -189,6 +243,21 @@ class AsyncVideoRecorder:
         return self._error
 
     def submit(
+        self, image: Any, *, capture_frame_id: Optional[int] = None,
+        control_frame_id: Optional[int] = None, control_frame_index: Optional[int] = None,
+        monotonic_sec: Optional[float] = None, unix_sec: Optional[float] = None,
+        wheel_feedback: Any = None, follow_snapshot: Any = None, linear_timing: Any = None,
+    ) -> bool:
+        started = time.monotonic()
+        try:
+            return self._submit(image, capture_frame_id=capture_frame_id,
+                control_frame_id=control_frame_id, control_frame_index=control_frame_index,
+                monotonic_sec=monotonic_sec, unix_sec=unix_sec, wheel_feedback=wheel_feedback,
+                follow_snapshot=follow_snapshot, linear_timing=linear_timing)
+        finally:
+            self._submission_timings.append((time.monotonic()-started)*1000.)
+
+    def _submit(
         self,
         image: Any,
         *,
@@ -215,35 +284,40 @@ class AsyncVideoRecorder:
         # Skip the RGB copy when already full. Capture never waits for encode.
         if self._queue.full():
             return self._drop_frame(int(capture_frame_id))
-        item = _QueuedFrame(
-            image=image.copy(),
-            capture_frame_id=int(capture_frame_id),
-            control_frame_id=(None if control_frame_id is None else int(control_frame_id)),
-            monotonic_sec=float(time.monotonic() if monotonic_sec is None else monotonic_sec),
-            unix_sec=float(time.time() if unix_sec is None else unix_sec),
-            wheel_feedback=wheel_feedback,
-            follow_snapshot=follow_snapshot,
-            linear_timing=linear_timing,
-        )
-        self._last_seen_capture_id = int(item.capture_frame_id)
-        with self._overlay_condition:
-            self._submitted_capture_ids.add(int(item.capture_frame_id))
+        # Metadata contention must never stall camera delivery. Reserve before
+        # copying/enqueueing so a fast vision result can attach its own CAP.
+        if not self._overlay_condition.acquire(blocking=False):
+            return self._drop_frame(int(capture_frame_id))
         try:
+            self._submitted_capture_ids.add(int(capture_frame_id))
+            item = _QueuedFrame(
+                image=image.copy(),
+                capture_frame_id=int(capture_frame_id),
+                control_frame_id=(None if control_frame_id is None else int(control_frame_id)),
+                monotonic_sec=float(time.monotonic() if monotonic_sec is None else monotonic_sec),
+                unix_sec=float(time.time() if unix_sec is None else unix_sec),
+                wheel_feedback=wheel_feedback,
+                follow_snapshot=follow_snapshot,
+                linear_timing=linear_timing,
+            )
             self._queue.put_nowait(item)
             self._submitted += 1
             return True
         except queue.Full:
-            with self._overlay_condition:
-                self._submitted_capture_ids.discard(int(item.capture_frame_id))
-            return self._drop_frame(int(item.capture_frame_id))
+            self._submitted_capture_ids.discard(int(capture_frame_id))
+            self._overlays.pop(int(capture_frame_id), None)
+            return self._drop_frame(int(capture_frame_id))
+        except Exception:
+            self._submitted_capture_ids.discard(int(capture_frame_id))
+            self._overlays.pop(int(capture_frame_id), None)
+            raise
+        finally:
+            self._overlay_condition.release()
 
     def _drop_frame(self, capture_id):
         self._dropped += 1
-        now = time.monotonic()
-        if now-self._last_drop_log_ts >= 1.:
-            self._last_drop_log_ts = now
-            self._logger.warning("Camera recorder queue full: dropped=%d queued=%d capture=%d output=%s",
-                                 self._dropped, self._queue.qsize(), capture_id, self.config.output_path)
+        # Recorder worker emits totals; never write a potentially blocking log
+        # to stdout/disk from the capture thread's overload path.
         return False
 
     def update_overlay(
@@ -281,11 +355,16 @@ class AsyncVideoRecorder:
             tracks=tuple(normalized_tracks),
             control=normalized_control,
         )
-        with self._overlay_condition:
-            if capture_id not in self._submitted_capture_ids or capture_id in self._written_capture_ids:
+        if not self._overlay_condition.acquire(blocking=False):
+            self._metadata_dropped += 1
+            return False
+        try:
+            if capture_id not in self._submitted_capture_ids:
                 return False
             self._overlays[capture_id] = overlay
             self._overlay_condition.notify_all()
+        finally:
+            self._overlay_condition.release()
         return True
 
     def close(self, timeout_sec: float = 3.0) -> bool:
@@ -325,6 +404,7 @@ class AsyncVideoRecorder:
         previous_capture_id = None
         backend = "opencv"
         try:
+            self._lower_worker_priority()
             while not self._closing.is_set() or not self._queue.empty():
                 try:
                     item = self._queue.get(timeout=0.1)
@@ -427,6 +507,7 @@ class AsyncVideoRecorder:
                     item.image, video_frame_number, item.capture_frame_id, overlay,
                     sharpness=sharpness, wheels=wheels, follow=follow, depth_view=depth_view,
                     capture_elapsed_sec=item.monotonic_sec-first_capture_timestamp,
+                    copy_image=False,
                 )
                 draw_end = time.monotonic()
                 writer.write(annotated)
@@ -478,7 +559,6 @@ class AsyncVideoRecorder:
                 previous_capture_id = item.capture_frame_id
                 self._written += 1
                 with self._overlay_condition:
-                    self._written_capture_ids.add(int(item.capture_frame_id))
                     self._submitted_capture_ids.discard(int(item.capture_frame_id))
                     self._overlays.pop(int(item.capture_frame_id), None)
                 self._queue.task_done()
@@ -506,6 +586,21 @@ class AsyncVideoRecorder:
             self._logger.info("Camera recording capture range: last_seen=%s last_written=%s",
                               self._last_seen_capture_id, previous_capture_id)
 
+    def _lower_worker_priority(self):
+        """Linux native-thread niceness only; never renice the whole process."""
+        if threading.current_thread() is not self._thread:
+            return
+        try:
+            tid = threading.get_native_id()
+            current = os.getpriority(os.PRIO_PROCESS, tid)
+            requested = max(current, min(19, max(0, int(self.config.worker_nice))))
+            if requested != current:
+                os.setpriority(os.PRIO_PROCESS, tid, requested)
+            self._logger.info("Camera recording worker priority: tid=%d nice=%d queue_capacity=%d",
+                              tid, os.getpriority(os.PRIO_PROCESS, tid), self._queue.maxsize)
+        except (AttributeError, OSError, ValueError) as exc:
+            self._logger.warning("Camera recording worker priority unchanged: %s", exc)
+
     def _log_recording_timings(self, backend):
         if not self._recording_timings:
             return
@@ -515,8 +610,41 @@ class AsyncVideoRecorder:
             values = sorted(row[i] for row in self._recording_timings)
             parts.append("%s_ms(avg=%.2f,p95=%.2f,max=%.2f)" % (
                 name, sum(values)/len(values), values[min(len(values)-1,int(.95*len(values)))], values[-1]))
-        self._logger.info("Camera recording timing: backend=%s n=%d queued=%d dropped=%d %s",
-                          backend, len(self._recording_timings), self._queue.qsize(), self._dropped, " ".join(parts))
+        submitted = sorted(tuple(self._submission_timings))
+        if submitted:
+            parts.append("submit_ms(avg=%.2f,p95=%.2f,max=%.2f)" % (
+                sum(submitted)/len(submitted), submitted[min(len(submitted)-1,int(.95*len(submitted)))], submitted[-1]))
+        self._logger.info("Camera recording timing: backend=%s n=%d queued=%d dropped=%d metadata_dropped=%d %s",
+                          backend, len(self._recording_timings), self._queue.qsize(), self._dropped,
+                          self._metadata_dropped, " ".join(parts))
+
+    def _text_layout(self, text, font, scale, thickness, available):
+        """Bounded scalar-only cache; no camera pixels or stale telemetry cached."""
+        key = (str(text), font, scale, thickness, available)
+        if key in self._text_layout_cache:
+            self._text_layout_cache.move_to_end(key)
+            return self._text_layout_cache[key]
+        rendered = str(text)
+        size, baseline = self._cv2.getTextSize(rendered, font, scale, thickness)
+        if size[0] > available:
+            # Long diagnostics used to call getTextSize once per removed
+            # character. Binary search preserves the largest fitting prefix.
+            low, high, rendered = 0, len(rendered), ""
+            original = str(text)
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = original[:middle].rstrip() + "~"
+                trial_size, trial_base = self._cv2.getTextSize(candidate, font, scale, thickness)
+                if trial_size[0] <= available:
+                    rendered, size, baseline = candidate, trial_size, trial_base
+                    low = middle + 1
+                else:
+                    high = middle - 1
+        result = rendered, size, baseline
+        self._text_layout_cache[key] = result
+        if len(self._text_layout_cache) > 256:
+            self._text_layout_cache.popitem(last=False)
+        return result
 
     def _depth_view(self, capture_id, timestamp, target_id):
         if self._depth_sample_provider is None:
@@ -593,20 +721,8 @@ class AsyncVideoRecorder:
         available = max(1, width - max(0, int(x)) - 4)
         if max_width is not None:
             available = min(available, max(1, int(max_width)))
-        rendered = str(text)
-        while rendered:
-            (text_width, text_height), baseline = self._cv2.getTextSize(
-                rendered,
-                font,
-                scale,
-                thickness,
-            )
-            if text_width <= available:
-                break
-            if len(rendered) <= 1:
-                rendered = ""
-                break
-            rendered = rendered[:-2].rstrip() + "~"
+        rendered, (text_width, text_height), baseline = self._text_layout(
+            text, font, scale, thickness, available)
         if not rendered:
             return int(y)
         outline_thickness = max(2, int(thickness) + 2)
@@ -623,26 +739,29 @@ class AsyncVideoRecorder:
         region = image[top:bottom, left:right]
         text_layer = region.copy()
         origin = (label_x - left, label_y - top)
-        self._cv2.putText(
-            text_layer,
-            rendered,
-            origin,
-            font,
-            scale,
-            (0, 0, 0),
-            outline_thickness,
-            self._cv2.LINE_8,
-        )
-        self._cv2.putText(
-            text_layer,
-            rendered,
-            origin,
-            font,
-            scale,
-            foreground,
-            thickness,
-            self._cv2.LINE_8,
-        )
+        # Cache glyph pixels only, never the underlying camera region. Static
+        # ruler/status labels need no repeated outline/text rasterization.
+        key = (rendered, origin, font, scale, foreground, thickness, region.shape, str(region.dtype))
+        raster = self._text_raster_cache.get(key)
+        if raster is None:
+            import numpy as np
+            ink = np.zeros(region.shape, dtype=region.dtype)
+            mask = np.zeros(region.shape[:2], dtype=np.uint8)
+            self._cv2.putText(mask, rendered, origin, font, scale, 255,
+                              outline_thickness, self._cv2.LINE_8)
+            self._cv2.putText(ink, rendered, origin, font, scale, foreground,
+                              thickness, self._cv2.LINE_8)
+            raster = ink, mask
+            size_bytes = ink.nbytes + mask.nbytes
+            if size_bytes <= 1024 * 1024:
+                self._text_raster_cache[key] = raster
+                self._text_raster_bytes += size_bytes
+                while self._text_raster_bytes > 1024 * 1024 or len(self._text_raster_cache) > 96:
+                    _, (old_ink, old_mask) = self._text_raster_cache.popitem(last=False)
+                    self._text_raster_bytes -= old_ink.nbytes + old_mask.nbytes
+        else:
+            self._text_raster_cache.move_to_end(key)
+        self._cv2.copyTo(raster[0], raster[1], text_layer)
         alpha = max(0.0, min(1.0, float(self.config.overlay_text_alpha)))
         self._cv2.addWeighted(text_layer, alpha, region, 1.0 - alpha, 0.0, dst=region)
         return bottom
@@ -672,9 +791,12 @@ class AsyncVideoRecorder:
         follow: FollowRecordingView = FollowRecordingView(),
         depth_view: DepthVideoView = DepthVideoView("disabled"),
         capture_elapsed_sec: Optional[float] = None,
+        copy_image: bool = True,
     ) -> Any:
         """Draw diagnostics on a copy in the recorder thread."""
-        annotated = image.copy()
+        # submit() already gave the worker its own pixels. Public/test callers
+        # retain copy-on-draw semantics; the worker avoids a second RGB copy.
+        annotated = image.copy() if copy_image else image
         if depth_view.status != "disabled":
             try:
                 draw_depth_overlay(annotated, depth_view, self._cv2)
@@ -820,6 +942,7 @@ class AsyncVideoRecorder:
             )
         status_lines = (
             f"ACTIVE U{active_text}  SELECT U{selected_text}  SEARCH {search_text}",
+            startup_status(overlay),
             candidate_text,
             f"MOTOR {control.action_name}  CMD {control.requested_rpm:+d}RPM  "
             f"YAW {yaw_text}  AGE {control.result_age_ms:.1f}ms",

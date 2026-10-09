@@ -49,8 +49,9 @@ def build_follow_snapshot(controller, frame, decision, source, now):
     uid = controller.active_target_id
     target = next((p for p in frame.persons if p.track_id == uid), None)
     visible = target is not None and controller.search_state == 'none'
+    speed_enabled = getattr(controller.cfg, 'distance_target_motion_control_enable', True)
     evidence = getattr(controller, '_longitudinal_motion_evidence', None)
-    if not visible or getattr(evidence, 'target_id', None) != uid:
+    if not speed_enabled or not visible or getattr(evidence, 'target_id', None) != uid:
         evidence = None
     speed_stamp = getattr(evidence, 'sample_timestamp', None)
     if getattr(evidence, 'status', None) == 'transient_bridge':
@@ -69,7 +70,7 @@ def build_follow_snapshot(controller, frame, decision, source, now):
         speed_timestamp=speed_stamp,
         target_speed_m_s=getattr(evidence, 'target_speed_m_s', None),
         relative_speed_m_s=getattr(evidence, 'range_rate_m_s', None),
-        speed_status=getattr(evidence, 'status', 'unavailable'),
+        speed_status=getattr(evidence, 'status', 'unavailable') if speed_enabled else 'disabled',
         pid_timestamp=getattr(controller, '_distance_pid_last_sample_timestamp', None) if pid else None,
         pid_rpm=getattr(pid, 'output_rpm', None),
         matching_base_rpm=getattr(pid, 'tracking_base_rpm', None),
@@ -130,7 +131,7 @@ class FollowRecordingView:
             return ('missing' if sample_age is None else 'future' if sample_age < 0 else
                     'fresh' if sample_age <= 180. else 'stale')
         status = 'current' if age <= 180. else 'stale'
-        speed_status = freshness(speed_age)
+        speed_status = 'disabled' if s.speed_status == 'disabled' else freshness(speed_age)
         valid_speed = speed_status == 'fresh' and status == 'current'
         if s.speed_status == 'transient_bridge' and valid_speed:
             speed_status = 'bridge'

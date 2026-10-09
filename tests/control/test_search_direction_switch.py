@@ -67,6 +67,8 @@ def test_current_left_candidate_overrides_right_history_on_search_entry():
             search_cooldown=0,
             search_timeout_sec=30.0,
             search_candidate_untracked_min_score=0.10,
+            center_left_ratio=0.30,
+            center_right_ratio=0.70,
         )
     )
     controller.active_target_id = 1
@@ -130,9 +132,9 @@ def test_edge_target_crossing_aimline_still_turns_toward_bbox_center():
     )
 
     assert controller.search_direction == "left"
-    assert decision.actions == []
-    assert decision.explicit_stop_requested is True
-    assert decision.reason == "search_candidate_aimline_brake"
+    assert decision.actions and decision.actions[0].kind == "rotate_left"
+    assert not decision.explicit_stop_requested
+    assert decision.reason == "search_candidate_approach_left"
     assert decision.evidence_capture_frame_id == 85
 
 
@@ -295,12 +297,13 @@ def test_current_candidate_bypasses_near_target_missing_wait_for_lateral_only():
 def test_one_opposite_candidate_switches_search_direction():
     controller = _searching_controller("left")
 
-    # A single fresh box on the right supersedes the stale left sweep.
+    # A current formally confirmed UID may supersede the stale left sweep.
     controller.note_search_candidate_evidence(
         (500.0, 80.0, 620.0, 420.0),
         frame_width=640,
         confirmed=True,
         source="formal",
+        candidate_confirmed_uid=1,
     )
 
     assert controller.search_state == "searching"
@@ -373,13 +376,11 @@ def test_blocked_high_score_untracked_candidate_cannot_reverse_search():
     assert controller._lost_exit_direction == "left"
 
 
-def test_strong_reid_evidence_can_reverse_frozen_search_without_uid_binding():
+def test_strong_reid_hint_cannot_reverse_frozen_search_without_formal_uid():
     controller = _searching_controller("left")
 
-    # The search gate has already completed its two-frame observation.  A
-    # fresh DeepSORT track can therefore redirect the sweep when the identity
-    # bank reports a strong match, even though the positive UID is not bound
-    # to that track yet.
+    # Detector observation completion and strong features are still only a
+    # hypothesis while the bank withholds the current frame's formal UID.
     controller.note_search_candidate_evidence(
         (500.0, 40.0, 625.0, 430.0),
         frame_width=640,
@@ -391,8 +392,8 @@ def test_strong_reid_evidence_can_reverse_frozen_search_without_uid_binding():
     )
 
     assert controller.search_state == "searching"
-    assert controller.search_direction == "right"
-    assert controller._lost_exit_direction == "right"
+    assert controller.search_direction == "left"
+    assert controller._lost_exit_direction == "left"
 
 
 def test_discontinuous_opposite_person_keeps_last_target_exit_direction():
@@ -451,7 +452,7 @@ def test_opposite_candidate_after_center_intersection_remains_braked_until_ident
     assert controller.search_direction == "right"
 
 
-def test_low_quality_opposite_candidate_can_override_history_direction():
+def test_low_quality_mapped_candidate_cannot_override_history_direction():
     controller = _searching_controller("right")
 
     controller.note_search_candidate_evidence(
@@ -464,7 +465,7 @@ def test_low_quality_opposite_candidate_can_override_history_direction():
     )
 
     assert controller.search_state == "searching"
-    assert controller.search_direction == "left"
+    assert controller.search_direction == "right"
 
 
 def test_search_candidate_gate_selects_highest_probe_score():

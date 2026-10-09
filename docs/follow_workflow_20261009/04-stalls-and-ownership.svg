@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="2250" viewBox="0 0 2000 2250" role="img">
+<title>卡顿定位图与多人协作边界</title><desc>从第一条异常实际零包，沿 UID / CAP / 采样时间向上追。下列“负责”为建议分工；历史故障不等于当前已复现。</desc>
+<rect width="2000" height="2250" fill="#F7F9FC"/>
+<text x="60" y="35" font-family="Noto Sans CJK SC, sans-serif" font-size="48" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">04 / 卡顿定位图与多人协作边界</text>
+<text x="60" y="105" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">从第一条异常实际零包，沿 UID / CAP / 采样时间向上追。下列“负责”为建议分工；历史故障不等于当前已复现。</text>
+<polyline points="60,153 1940,153" fill="none" stroke="#CED8E3" stroke-width="2"/>
+<text x="60" y="184" font-family="Noto Sans CJK SC, sans-serif" font-size="28" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">风险卡片：蓝色＝已有针对性修复，须实车复验；琥珀色＝持续敏感边界。必要安全停车仍须保留。</text>
+<rect x="60" y="255" width="900" height="225" rx="16" fill="#FFF3D9" stroke="#CED8E3" stroke-width="2"/>
+<text x="80" y="271" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">F1  身份链</text>
+<text x="80" y="317" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">转身后 UID0 / 重新搜索 / 距离消失</text>
+<text x="80" y="359" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">裁剪不可比、模板不足、弱竞争、隔离期或旧锚点切换。</text>
+<text x="80" y="394" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">查：身份 reason、full/partial、geometry、quarantine。</text>
+<text x="80" y="428" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">负责：视觉身份组 / rk_vision；已有恢复修复，场景仍须回归。</text>
+<rect x="1040" y="255" width="900" height="225" rx="16" fill="#FFF3D9" stroke="#CED8E3" stroke-width="2"/>
+<text x="1060" y="271" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">F2  时钟与交付</text>
+<text x="1060" y="317" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">有框 / 有距离，却不能授权</text>
+<text x="1060" y="359" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">采集时钟与处理完成混用；500ms 框窗不能替代新深度资格。</text>
+<text x="1060" y="394" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">查：capture_result_age、ROI age、sample age、截止时间。</text>
+<text x="1060" y="428" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">负责：感知调度组；早发布已接入，上游迟到仍可能发生。</text>
+<rect x="60" y="505" width="900" height="225" rx="16" fill="#EAF2FF" stroke="#CED8E3" stroke-width="2"/>
+<text x="80" y="521" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">F3  计算与提交</text>
+<text x="80" y="567" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">独立深度标称 30Hz，合格输出却稀疏</text>
+<text x="80" y="609" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">选帧 / 像素处理耗时与调度长尾，算完时样本已失效。</text>
+<text x="80" y="644" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">查：depth transaction 的 wall / CPU、commit wait、context。</text>
+<text x="80" y="678" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">负责：深度组；单任务+最新邮箱、锁外测距、计时已补。</text>
+<rect x="1040" y="505" width="900" height="225" rx="16" fill="#FFF3D9" stroke="#CED8E3" stroke-width="2"/>
+<text x="1060" y="521" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">F4  确认等待</text>
+<text x="1060" y="567" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">深度出现几次，但新距离迟迟不被接受</text>
+<text x="1060" y="609" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">大裁切 / 跳变进入多次确认；重复物理样本不能增加计数。</text>
+<text x="1060" y="644" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">查：pending 1/3→2/3→accepted、duplicate、样本 ID。</text>
+<text x="1060" y="678" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">负责：深度组；去重是必要保护，确认重启与间隔仍须追查。</text>
+<rect x="60" y="755" width="900" height="225" rx="16" fill="#FFF3D9" stroke="#CED8E3" stroke-width="2"/>
+<text x="80" y="771" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">F5  制动 / 驻车</text>
+<text x="80" y="817" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">距离仍远却限速为 0，之后持续等待</text>
+<text x="80" y="859" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">制动预算、实际动量、反馈余量、驻车所有权叠加。</text>
+<text x="80" y="894" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">查：remaining / required、brake veto、park release。</text>
+<text x="80" y="928" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">负责：控制+实测组；已有余量去重，不等于完成制动标定。</text>
+<rect x="1040" y="755" width="900" height="225" rx="16" fill="#EAF2FF" stroke="#CED8E3" stroke-width="2"/>
+<text x="1060" y="771" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">F6  发布 / 写入交接</text>
+<text x="1060" y="817" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">PI 有前进请求，实际却写出 0/0</text>
+<text x="1060" y="859" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">旧零计划、新授权、转向版本并发；不能保留旧包就误清零。</text>
+<text x="1060" y="894" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">查：publication、terminal、motor_zero_audit、packet_written。</text>
+<text x="1060" y="928" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">负责：执行组；已补统一再核验/独立直行，实车效果待复验。</text>
+<rect x="60" y="1005" width="900" height="225" rx="16" fill="#EAF2FF" stroke="#CED8E3" stroke-width="2"/>
+<text x="80" y="1021" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">F7  恢复放大</text>
+<text x="80" y="1067" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">零包之后只能个位数，刚提速又掉下去</text>
+<text x="80" y="1109" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">低实测轮速、旧失权状态、固定恢复步长和量化相互放大。</text>
+<text x="80" y="1144" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">查：PI requested / approved、recovery reason、feedback。</text>
+<text x="80" y="1178" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">负责：控制+执行组；已补新证据接续，真实反转仍必须拦截。</text>
+<rect x="1040" y="1005" width="900" height="225" rx="16" fill="#FFF3D9" stroke="#CED8E3" stroke-width="2"/>
+<text x="1060" y="1021" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">F8  通信 / 实际响应</text>
+<text x="1060" y="1067" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">已发高 RPM，但车轮迟到或反馈过期</text>
+<text x="1060" y="1109" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">串口争用、长事务、后台竞争；驱动加速不等于指令阶跃。</text>
+<text x="1060" y="1144" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">查：motor lock wait / max hold、ACK、反馈年龄和实测 RPM。</text>
+<text x="1060" y="1178" font-family="Noto Sans CJK SC, sans-serif" font-size="22" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">负责：驱动组；独占/在途预算已补，勿同时开第二控制程序。</text>
+<text x="60" y="1285" font-family="Noto Sans CJK SC, sans-serif" font-size="33" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">不同期限不能互相替代</text>
+<text x="60" y="1333" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">这是资格上限，不是保证获准时长。新鲜轮速、普通新框或重发命令都不能替旧深度续命。</text>
+<rect x="60" y="1392" width="1880" height="63" rx="4" fill="#EDF0F4" stroke="#EDF0F4" stroke-width="2"/>
+<text x="75" y="1400" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">新 Depth / 旧前进授权</text>
+<text x="595" y="1400" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">180ms / 最长 300ms</text>
+<text x="1025" y="1400" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">按原物理采样时间；180–300ms 仅受限旧授权接续</text>
+<text x="75" y="1469" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">测距框调度 / 可见证据</text>
+<text x="595" y="1469" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">各自最长 500ms</text>
+<text x="1025" y="1469" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">框&gt;250ms 仅历史选帧；采样关联与新鲜度仍各限 180ms</text>
+<rect x="60" y="1530" width="1880" height="63" rx="4" fill="#EDF0F4" stroke="#EDF0F4" stroke-width="2"/>
+<text x="75" y="1538" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">普通横向 / 受限桥接</text>
+<text x="595" y="1538" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">150ms / 双时钟约束</text>
+<text x="1025" y="1538" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">桥接另限发布 220ms、采集 350ms，且要求更鲜轮速</text>
+<text x="75" y="1607" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">最终轮速反馈</text>
+<text x="595" y="1607" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">150ms</text>
+<text x="1025" y="1607" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">不是驱动响应时间；反馈恢复不自动恢复旧授权</text>
+<rect x="60" y="1668" width="1880" height="63" rx="4" fill="#EDF0F4" stroke="#EDF0F4" stroke-width="2"/>
+<text x="75" y="1676" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">PI 状态记忆 / 完成执行历史</text>
+<text x="595" y="1676" font-family="Noto Sans CJK SC, sans-serif" font-size="25" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">350ms / 650ms</text>
+<text x="1025" y="1676" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">只用于状态接续或行程预算，不是运动授权</text>
+<text x="60" y="1780" font-family="Noto Sans CJK SC, sans-serif" font-size="33" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">团队共同验收：跨模块追踪一条指令，而不是各自只测函数</text>
+<rect x="60" y="1845" width="350" height="93" rx="16" fill="#FFFFFF" stroke="#CED8E3" stroke-width="2"/>
+<text x="82" y="1861" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">可信 UID / CAP</text>
+<text x="82" y="1903" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42"></text>
+<polyline points="410,1891 442,1891" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="442,1891 429.39374056706254,1897.0895174775571 429.39374056706254,1884.9104825224429" fill="#70859A"/>
+<rect x="442" y="1845" width="350" height="93" rx="16" fill="#FFFFFF" stroke="#CED8E3" stroke-width="2"/>
+<text x="464" y="1861" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">物理深度采样</text>
+<text x="464" y="1903" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42"></text>
+<polyline points="792,1891 824,1891" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="824,1891 811.3937405670625,1897.0895174775571 811.3937405670625,1884.9104825224429" fill="#70859A"/>
+<rect x="824" y="1845" width="350" height="93" rx="16" fill="#FFFFFF" stroke="#CED8E3" stroke-width="2"/>
+<text x="846" y="1861" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">PI 请求 / 批准</text>
+<text x="846" y="1903" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42"></text>
+<polyline points="1174,1891 1206,1891" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1206,1891 1193.3937405670624,1897.0895174775571 1193.3937405670624,1884.9104825224429" fill="#70859A"/>
+<rect x="1206" y="1845" width="350" height="93" rx="16" fill="#FFFFFF" stroke="#CED8E3" stroke-width="2"/>
+<text x="1228" y="1861" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">最终零包原因</text>
+<text x="1228" y="1903" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42"></text>
+<polyline points="1556,1891 1588,1891" fill="none" stroke="#70859A" stroke-width="3"/>
+<polygon points="1588,1891 1575.3937405670624,1897.0895174775571 1575.3937405670624,1884.9104825224429" fill="#70859A"/>
+<rect x="1588" y="1845" width="350" height="93" rx="16" fill="#FFFFFF" stroke="#CED8E3" stroke-width="2"/>
+<text x="1610" y="1861" font-family="Noto Sans CJK SC, sans-serif" font-size="31" font-weight="700" dominant-baseline="text-before-edge" fill="#172B42">双 ACK / 实测</text>
+<text x="1610" y="1903" font-family="Noto Sans CJK SC, sans-serif" font-size="26" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42"></text>
+<text x="60" y="1975" font-family="Noto Sans CJK SC, sans-serif" font-size="27" font-weight="400" dominant-baseline="text-before-edge" fill="#172B42">必须同时覆盖：直行↔左右转、旧零包遇新授权、反馈迟到后恢复、深度确认完成、目标转身接回，以及真正近距 / 危险 / 反转停车。</text>
+<text x="60" y="2059" font-family="Noto Sans CJK SC, sans-serif" font-size="24" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">证据示例来自 2026-10-09 13:34 旧运行 CAP125–367：深度扫描约 152–159ms 后过期、重复样本确认等待、最终写入交接。后续代码已有修改，不能当作新版本仍原样复现。</text>
+<polyline points="60,2150 1940,2150" fill="none" stroke="#CED8E3" stroke-width="2"/>
+<text x="60" y="2168" font-family="Noto Sans CJK SC, sans-serif" font-size="20" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">源码索引与生成时 SHA256 见 sources.json；F 编号是排查分类，不表示每一个零包都错误，也不保证问题已全部消除。</text>
+<text x="60" y="2202" font-family="Noto Sans CJK SC, sans-serif" font-size="21" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">2026-10-09 当前工作区 / 默认启动配置；环境覆盖另计。示意图，不是实测性能或停车距离保证。</text>
+<text x="1840" y="2202" font-family="Noto Sans CJK SC, sans-serif" font-size="23" font-weight="400" dominant-baseline="text-before-edge" fill="#4F647A">4 / 4</text>
+</svg>

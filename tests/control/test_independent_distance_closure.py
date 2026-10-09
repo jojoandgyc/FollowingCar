@@ -145,7 +145,7 @@ def test_explicit_trial_overrides_ini_without_disabling_depth(monkeypatch,mode,e
     assert os.environ['DISTANCE_APPROACH_MATCHING_ENABLE']==expected
     assert os.environ['DISTANCE_FEEDFORWARD_ENABLE']=='1'
     # Matching mode does not override the board's bounded 250ms grant TTL.
-    assert os.environ['ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC']=='0.25'
+    assert os.environ['ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC']=='0.30'
 
 
 def test_invalid_trial_fails_before_hardware(monkeypatch):

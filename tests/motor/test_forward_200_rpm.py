@@ -30,7 +30,7 @@ def test_depth_limits_keep_near_slow_and_far_ceiling(monkeypatch):
     assert cap([ControlAction.backward(100,'test')],distance_m=3.4)[0].speed_percent==30
 
 
-def test_periodic_wheel_ceiling_keeps_differential_and_zero_expiry(monkeypatch):
+def test_periodic_wheel_ceiling_preserves_base_and_zero_expiry(monkeypatch):
     rt,owner,driver,s,clock,state=setup_periodic(monkeypatch)
     rt.config.motor_forward_max_target_rpm=200
     rt.backend.config=replace(rt.backend.config,max_target=200)
@@ -38,7 +38,9 @@ def test_periodic_wheel_ceiling_keeps_differential_and_zero_expiry(monkeypatch):
     owner._fresh_depth_linear_snapshot=lambda uid,now=None:('forward',100) if clock[0]<state[2] else None
     rt.get_steering_feedback=lambda:feedback(clock[0],190,190)
     rt._service_follow_wheels()
-    assert driver.pairs[-1]==(200,-190)
+    # At the absolute ceiling there is no yaw headroom; don't silently
+    # reduce the authorized mean to195 just to retain a10RPM wheel delta.
+    assert driver.pairs[-1]==(200,-200)
     clock[0]=10.19
     rt._service_follow_wheels()
     assert driver.pairs[-1]==(0,0)

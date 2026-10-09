@@ -244,6 +244,10 @@ def extended_pi_owner(pi_owner, monkeypatch):
     assert accepted and actions[0].speed_percent == 20
     monkeypatch.setattr(runtime.time, "monotonic", lambda: NOW+.19)
     pi_owner._last_vision_control_ts = NOW+.18
+    # Continuation now validates the CURRENT cached encoder sample on both
+    # full-speed and reduced-speed paths, not just the original commit frame.
+    pi_owner._action_runtime = SimpleNamespace(get_steering_feedback=lambda: SteeringFeedback(
+        timestamp=NOW+.19, trustworthy=True, left_forward_rpm=40., right_forward_rpm=40.))
     return pi_owner
 
 

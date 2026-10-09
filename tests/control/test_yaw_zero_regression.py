@@ -20,6 +20,10 @@ class FakeBackend:
     def __init__(self):
         self.config = SimpleNamespace(m1_is_left_wheel=True, max_target=100)
         self.targets = []
+        self.normal_zero_hold = False
+
+    def prepare_speed_mode(self):
+        pass  # Mode transitions are covered by the real-backend fake transport tests.
 
     @staticmethod
     def wheel_raw_state_to_target(_side, raw, state):

@@ -279,6 +279,17 @@ class SensorRuntime:
             return None
         return self.astra_depth
 
+    @property
+    def supports_bounded_depth_roi(self) -> bool:
+        return bool(self.config.astra_depth_enable
+                    and getattr(self.astra_depth, "supports_bounded_depth_roi", False) is True)
+
+    def prepare_astra_target_distance(self, bbox, frame_width, frame_height, **kwargs):
+        runtime = self.astra_depth
+        if not self.config.astra_depth_enable or runtime is None:
+            return None
+        return runtime.prepare_target_measurement(bbox, frame_width, frame_height, **kwargs)
+
     def get_astra_target_distance(
         self,
         bbox: Tuple[float, float, float, float],
@@ -290,10 +301,14 @@ class SensorRuntime:
         steering_feedback=None,
         reference_timestamp: Optional[float] = None,
         evidence_capture_frame_id: Optional[int] = None,
+        bounded_roi_capture_timestamp: Optional[float] = None,
+        bounded_roi_max_age_sec: float = .25,
     ) -> AstraDepthMeasurement:
         runtime = self.astra_depth
         if not self.config.astra_depth_enable or runtime is None:
             return AstraDepthMeasurement(None, None, None, 0, "disabled")
+        if bounded_roi_capture_timestamp is not None and not self.supports_bounded_depth_roi:
+            return AstraDepthMeasurement(None, None, None, 0, "bounded_roi_unsupported")
         return runtime.measure_target(
             bbox,
             frame_width,
@@ -303,6 +318,9 @@ class SensorRuntime:
             steering_feedback=steering_feedback,
             reference_timestamp=reference_timestamp,
             evidence_capture_frame_id=evidence_capture_frame_id,
+            **({} if bounded_roi_capture_timestamp is None else
+               {"bounded_roi_capture_timestamp": bounded_roi_capture_timestamp,
+                "bounded_roi_max_age_sec": bounded_roi_max_age_sec}),
         )
 
     def _start_mmwave_cache_thread(self) -> None:

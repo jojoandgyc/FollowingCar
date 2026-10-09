@@ -8,6 +8,49 @@ import pytest
 from tools.follow_metrics import analyze, comparison, distribution, short_speed_drops
 
 
+def test_cross_brake_metrics_distinguish_hold_from_writes_and_dedupe_episodes(run):
+    path = run / 'request_0513_modular.log'
+    lines = [
+        '2026-09-16 12:00:00,000 - LZ30EMA 停车命令: 标签=follow_cross_brake 模式=normal',
+        '2026-09-16 12:00:00,001 - visible_wheel_dispatch uid=1 requested_forward_rpm=(8, -8) applied_forward_rpm=(0, 0) reason=cross_wait_zero cross_brake=applied packet_written=True cross_episode_ts=10 cross_finished=False cross_wait_ms=0',
+        '2026-09-16 12:00:00,300 - visible_wheel_dispatch uid=1 requested_forward_rpm=(64, 60) applied_forward_rpm=(0, 0) reason=cross_timeout_zero cross_brake=held packet_written=False cross_episode_ts=10 cross_finished=False cross_wait_ms=300',
+        '2026-09-16 12:00:00,350 - visible_wheel_dispatch uid=1 requested_forward_rpm=(64, 60) applied_forward_rpm=(0, 0) reason=cross_timeout_zero cross_brake=held packet_written=False cross_episode_ts=10 cross_finished=False cross_wait_ms=350',
+        '2026-09-16 12:00:00,390 - LZ30EMA 电机命令: 标签=FOLLOW20 左轮=64转/分 右轮=-60转/分',
+        '2026-09-16 12:00:00,391 - visible_wheel_dispatch uid=1 requested_forward_rpm=(64, 60) applied_forward_rpm=(64, 60) reason=cross_confirmed_forward_handoff cross_brake=released packet_written=True cross_episode_ts=10 cross_finished=True cross_wait_ms=390',
+    ]
+    path.write_text('\n'.join(lines))
+    a = analyze(run, tail_sec=0)['execution']
+    assert a['cross_brake_records'] == {'applied': 1, 'held': 2, 'released': 1}
+    assert a['held_without_motor_write_records'] == 2
+    assert a['cross_timeout_distinct_episodes'] == 1
+    assert a['cross_completed_wait_ms']['count'] == 1
+    assert a['cross_completed_wait_ms']['max'] == 390
+    assert a['positive_requested_but_zero_dispatch_records'] == 2
+    assert a['command_dwell_sec']['zero'] == pytest.approx(.39)
+
+
+def test_old_logs_cannot_claim_transition_brake_was_verified(run):
+    a = analyze(run, tail_sec=0)['execution']
+    assert a['cross_brake_records'] == {}
+    assert a['cross_completed_wait_ms']['count'] == 0
+    assert a['held_without_motor_write_records'] == 0
+
+
+def test_transition_metrics_do_not_hide_zero_time_by_renaming_the_wait(run):
+    path = run / 'request_0513_modular.log'
+    path.write_text('\n'.join([
+        '2026-09-16 12:00:00,000 - LZ30EMA 电机命令: 标签=FOLLOW20 左轮=0转/分 右轮=0转/分',
+        '2026-09-16 12:00:00,001 - visible_wheel_dispatch uid=1 requested_forward_rpm=(-4, 4) applied_forward_rpm=(0, 0) reason=forward_loss_decelerating',
+        '2026-09-16 12:00:00,200 - LZ30EMA 电机命令: 标签=FOLLOW20 左轮=60转/分 右轮=-80转/分',
+        '2026-09-16 12:00:00,201 - visible_wheel_dispatch uid=1 requested_forward_rpm=(60, 80) applied_forward_rpm=(60, 80) reason=continuous',
+    ]))
+    a = analyze(run, tail_sec=0)['execution']
+    assert a['cross_wait_zero_percent'] == 0
+    assert a['forward_loss_zero_percent'] > 0
+    assert a['transition_zero_percent'] == a['forward_loss_zero_percent']
+    assert a['zero_command_percent'] >= a['transition_zero_percent']
+
+
 def test_approach_metrics_deduplicate_and_leave_old_logs_empty(run):
     assert analyze(run,tail_sec=0)['control']['approach_profile']['distinct_samples']==0
     path=run/'request_0513_modular.log'

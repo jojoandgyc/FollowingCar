@@ -48,9 +48,22 @@ def test_reacquire_after_rotation_requires_one_stop_transition():
     assert policy.visible(25.15).state == "tracking"
 
 
-def test_stale_or_missing_direction_never_starts_rotation():
+def test_stale_steering_uses_the_configured_fallback_direction():
     policy = _policy(turn_memory_sec=0.2)
     policy.record_executed_follow_command(MinimalFollowCommand(6, 10, reason="steer_left"), 30.0)
     command, status = policy.target_missing(now=30.21, front_obstacle=False)
-    assert command.reason == "person_missing_direction_unavailable"
-    assert status.state == "direction_unavailable"
+    assert command.reason == "search_transition_stop"
+    assert status.direction == "left"
+    command, status = policy.target_missing(now=30.26, front_obstacle=False)
+    assert command.reason == "search_rotate_left"
+    assert status.state == "searching"
+
+
+def test_visual_target_side_is_used_when_there_was_no_steering_command():
+    policy = _policy(target_direction_memory_sec=3.0, fallback_direction="right")
+    policy.record_visible_target((20.0, 80.0, 180.0, 400.0), 640, 40.0)
+    command, status = policy.target_missing(now=40.10, front_obstacle=False)
+    assert command.reason == "search_transition_stop"
+    command, status = policy.target_missing(now=40.15, front_obstacle=False)
+    assert command.reason == "search_rotate_left"
+    assert status.direction == "left"

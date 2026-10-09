@@ -19,6 +19,9 @@ class LostPersonSearchConfig:
     enabled: bool = True
     lost_confirm_frames: int = 1
     turn_memory_sec: float = 1.0
+    target_direction_memory_sec: float = 3.0
+    target_side_deadband_ratio: float = 0.03
+    fallback_direction: str = "left"
     timeout_sec: float = 1.5
     turn_percent: int = 8
 
@@ -32,7 +35,7 @@ class LostPersonSearchStatus:
 
 
 class LostPersonSearchPolicy:
-    """Search the direction of the last *executed* visible steering command.
+    """Search from steering history, target-side history, then a fallback.
 
     A newly lost target first produces one STOP frame.  This gives the motor a
     bounded zero/STOP transition before one wheel reverses for an in-place
@@ -44,6 +47,8 @@ class LostPersonSearchPolicy:
         self.config = config
         self._last_direction: Optional[str] = None
         self._last_direction_at: Optional[float] = None
+        self._last_target_direction: Optional[str] = None
+        self._last_target_direction_at: Optional[float] = None
         self._lost_frames = 0
         self._search_started_at: Optional[float] = None
         self._search_direction: Optional[str] = None
@@ -64,17 +69,33 @@ class LostPersonSearchPolicy:
             self._last_direction = "right"
             self._last_direction_at = float(now)
 
+    def record_visible_target(self, bbox, frame_width: int, now: float) -> None:
+        """Keep a visual direction even when the driving command was straight."""
+        if not self._valid_now(now) or frame_width <= 0:
+            return
+        x1, _, x2, _ = (float(value) for value in bbox)
+        offset_ratio = ((x1 + x2) * 0.5 - float(frame_width) * 0.5) / float(frame_width)
+        deadband = max(0.0, float(self.config.target_side_deadband_ratio))
+        if offset_ratio <= -deadband:
+            self._last_target_direction = "left"
+            self._last_target_direction_at = float(now)
+        elif offset_ratio >= deadband:
+            self._last_target_direction = "right"
+            self._last_target_direction_at = float(now)
+
     @property
     def loss_episode_active(self) -> bool:
         """Whether a candidate must be appearance-verified before takeover."""
         return self._state != "tracking"
 
-    def _fresh_direction(self, now: float) -> Optional[str]:
-        if self._last_direction not in {"left", "right"} or self._last_direction_at is None:
-            return None
-        if now - self._last_direction_at > max(0.0, float(self.config.turn_memory_sec)):
-            return None
-        return self._last_direction
+    def _fresh_direction(self, now: float) -> str:
+        if self._last_direction in {"left", "right"} and self._last_direction_at is not None:
+            if now - self._last_direction_at <= max(0.0, float(self.config.turn_memory_sec)):
+                return self._last_direction
+        if self._last_target_direction in {"left", "right"} and self._last_target_direction_at is not None:
+            if now - self._last_target_direction_at <= max(0.0, float(self.config.target_direction_memory_sec)):
+                return self._last_target_direction
+        return "right" if str(self.config.fallback_direction).strip().lower() == "right" else "left"
 
     def _status(self, now: float, direction: Optional[str]) -> LostPersonSearchStatus:
         elapsed_ms = None
@@ -118,11 +139,6 @@ class LostPersonSearchPolicy:
             self._search_direction = None
             self._state = "lost_confirming"
             return MinimalFollowCommand.stop("person_missing_confirming"), self._status(now, direction)
-        if direction is None:
-            self._search_started_at = None
-            self._search_direction = None
-            self._state = "direction_unavailable"
-            return MinimalFollowCommand.stop("person_missing_direction_unavailable"), self._status(now, direction)
         if self._search_started_at is None:
             self._search_started_at = now
             self._search_direction = direction

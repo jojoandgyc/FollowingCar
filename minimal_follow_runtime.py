@@ -95,6 +95,8 @@ class RuntimeConfig:
     search_enabled: bool
     search_lost_confirm_frames: int
     search_turn_memory_sec: float
+    search_target_memory_sec: float
+    search_fallback_direction: str
     search_timeout_sec: float
     search_turn_percent: int
     reid_enabled: bool
@@ -128,6 +130,8 @@ class RuntimeConfig:
             search_enabled=_bool_env("MINIMAL_SEARCH_ENABLE", True),
             search_lost_confirm_frames=max(1, _int_env("MINIMAL_SEARCH_LOST_CONFIRM_FRAMES", 1)),
             search_turn_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TURN_MEMORY_SEC", 1.0)),
+            search_target_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TARGET_MEMORY_SEC", 3.0)),
+            search_fallback_direction=os.environ.get("MINIMAL_SEARCH_FALLBACK_DIRECTION", "left").strip().lower(),
             search_timeout_sec=max(0.0, _float_env("MINIMAL_SEARCH_TIMEOUT_SEC", 1.5)),
             search_turn_percent=max(0, _int_env("MINIMAL_SEARCH_TURN_PERCENT", 8)),
             reid_enabled=_bool_env("MINIMAL_REID_ENABLE", True),
@@ -222,6 +226,8 @@ class MinimalFollowRuntime:
                 enabled=config.search_enabled,
                 lost_confirm_frames=config.search_lost_confirm_frames,
                 turn_memory_sec=config.search_turn_memory_sec,
+                target_direction_memory_sec=config.search_target_memory_sec,
+                fallback_direction=config.search_fallback_direction,
                 timeout_sec=config.search_timeout_sec,
                 turn_percent=config.search_turn_percent,
             )
@@ -231,10 +237,11 @@ class MinimalFollowRuntime:
             self.motor = self._make_motor()
         LOG.info(
             "minimal follow ready motor_enabled=%s target=%.2fm deadband=%.2fm camera=%s %dx%d@%.1f "
-            "search(enabled=%s memory=%.2fs timeout=%.2fs turn=%d%%)",
+            "search(enabled=%s steer_memory=%.2fs target_memory=%.2fs fallback=%s timeout=%.2fs turn=%d%%)",
             config.motor_enabled, config.target_distance_m, config.distance_deadband_m,
             config.camera_device, config.camera_width, config.camera_height, config.camera_fps,
-            config.search_enabled, config.search_turn_memory_sec,
+            config.search_enabled, config.search_turn_memory_sec, config.search_target_memory_sec,
+            config.search_fallback_direction,
             config.search_timeout_sec, config.search_turn_percent,
         )
 
@@ -572,6 +579,7 @@ class MinimalFollowRuntime:
             dispatched = self._dispatch(command)
             dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000.0
             if dispatched and selected is not None:
+                self.search_policy.record_visible_target(bbox, frame.shape[1], time.monotonic())
                 self.search_policy.record_executed_follow_command(command, time.monotonic())
             self._log_frame_timing(
                 frame_started_at=frame_started_at,

@@ -134,9 +134,9 @@ class RuntimeConfig:
             reid_stable_enroll_frames=max(1, _int_env("MINIMAL_REID_STABLE_ENROLL_FRAMES", 10)),
             reid_enroll_interval_sec=max(0.0, _float_env("MINIMAL_REID_ENROLL_INTERVAL_SEC", 1.0)),
             reid_reacquire_interval_sec=max(0.0, _float_env("MINIMAL_REID_REACQUIRE_INTERVAL_SEC", 0.20)),
-            reid_result_max_age_sec=max(0.01, _float_env("MINIMAL_REID_RESULT_MAX_AGE_SEC", 0.30)),
-            reid_full_match_threshold=_float_env("MINIMAL_REID_FULL_THRESHOLD", 0.78),
-            reid_torso_match_threshold=_float_env("MINIMAL_REID_TORSO_THRESHOLD", 0.84),
+            reid_result_max_age_sec=max(0.01, _float_env("MINIMAL_REID_RESULT_MAX_AGE_SEC", 0.75)),
+            reid_full_match_threshold=_float_env("MINIMAL_REID_FULL_THRESHOLD", 0.70),
+            reid_torso_match_threshold=_float_env("MINIMAL_REID_TORSO_THRESHOLD", 0.76),
             reid_confirm_hits=max(1, _int_env("MINIMAL_REID_CONFIRM_HITS", 2)),
             motor_enabled=bool(motor_enabled),
             front_ir_enabled=_bool_env("MINIMAL_FRONT_IR_ENABLE", True),
@@ -283,6 +283,10 @@ class MinimalFollowRuntime:
             target=os.environ.get("RKNN_TARGET", "rk3588").strip(),
             core_mask=os.environ.get("MINIMAL_REID_RKNN_CORE_MASK", os.environ.get("RKNN_CORE_MASK", "auto")).strip(),
             backend=os.environ.get("RKNN_BACKEND", "auto").strip(),
+            artifact_dir=(
+                os.path.join(os.environ["FOLLOW_LOG_DIR"], "reid_v2")
+                if os.environ.get("FOLLOW_LOG_DIR") else ""
+            ),
         ), logger=LOG)
         self.reid_worker.start()
         LOG.info(

@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
+from .artifacts import ReidArtifactWriter
+
 
 @dataclass(frozen=True)
 class ReidWorkerConfig:
@@ -22,6 +24,7 @@ class ReidWorkerConfig:
     target: str
     core_mask: str
     backend: str
+    artifact_dir: str = ""
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,7 @@ class ReidRequest:
     quality: float
     crop: Any
     frame_width: int = 640
+    allow_full: bool = True
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,8 @@ class ReidResult:
     timings_ms: dict
     error: Optional[str] = None
     frame_width: int = 640
+    crop_path: Optional[str] = None
+    feature_path: Optional[str] = None
 
 
 class ReidWorker:
@@ -60,6 +66,7 @@ class ReidWorker:
         self._thread = threading.Thread(target=self._run, name="minimal-reid-v2", daemon=True)
         self._started = False
         self._last_submit_at: dict[str, float] = {}
+        self._artifacts = ReidArtifactWriter(config.artifact_dir, logger=self.logger)
 
     def start(self) -> None:
         if not self._started:
@@ -116,21 +123,46 @@ class ReidWorker:
                     request = self._requests.get(timeout=0.10)
                 except queue.Empty:
                     continue
+                crop_path = None
                 try:
+                    crop_path = self._artifacts.write_crop(
+                        frame_id=request.frame_id, purpose=request.purpose, crop=request.crop,
+                    )
                     height, width = request.crop.shape[:2]
                     detection = Detection((0.0, 0.0, float(width), float(height)), 1.0, 0)
                     full = extractor.extract(request.crop, [detection], "BGR", compute_partial=True)[0]
+                    if not request.allow_full:
+                        full = None
                     torso = extractor.last_partial_features[0] if extractor.last_partial_features else None
+                    completed_at = time.monotonic()
+                    feature_path = self._artifacts.write_features(
+                        frame_id=request.frame_id, purpose=request.purpose, bbox=request.bbox,
+                        quality=request.quality, submitted_at=request.submitted_at, completed_at=completed_at,
+                        full_feature=full, torso_feature=torso, timings_ms=dict(extractor.last_timing_ms),
+                        crop_path=crop_path, error=None,
+                    )
                     result = ReidResult(
-                        request.frame_id, request.submitted_at, time.monotonic(), request.purpose,
+                        request.frame_id, request.submitted_at, completed_at, request.purpose,
                         request.bbox, request.quality, full, torso, dict(extractor.last_timing_ms), None,
-                        request.frame_width,
+                        request.frame_width, crop_path, feature_path,
+                    )
+                    self.logger.info(
+                        "reid_v2_artifact frame=%s purpose=%s crop=%s feature=%s full=%s torso=%s",
+                        request.frame_id, request.purpose, crop_path, feature_path,
+                        full is not None, torso is not None,
                     )
                 except Exception as exc:
+                    completed_at = time.monotonic()
+                    feature_path = self._artifacts.write_features(
+                        frame_id=request.frame_id, purpose=request.purpose, bbox=request.bbox,
+                        quality=request.quality, submitted_at=request.submitted_at, completed_at=completed_at,
+                        full_feature=None, torso_feature=None, timings_ms={}, crop_path=crop_path,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
                     result = ReidResult(
-                        request.frame_id, request.submitted_at, time.monotonic(), request.purpose,
+                        request.frame_id, request.submitted_at, completed_at, request.purpose,
                         request.bbox, request.quality, None, None, {}, f"{type(exc).__name__}: {exc}",
-                        request.frame_width,
+                        request.frame_width, crop_path, feature_path,
                     )
                 self._results.put(result)
         except Exception as exc:

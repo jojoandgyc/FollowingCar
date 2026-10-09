@@ -17,15 +17,15 @@ class ReidConfig:
     stable_frames: int = 10
     enroll_interval_sec: float = 1.0
     reacquire_interval_sec: float = 0.20
-    result_max_age_sec: float = 0.30
+    result_max_age_sec: float = 0.75
     # One high-quality template is enough to lock a first-session target;
     # later views are retained and make matching progressively more robust.
     min_full_templates: int = 1
     min_torso_templates: int = 2
     max_full_templates: int = 8
     max_torso_templates: int = 4
-    full_threshold: float = 0.78
-    torso_threshold: float = 0.84
+    full_threshold: float = 0.70
+    torso_threshold: float = 0.76
     confirm_hits: int = 2
     confirm_window: int = 3
     min_iou: float = 0.12
@@ -69,7 +69,7 @@ class ReidPolicy:
         center = (bbox[0] + bbox[2]) * 0.5 / max(1.0, float(frame_width))
         return max(0, min(2, int(center * 3.0)))
 
-    def _quality(self, candidate: ReidCandidate, frame_width: int, frame_height: int) -> Optional[float]:
+    def _quality(self, candidate: ReidCandidate, frame_width: int, frame_height: int, *, purpose: str) -> Optional[tuple[float, bool]]:
         x1, y1, x2, y2 = candidate.bbox
         width = max(0.0, x2 - x1)
         height = max(0.0, y2 - y1)
@@ -78,9 +78,14 @@ class ReidPolicy:
         margin_y = float(frame_height) * self.config.edge_margin_ratio
         if candidate.score < self.config.min_confidence or height < self.config.min_height_px or area < self.config.min_area_px:
             return None
+        quality = min(1.0, candidate.score) * min(1.0, area / (float(frame_width * frame_height) * 0.25))
         if x1 <= margin_x or y1 <= margin_y or x2 >= frame_width - margin_x or y2 >= frame_height - margin_y:
-            return None
-        return min(1.0, candidate.score) * min(1.0, area / (float(frame_width * frame_height) * 0.25))
+            # A partial person entering from an edge is useless for building a
+            # full-body gallery, but its torso is often enough for search.
+            if purpose == "enroll":
+                return None
+            return quality * 0.70, False
+        return quality, True
 
     @staticmethod
     def _crop(frame, bbox: BBox):
@@ -94,15 +99,16 @@ class ReidPolicy:
     def _submit(self, *, frame, candidate: ReidCandidate, frame_id: int, now: float, purpose: str, frame_width: int, frame_height: int) -> bool:
         if self.worker is None:
             return False
-        quality = self._quality(candidate, frame_width, frame_height)
-        if quality is None:
+        quality_evidence = self._quality(candidate, frame_width, frame_height, purpose=purpose)
+        if quality_evidence is None:
             return False
+        quality, allow_full = quality_evidence
         crop = self._crop(frame, candidate.bbox)
         if crop is None:
             return False
         interval = self.config.enroll_interval_sec if purpose == "enroll" else self.config.reacquire_interval_sec
         return self.worker.submit(
-            ReidRequest(frame_id, now, purpose, candidate.bbox, quality, crop, frame_width), min_interval_sec=interval,
+            ReidRequest(frame_id, now, purpose, candidate.bbox, quality, crop, frame_width, allow_full), min_interval_sec=interval,
         )
 
     def _consume(self, now: float) -> None:
@@ -172,6 +178,11 @@ class ReidPolicy:
 
         if self.state == "LOCKED" and associated is not None:
             self._last_bbox = associated.bbox
+            # Keep collecting a small number of views after lock. Otherwise a
+            # target enrolled only front-facing would be very hard to recover
+            # after the vehicle rotates during a loss episode.
+            self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
+                         frame_width=frame_width, frame_height=frame_height)
             return self._decision(True, associated, state="LOCKED", reason="geometry_associated")
 
         # No continuous target: do not hand control to any new detection until

@@ -1,5 +1,8 @@
 # FollowingCar
 
+多人开发的当前目录架构、线程/授权边界、活动配置和调试入口见
+[项目架构与开发交接](docs/PROJECT_ARCHITECTURE_HANDOFF.md)。
+
 RK3588 跟随小车运行项目，集成人员检测与 ReID、摄像头采集、红外避障、
 AT2410 毫米波测距、超声波、IMU 和 LZ30EMA 双轮电机控制。
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 from typing import Optional, Tuple
 
+from .commands import MinimalFollowCommand
 
 BBox = Tuple[float, float, float, float]
 
@@ -19,21 +20,6 @@ class MinimalFollowConfig:
     max_forward_percent: int = 20
     center_deadband_ratio: float = 0.08
     steering_delta_max_percent: int = 8
-
-
-@dataclass(frozen=True)
-class MinimalFollowCommand:
-    left_percent: int = 0
-    right_percent: int = 0
-    reason: str = "stop"
-
-    @property
-    def moving(self) -> bool:
-        return self.left_percent > 0 or self.right_percent > 0
-
-    @staticmethod
-    def stop(reason: str) -> "MinimalFollowCommand":
-        return MinimalFollowCommand(reason=reason)
 
 
 class MinimalFollowController:

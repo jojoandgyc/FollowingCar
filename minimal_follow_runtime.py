@@ -26,7 +26,12 @@ LOADED_CONFIG = preload_config_from_argv()
 
 from car_control_modular.astra_depth import AstraDepthConfig, AstraDepthRuntime
 from car_control_modular.mssd_motor import MssdMotorBackend, MssdMotorConfig
-from minimal_follow import MinimalFollowConfig, MinimalFollowController
+from minimal_follow import (
+    LostPersonSearchConfig,
+    LostPersonSearchPolicy,
+    MinimalFollowConfig,
+    MinimalFollowController,
+)
 from rk_vision.yolo11 import YOLO11Config, YOLO11RKNNDetector
 
 try:
@@ -78,6 +83,11 @@ class RuntimeConfig:
     max_forward_percent: int
     center_deadband_ratio: float
     steering_delta_max_percent: int
+    search_enabled: bool
+    search_lost_confirm_frames: int
+    search_turn_memory_sec: float
+    search_timeout_sec: float
+    search_turn_percent: int
     motor_enabled: bool
     front_ir_enabled: bool
 
@@ -98,6 +108,11 @@ class RuntimeConfig:
             max_forward_percent=_int_env("MINIMAL_MAX_FORWARD_PERCENT", 20),
             center_deadband_ratio=_float_env("MINIMAL_CENTER_DEADBAND_RATIO", 0.08),
             steering_delta_max_percent=_int_env("MINIMAL_STEERING_DELTA_MAX_PERCENT", 8),
+            search_enabled=_bool_env("MINIMAL_SEARCH_ENABLE", True),
+            search_lost_confirm_frames=max(1, _int_env("MINIMAL_SEARCH_LOST_CONFIRM_FRAMES", 1)),
+            search_turn_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TURN_MEMORY_SEC", 1.0)),
+            search_timeout_sec=max(0.0, _float_env("MINIMAL_SEARCH_TIMEOUT_SEC", 1.5)),
+            search_turn_percent=max(0, _int_env("MINIMAL_SEARCH_TURN_PERCENT", 8)),
             motor_enabled=bool(motor_enabled),
             front_ir_enabled=_bool_env("MINIMAL_FRONT_IR_ENABLE", True),
         )
@@ -176,12 +191,24 @@ class MinimalFollowRuntime:
                 steering_delta_max_percent=config.steering_delta_max_percent,
             )
         )
+        self.search_policy = LostPersonSearchPolicy(
+            LostPersonSearchConfig(
+                enabled=config.search_enabled,
+                lost_confirm_frames=config.search_lost_confirm_frames,
+                turn_memory_sec=config.search_turn_memory_sec,
+                timeout_sec=config.search_timeout_sec,
+                turn_percent=config.search_turn_percent,
+            )
+        )
         if config.motor_enabled:
             self.motor = self._make_motor()
         LOG.info(
-            "minimal follow ready motor_enabled=%s target=%.2fm deadband=%.2fm camera=%s %dx%d@%.1f",
+            "minimal follow ready motor_enabled=%s target=%.2fm deadband=%.2fm camera=%s %dx%d@%.1f "
+            "search(enabled=%s memory=%.2fs timeout=%.2fs turn=%d%%)",
             config.motor_enabled, config.target_distance_m, config.distance_deadband_m,
             config.camera_device, config.camera_width, config.camera_height, config.camera_fps,
+            config.search_enabled, config.search_turn_memory_sec,
+            config.search_timeout_sec, config.search_turn_percent,
         )
 
     def _make_motor(self) -> MssdMotorBackend:
@@ -266,25 +293,33 @@ class MinimalFollowRuntime:
         )
         return measurement.distance_m
 
-    def _dispatch(self, command) -> None:
-        key = (command.left_percent, command.right_percent, command.reason)
+    def _dispatch(self, command) -> bool:
+        key = (
+            command.left_percent, command.right_percent,
+            command.left_state, command.right_state, command.reason,
+        )
         now = time.monotonic()
-        if key != self.last_command_key:
+        changed = key != self.last_command_key
+        if changed:
             LOG.info(
-                "minimal command reason=%s left=%d%% right=%d%% motor_enabled=%s",
-                command.reason, command.left_percent, command.right_percent, self.config.motor_enabled,
+                "minimal command reason=%s left=%d%%/state=%02x right=%d%%/state=%02x motor_enabled=%s",
+                command.reason, command.left_percent, command.left_state,
+                command.right_percent, command.right_state, self.config.motor_enabled,
             )
             self.last_command_key = key
         if self.motor is None:
-            return
+            return True
         if not command.moving:
-            if now - self.last_stop_at >= 1.0:
+            # Every new STOP reason must be sent immediately. Repeated held
+            # stops are rate-limited only to avoid needless RS485 traffic.
+            if changed or now - self.last_stop_at >= 1.0:
                 self.motor.send_stop("minimal_" + command.reason, mode="emergency")
                 self.last_stop_at = now
-            return
-        left = self.motor.wheel_state_to_target("left", command.left_percent, 0x01)
-        right = self.motor.wheel_state_to_target("right", command.right_percent, 0x01)
+            return True
+        left = self.motor.wheel_state_to_target("left", command.left_percent, command.left_state)
+        right = self.motor.wheel_state_to_target("right", command.right_percent, command.right_state)
         self.motor.send_targets(left, right, "minimal_" + command.reason)
+        return True
 
     def _log_frame_timing(
         self,
@@ -297,6 +332,8 @@ class MinimalFollowRuntime:
         depth_ms: float,
         decision_ms: float,
         dispatch_ms: float,
+        search_policy_ms: float,
+        search_status,
         detection_count: int,
         selected: bool,
         depth_attempted: bool,
@@ -325,6 +362,7 @@ class MinimalFollowRuntime:
             "depth_ms": round(depth_ms, 3),
             "decision_ms": round(decision_ms, 3),
             "dispatch_ms": round(dispatch_ms, 3),
+            "search_policy_ms": round(search_policy_ms, 3),
             "total_ms": round((finished_at - frame_started_at) * 1000.0, 3),
             "detections": int(detection_count),
             "person_selected": bool(selected),
@@ -334,6 +372,13 @@ class MinimalFollowRuntime:
             "action": command.reason,
             "left_percent": int(command.left_percent),
             "right_percent": int(command.right_percent),
+            "search_state": search_status.state,
+            "search_direction": search_status.direction,
+            "lost_frames": int(search_status.lost_frames),
+            "search_elapsed_ms": (
+                None if search_status.search_elapsed_ms is None
+                else round(float(search_status.search_elapsed_ms), 3)
+            ),
         }
         LOG.info("minimal_timing %s", json.dumps(record, separators=(",", ":"), sort_keys=True))
 
@@ -366,31 +411,47 @@ class MinimalFollowRuntime:
             front_blocked = self._front_ir_triggered()
             ir_ms = (time.perf_counter() - ir_started_at) * 1000.0
             depth_ms = 0.0
-            depth_attempted = selected is not None
+            depth_attempted = False
             distance = None
             if selected is None:
-                decision_started_at = time.perf_counter()
-                command = self.controller.step(
-                    frame_width=frame.shape[1], bbox=None, distance_m=None, front_obstacle=front_blocked,
+                search_started_at = time.perf_counter()
+                command, search_status = self.search_policy.target_missing(
+                    now=time.monotonic(), front_obstacle=front_blocked,
                 )
-                decision_ms = (time.perf_counter() - decision_started_at) * 1000.0
+                search_policy_ms = (time.perf_counter() - search_started_at) * 1000.0
+                decision_ms = 0.0
             else:
                 bbox, track_id, _area = selected
-                depth_started_at = time.perf_counter()
-                try:
-                    distance = self._measure_distance(bbox, track_id, frame.shape[1], frame.shape[0])
-                except Exception as exc:
-                    LOG.warning("depth measure failed; stopping: %s", exc)
-                    distance = None
-                depth_ms = (time.perf_counter() - depth_started_at) * 1000.0
-                decision_started_at = time.perf_counter()
-                command = self.controller.step(
-                    frame_width=frame.shape[1], bbox=bbox, distance_m=distance, front_obstacle=front_blocked,
-                )
-                decision_ms = (time.perf_counter() - decision_started_at) * 1000.0
+                search_started_at = time.perf_counter()
+                search_status = self.search_policy.visible(time.monotonic())
+                search_policy_ms = (time.perf_counter() - search_started_at) * 1000.0
+                if search_status.state == "search_reacquire_transition_stop":
+                    decision_started_at = time.perf_counter()
+                    command = self.controller.step(
+                        frame_width=frame.shape[1], bbox=bbox, distance_m=None, front_obstacle=front_blocked,
+                    )
+                    if not front_blocked:
+                        command = command.stop("search_reacquire_transition_stop")
+                    decision_ms = (time.perf_counter() - decision_started_at) * 1000.0
+                else:
+                    depth_attempted = True
+                    depth_started_at = time.perf_counter()
+                    try:
+                        distance = self._measure_distance(bbox, track_id, frame.shape[1], frame.shape[0])
+                    except Exception as exc:
+                        LOG.warning("depth measure failed; stopping: %s", exc)
+                        distance = None
+                    depth_ms = (time.perf_counter() - depth_started_at) * 1000.0
+                    decision_started_at = time.perf_counter()
+                    command = self.controller.step(
+                        frame_width=frame.shape[1], bbox=bbox, distance_m=distance, front_obstacle=front_blocked,
+                    )
+                    decision_ms = (time.perf_counter() - decision_started_at) * 1000.0
             dispatch_started_at = time.perf_counter()
-            self._dispatch(command)
+            dispatched = self._dispatch(command)
             dispatch_ms = (time.perf_counter() - dispatch_started_at) * 1000.0
+            if dispatched and selected is not None:
+                self.search_policy.record_executed_follow_command(command, time.monotonic())
             self._log_frame_timing(
                 frame_started_at=frame_started_at,
                 capture_ms=capture_ms,
@@ -400,6 +461,8 @@ class MinimalFollowRuntime:
                 depth_ms=depth_ms,
                 decision_ms=decision_ms,
                 dispatch_ms=dispatch_ms,
+                search_policy_ms=search_policy_ms,
+                search_status=search_status,
                 detection_count=len(detections),
                 selected=selected is not None,
                 depth_attempted=depth_attempted,

@@ -1,5 +1,10 @@
-"""Small, hardware-independent single-person follow policy."""
+"""Small, hardware-independent single-person follow policies."""
 
-from .controller import MinimalFollowCommand, MinimalFollowConfig, MinimalFollowController
+from .commands import MinimalFollowCommand
+from .controller import MinimalFollowConfig, MinimalFollowController
+from .search_policy import LostPersonSearchConfig, LostPersonSearchPolicy, LostPersonSearchStatus
 
-__all__ = ["MinimalFollowCommand", "MinimalFollowConfig", "MinimalFollowController"]
+__all__ = [
+    "LostPersonSearchConfig", "LostPersonSearchPolicy", "LostPersonSearchStatus",
+    "MinimalFollowCommand", "MinimalFollowConfig", "MinimalFollowController",
+]

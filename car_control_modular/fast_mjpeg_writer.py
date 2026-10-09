@@ -28,7 +28,12 @@ class FastMjpegWriter:
                 "-vcodec", "mjpeg", "-i", "pipe:0", "-map", "0:v:0",
                 "-c:v", "copy", "-f", "avi", "-y", str(path),
             ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=self._stderr, bufsize=0, close_fds=True)
+                stderr=self._stderr, bufsize=0, close_fds=True,
+                # Terminal Ctrl+C must stop the car producer first, not kill
+                # the muxer before queued JPEG packets and AVI index drain.
+                # release() still closes stdin, waits, and kills on timeout;
+                # the launcher's forced descendant cleanup also still applies.
+                start_new_session=True)
         except Exception:
             self._stderr.close()
             raise

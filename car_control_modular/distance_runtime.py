@@ -1211,6 +1211,7 @@ class DistanceRuntime:
         use_latest_depth: bool,
         capture_timestamp: Optional[float],
         steering_feedback: Optional[SteeringFeedback] = None,
+        allow_bounded_depth_history: bool = False,
     ) -> Tuple[Optional[PersonTarget], str]:
         """Validate a bound detector snapshot without altering steering geometry."""
         observation = getattr(target, "depth_observation", None)
@@ -1271,7 +1272,7 @@ class DistanceRuntime:
             if not math.isfinite(age) or age < 0.0 or age > max_age:
                 return None, "depth_detector_bbox_stale"
             if use_latest_depth:
-                from .depth_roi_policy import roi_age_status
+                from .depth_roi_policy import roi_age_status, bounded_roi_history_allowed
                 status = roi_age_status(capture_ts, now, max_age, steering_feedback)
                 if age > .18:
                     self.logger.info(
@@ -1280,6 +1281,10 @@ class DistanceRuntime:
                         observation.capture_frame_id, observation.target_id, age*1000, status,
                     )
                 if status not in {"normal", "extended"}:
+                    if (allow_bounded_depth_history and
+                            bounded_roi_history_allowed(capture_ts, now, max_age)):
+                        return (replace(target, bbox=bbox, area=(x2-x1)*(y2-y1)),
+                                "yolo_detector_bounded_history")
                     return None, "depth_detector_bbox_stale"
         except (TypeError, ValueError, OverflowError):
             return None, "depth_detector_bbox_invalid_observation"
@@ -1350,6 +1355,8 @@ class DistanceRuntime:
             target, width, height, now=time.monotonic(),
             use_latest_depth=use_latest_depth, capture_timestamp=capture_timestamp,
             steering_feedback=steering_feedback,
+            allow_bounded_depth_history=(
+                getattr(self.sensor_runtime, "supports_bounded_depth_roi", False) is True),
         )
         observation = getattr(target, "depth_observation", None)
         self.logger.info(
@@ -1379,6 +1386,8 @@ class DistanceRuntime:
             measurement_kwargs["evidence_capture_frame_id"] = int(observation.capture_frame_id)
         if use_latest_depth:
             measurement_kwargs["use_latest_depth"] = True
+        if geometry_reason == "yolo_detector_bounded_history":
+            measurement_kwargs["bounded_roi_capture_timestamp"] = float(observation.capture_timestamp)
         if steering_feedback is not None:
             measurement_kwargs["steering_feedback"] = steering_feedback
         if observation is not None and not use_latest_depth:
@@ -1396,6 +1405,29 @@ class DistanceRuntime:
             int(height),
             **measurement_kwargs,
         )
+        if geometry_reason == "yolo_detector_bounded_history" and measurement.raw_distance_m is not None:
+            from .depth_roi_policy import BoundedDepthSelection
+            stamp = getattr(measurement, "sample_timestamp", None)
+            selection = getattr(measurement, "bounded_roi_selection", None)
+            valid = bool(
+                getattr(measurement, "observation_source", None) == "roi_bounded_history"
+                and getattr(measurement, "observation_sample_timestamp", None) == stamp
+                and isinstance(selection, BoundedDepthSelection)
+                and selection.valid_for(
+                    capture_timestamp=observation.capture_timestamp, sample_timestamp=stamp,
+                    now=time.monotonic(), target_id=target.track_id,
+                    capture_frame_id=observation.capture_frame_id, bbox=ranging_target.bbox,
+                )
+            )
+            if not valid:
+                # Fail closed even if a backend accidentally returns latest or
+                # retimestamps a sample. Do not erase a newer fusion anchor.
+                self.logger.warning("Depth bounded ROI provenance rejected capture=%s sample_ts=%s",
+                                    observation.capture_frame_id, stamp)
+                state = DistanceState(source="vision_depth", source_detail="bounded_roi_provenance_rejected",
+                                      target_threshold_m=target_distance_m, brake_threshold_m=brake_distance_m)
+                self.last_distance_state = state
+                return state
         return self._build_vision_depth_state(
             measurement,
             target=ranging_target,
@@ -1404,6 +1436,46 @@ class DistanceRuntime:
             target_distance_m=target_distance_m,
             brake_distance_m=brake_distance_m,
         )
+
+    def get_cropped_observation_state(self, width, height, observation, *, steering_feedback=None):
+        """RGB-aligned ranging only; never publish a motion ROI or fusion anchor."""
+        state = DistanceState(source="cropped_depth_observation", source_detail="crop_depth_unavailable")
+        if (not self.config.module_astra_depth_enable
+                or not isinstance(observation, DepthTargetObservation)
+                or observation.source != "yolo_cropped_observation"):
+            return state
+        # Reuse the ordinary age/bounds validator locally. The original typed
+        # observation is NEVER promoted or cached for the latest-depth worker.
+        target = PersonTarget(bbox=observation.bbox, track_id=observation.target_id,
+                              confidence=0., area=0., depth_observation=replace(observation, source="yolo_detector"))
+        target, reason = self._depth_target_for_ranging(
+            target, width, height, now=time.monotonic(), use_latest_depth=False,
+            capture_timestamp=observation.capture_timestamp, steering_feedback=steering_feedback)
+        if target is None:
+            return replace(state, source_detail="crop_observation:" + reason)
+        measurement = self.sensor_runtime.get_astra_target_distance(
+            observation.bbox, width, height, target_id=observation.target_id,
+            reference_timestamp=observation.capture_timestamp,
+            evidence_capture_frame_id=observation.capture_frame_id,
+            steering_feedback=steering_feedback)
+        try:
+            stamp = float(measurement.sample_timestamp)
+            age = time.monotonic() - stamp
+            distance = float(measurement.distance_m)
+            raw = float(measurement.raw_distance_m)
+            valid = (math.isfinite(distance) and distance > 0 and math.isfinite(raw) and raw > 0
+                     and 0 <= age <= .25 and measurement.temporal_status == "new_sample"
+                     and measurement.detail.startswith("depth_")
+                     and not any(x in measurement.detail for x in ("hold", "pending", "guard", "reanchored")))
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        return replace(state, source_detail="crop_observation:" + measurement.detail,
+            raw_distance_m=raw if valid else None, used_distance_m=distance if valid else None,
+            safety_distance_m=min(raw, distance) if valid else None,
+            filtered_distance_m=distance if valid else None, sample_count=1 if valid else 0,
+            sample_timestamp=stamp if valid else None, sample_age_sec=age if valid else None,
+            observation_timestamp=measurement.observation_sample_timestamp,
+            temporal_status=measurement.temporal_status, fusion_mode="observation_only")
 
     def get_recent_vision_depth_state(
         self,

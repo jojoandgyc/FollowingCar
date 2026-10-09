@@ -5,12 +5,67 @@ import threading
 
 from car_control_modular.near_yaw_parking import NearYawParkRequest
 from test_follow_wheel_periodic import setup_periodic
+from test_visible_wheel_continuity import feedback
 
 
 def request_park(owner, clock):
     request = NearYawParkRequest(1, 46, clock[0] - .10, clock[0], "predictive_brake_coast")
     owner._near_yaw_park_request = request
     return request
+
+
+def test_release_evidence_starts_after_actual_backend_write(monkeypatch):
+    rt, owner, driver, _, clock, _ = setup_periodic(monkeypatch)
+    request = request_park(owner, clock)
+    original = rt.backend.send_stop
+    def delayed_stop(*args, **kwargs):
+        clock[0] += .03
+        return original(*args, **kwargs)
+    rt.backend.send_stop = delayed_stop
+    rt._service_follow_wheels()
+    assert rt._near_yaw_park_settling.sent_at == pytest.approx(10.03)
+    rt.get_steering_feedback = lambda: feedback(clock[0], 0, 0)
+    clock[0] = 10.45
+    rt._service_follow_wheels()
+    clock[0] = 10.51
+    rt._service_follow_wheels()
+    assert not rt.near_yaw_park_release_ready(request, 10.02, 10.54)
+    assert not rt.near_yaw_park_release_ready(request, 10.47, 10.54)
+    assert not rt.near_yaw_park_release_ready(request, 10.52, 10.52)
+    for t in (10.54, 10.58, 10.63):
+        clock[0] = t
+        rt._service_follow_wheels()
+    assert not rt.near_yaw_park_release_ready(request, 10.56, 10.64)
+    assert rt.near_yaw_park_release_ready(request, 10.64, 10.64)
+    assert driver.stops == [1, 0, 2]
+    assert rt._near_yaw_park_settling.sent_at == pytest.approx(10.03)
+
+
+def test_failed_actual_stop_does_not_create_release_permission(monkeypatch):
+    rt, owner, _, _, clock, _ = setup_periodic(monkeypatch)
+    request = request_park(owner, clock)
+    def failed_stop(*args, **kwargs):
+        raise OSError("fake write failed")
+    rt.backend.send_stop = failed_stop
+    with pytest.raises(OSError):
+        rt._service_follow_wheels()
+    assert not rt.near_yaw_park_release_ready(request, 10.01, 10.02)
+
+
+def test_actual_release_check_rejects_movement_and_other_episode(monkeypatch):
+    rt, owner, _, _, clock, _ = setup_periodic(monkeypatch)
+    request = request_park(owner, clock)
+    rt._service_follow_wheels()
+    for t in [10.50, 10.51, 10.56]:
+        clock[0] = t
+        rt.get_steering_feedback = lambda: feedback(clock[0], 0, 0)
+        rt._service_follow_wheels()
+    assert rt.near_yaw_park_release_ready(request, 10.57, 10.57)
+    other = request_park(owner, clock)
+    assert not rt.near_yaw_park_release_ready(other, 10.57, 10.57)
+    clock[0] = 10.58
+    rt.get_steering_feedback = lambda: feedback(clock[0], -4, 3)
+    assert not rt.near_yaw_park_release_ready(request, 10.58, 10.58)
 
 
 def test_explicit_park_preempts_periodic_tick_and_sends_normal_once(monkeypatch):
@@ -23,7 +78,7 @@ def test_explicit_park_preempts_periodic_tick_and_sends_normal_once(monkeypatch)
     for _ in range(5):
         clock[0] += .01
         rt._service_follow_wheels()
-    assert driver.stops == [0]  # NORMAL, not just a zero target
+    assert driver.stops == [1, 0]  # NORMAL, not just a zero target
     assert len(driver.pairs) == count  # no FOLLOW20_REVOKED after parking
     assert owner._brake_hold_active
     assert owner._brake_hold_label == "near_yaw_park"
@@ -116,7 +171,7 @@ def test_fresh_producer_release_restores_writer_not_old_queued_release(monkeypat
     rt._service_follow_wheels()
     assert driver.pairs[-1] == (24, -24)
     rt.send_percent_brake(mode="normal", label="near_yaw_park")
-    assert driver.stops == [0]
+    assert driver.stops == [1, 0]
     assert rt._near_yaw_park_applied is None
 
 
@@ -127,7 +182,7 @@ def test_hard_stop_overrides_normal_without_later_downgrade(monkeypatch):
     rt.send_stop_with_brake_hold("hard_stop")
     rt._service_follow_wheels()
     rt.send_percent_brake(mode="normal", label="near_yaw_park")
-    assert driver.stops == [0, 1]
+    assert driver.stops == [1, 0, 1]
     assert owner._brake_hold_label == "safety_hold_hard_stop"
     assert owner._brake_hold_stop_mode == "emergency"
 
@@ -151,7 +206,7 @@ def test_pending_park_is_rechecked_after_feedback_before_motor_write(monkeypatch
     rt._service_follow_wheels()
     assert not driver.pairs
     rt._service_follow_wheels()
-    assert driver.stops == [0]
+    assert driver.stops == [1, 0]
 
 
 def test_zero_packet_prepared_before_park_is_vetoed_under_motor_lock(monkeypatch):
@@ -168,7 +223,7 @@ def test_zero_packet_prepared_before_park_is_vetoed_under_motor_lock(monkeypatch
     assert not driver.pairs
     owner.motor_io_lock = lock
     rt._service_follow_wheels()
-    assert driver.stops == [0]
+    assert driver.stops == [1, 0]
 
 
 def test_cancel_aux_pulses_without_zero_before_normal(monkeypatch):
@@ -180,7 +235,7 @@ def test_cancel_aux_pulses_without_zero_before_normal(monkeypatch):
     request_park(owner, clock)
     rt._service_follow_wheels()
     assert not rt.yaw_aux_pulse_active()
-    assert driver.stops == [0]
+    assert driver.stops == [1, 0]
     assert driver.pairs == [(0, 0)]  # only NORMAL's own pre-zero
 
 

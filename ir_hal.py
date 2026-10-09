@@ -50,6 +50,7 @@ _last_status: Dict[str, int] = {}
 _last_read_ts = 0.0
 _last_log_ts = 0.0
 _last_log_key = None
+_iio_log_state = {}
 _session = requests.Session() if requests is not None else None
 _logger = logging.getLogger("PersonTracker")
 
@@ -67,7 +68,50 @@ _IDX_TO_IIO_PATH = {
 
 def _read_iio_value(path: str) -> int:
     with open(path, "r", encoding="ascii") as fh:
-        return int(fh.read().strip())
+        value = int(fh.read().strip())
+    if value not in (0, 1):
+        raise ValueError(f"IR IIO raw value must be 0 or 1: {value!r}")
+    return value
+
+
+def _maybe_log_iio(idx, path, *, value=None, error=None, force=False) -> None:
+    """Report the existing read, without another device access or a cache.
+
+    The HTTP diagnostics do not run for IIO. Keep per-channel state so that a
+    clear front sensor cannot hide a blocked right sensor's change/release.
+    This state is diagnostic only and never decides whether motion is allowed.
+    """
+    if not IR_RAW_LOG_ENABLE:
+        return
+    triggered = error is not None or value == IR_TRIGGER_VALUE
+    error_text = None if error is None else f"{type(error).__name__}: {error}"
+    key = (path, value, error_text, IR_TRIGGER_VALUE)
+    with _lock:
+        now = time.monotonic()
+        previous = _iio_log_state.get(idx)
+        previous_since = previous[2] if previous is not None else None
+        blocked_since = (previous_since if previous_since is not None else now) if triggered else None
+        previous_blocked_ms = 0.0 if previous_since is None else max(0.0, now - previous_since) * 1000.0
+        changed = previous is None or previous[0] != key
+        if not force and not changed and now - previous[1] < IR_RAW_LOG_EVERY_SEC:
+            return
+        _iio_log_state[idx] = (key, now, blocked_since)
+    log = _logger.warning if triggered else _logger.info
+    try:
+        log(
+            "IR IIO status side=%s idx=%s path=%s raw=%s trigger_value=%s "
+            "triggered=%s fail_closed=%s event=%s blocked_observed_ms=%.1f "
+            "previous_blocked_observed_ms=%.1f error=%s",
+            {0: "right", 1: "front", 2: "left"}.get(idx, "unknown"),
+            idx, path, value, IR_TRIGGER_VALUE, triggered, error is not None,
+            "initial" if previous is None else ("changed" if changed else "held"),
+            0.0 if blocked_since is None else max(0.0, now - blocked_since) * 1000.0,
+            previous_blocked_ms if not triggered else 0.0, error_text,
+        )
+    except Exception:
+        # A broken output handler must not replace a real hazard reading with
+        # an exception that callers may interpret differently from a trigger.
+        pass
 
 
 def _status_url() -> str:
@@ -202,8 +246,9 @@ class IR:
     def init():
         if IR_BACKEND in {"iio", "sysfs"}:
             try:
-                for path in _IDX_TO_IIO_PATH.values():
-                    _read_iio_value(path)
+                for idx, path in _IDX_TO_IIO_PATH.items():
+                    value = _read_iio_value(path)
+                    _maybe_log_iio(idx, path, value=value, force=True)
                 return 0
             except Exception as exc:
                 if IR_RAW_LOG_ENABLE:
@@ -218,12 +263,17 @@ class IR:
     @staticmethod
     def is_triggered(idx):
         if IR_BACKEND in {"iio", "sysfs"}:
+            channel = None
+            path = None
             try:
-                return _read_iio_value(_IDX_TO_IIO_PATH[int(idx)]) == IR_TRIGGER_VALUE
+                channel = int(idx)
+                path = _IDX_TO_IIO_PATH[channel]
+                value = _read_iio_value(path)
             except Exception as exc:
-                if IR_RAW_LOG_ENABLE:
-                    _logger.warning("IR IIO read failed idx=%s path=%s error=%s", idx, _IDX_TO_IIO_PATH.get(int(idx)), exc)
+                _maybe_log_iio(channel, path, error=exc)
                 return True
+            _maybe_log_iio(channel, path, value=value)
+            return value == IR_TRIGGER_VALUE
         try:
             key = _IDX_TO_PROTOCOL_KEY[int(idx)]
             status = _read_status()
@@ -237,4 +287,5 @@ class IR:
     def deinit():
         with _lock:
             _last_status.clear()
+            _iio_log_state.clear()
         return 0

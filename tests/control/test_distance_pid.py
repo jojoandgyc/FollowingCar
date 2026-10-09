@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from car_control_modular.steering_pid import DistancePidConfig, LongitudinalDistancePid
 from car_control_modular.control_types import PersonTarget, SensorFrame

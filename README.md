@@ -19,21 +19,19 @@ tracker.process_external_frame(frame, frame_format="BGR")
 
 ## Models
 
-Put RK3588 `.rknn` models under `models/`:
+The default RK3588 configuration uses the model files included under `models/`:
 
-- `models/yolo11s.rknn`
-- `models/deepsort.rknn`
+- `models/yolo11n_int8_person_val2017.rknn` (person detection)
+- `models/osnet_x0_25_msmt17_b1.rknn` (person ReID)
 
-YOLO11 can be converted with Rockchip's official `rknn_model_zoo/examples/yolo11`
-flow.  The default ReID model is the board-provided DeepSORT embedding RKNN
-model from the working RK3588 reference project.
+`models/README.md` records the optional model conversion experiments.
 
 ## 在 RK3588 开发板运行
 
-项目部署在 `/home/topeet/Desktop/rk_car_runtime_module` 时执行：
+在 RK3588 开发板上进入克隆目录后执行：
 
 ```bash
-cd /home/topeet/Desktop/rk_car_runtime_module
+cd /path/to/FollowingCar
 sudo -v
 ./run_request_0428_modular.sh --config car_control_modular/config/reid_runtime.ini
 ```
@@ -41,8 +39,10 @@ sudo -v
 按 `Ctrl+C` 会触发安全停车并退出。不要使用 `sudo ./run_request_0428_modular.sh`
 启动整个项目，否则运行日志可能被创建为 `root` 权限。
 
-RKNN 模型和板端运行时二进制未纳入 Git，请按 `models/README.md` 和
-`docs/rknn_environment.md` 准备运行环境。
+现用 RKNN 模型、`librknnrt.so`、Astra OpenNI 运行文件和 LZ30EMA 电机驱动源码
+已随此分支提供。默认配置从 `runtime_dependencies/` 读取后两项。
+Python 包、设备驱动与硬件接口仍需在 RK3588 开发板安装；版本和路径见
+[`runtime_dependencies/README.md`](runtime_dependencies/README.md)。
 
 ## 运行记录
 
@@ -65,10 +65,10 @@ RKNN 模型和板端运行时二进制未纳入 Git，请按 `models/README.md` 
 
 ## Smoke Test
 
-Once the RKNN runtime and models are available on the RK3588 board:
+Once the board-side Python dependencies are installed:
 
 ```bash
 python3 tools/rknn_image_smoke.py test.jpg \
-  --yolo-model models/yolo11s.rknn \
-  --reid-model models/deepsort.rknn
+  --yolo-model models/yolo11n_int8_person_val2017.rknn \
+  --reid-model models/osnet_x0_25_msmt17_b1.rknn
 ```

@@ -135,6 +135,7 @@ class LatestFrame:
     frame: Optional[Any] = None
     capture_index: int = 0
     capture_ts: float = 0.0
+    capture_monotonic: float = 0.0
 
 
 @dataclass
@@ -272,6 +273,7 @@ def main() -> int:
         window_name = "camera_raw"
         while not stop_event.is_set():
             frame_start = time.time()
+            frame_monotonic = time.monotonic()
             capture_end_ts = frame_start
             captured_frames += 1
 
@@ -286,6 +288,9 @@ def main() -> int:
                     latest.frame = frame
                     latest.capture_index = captured_frames
                     latest.capture_ts = frame_start
+                    # Same host monotonic clock as motor test events. This is
+                    # frame delivery time, not a hardware exposure timestamp.
+                    latest.capture_monotonic = frame_monotonic
                     latest.condition.notify()
 
             if args.display:
@@ -476,6 +481,7 @@ def inference_worker(
                     continue
                 capture_index = int(latest.capture_index)
                 capture_ts = float(latest.capture_ts)
+                capture_monotonic = float(latest.capture_monotonic)
                 frame = latest.frame.copy() if latest.frame is not None else None
                 last_seen = capture_index
             if frame is None:
@@ -524,6 +530,9 @@ def inference_worker(
                 "capture_index": capture_index,
                 "track_index": stats.processed,
                 "capture_ts": round(capture_ts, 6),
+                "capture_monotonic": capture_monotonic,
+                "frame_width": int(frame.shape[1]),
+                "frame_height": int(frame.shape[0]),
                 "infer_start_ts": round(infer_start, 6),
                 "infer_end_ts": round(infer_end, 6),
                 "capture_to_output_ms": round(max(0.0, (infer_end - capture_ts) * 1000.0), 3),

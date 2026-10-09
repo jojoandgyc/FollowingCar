@@ -4,6 +4,7 @@ import math
 import threading
 from dataclasses import dataclass, replace
 from typing import Optional
+from .outward_trajectory import OutwardTrajectoryLead
 
 
 @dataclass(frozen=True)
@@ -35,10 +36,21 @@ class LateralControlIntent:
     # required to release a deliberate coast/center hold.
     hold_zero: bool = False
     near_distance_mode: bool = False
-    # Whole-chassis NORMAL parking, only with zero longitudinal authority.
-    # Unlike hold_zero, this survives old-frame refreshes and zero writes.
+    # Predictive/center stop evidence. Runtime qualifies whole-chassis NORMAL
+    # from near-mode/no-translation or measured low-speed pivot motion; normal
+    # differential forward travel still retains longitudinal authority.
     park_requested: bool = False
     nominal_valid_until: float = 0.0
+    image_error_only: bool = False
+    # Explicit permission from the visual producer. Tapered/braking/search
+    # evidence must never be amplified again by the motor executor.
+    response_boost_allowed: bool = False
+    visual_error_deg: Optional[float] = None
+    countersteer_rpm: int = 0  # certified predictive brake, not a search direction
+    outward_lead: Optional[OutwardTrajectoryLead] = None
+    braking_image_rate_dps: Optional[float] = None  # capture-bound, taper only
+    outward_continuity_rate_dps: Optional[float] = None  # limited yaw only, no projection
+    forward_countersteer: bool = False  # cannot become an old pure-pivot pulse
 
     def continuation_allowed(self, now: float, feedback) -> bool:
         """Short forward-only bridge; feedback cannot extend either deadline."""
@@ -111,8 +123,16 @@ def _forward_continuation_evidence(intent, now, feedback) -> bool:
             or not 0.0 <= now - intent.capture_timestamp <= 0.35
             or not intent.valid(now) or feedback is None or not feedback.trustworthy):
         return False
-    yaw = float(feedback.yaw_rate_right_dps)
     age = now - float(feedback.timestamp)
+    if intent.image_error_only:
+        # Same deadlines/identity/forward scope, but yaw must not veto the
+        # position-only trial. Reserve image-motion uncertainty near center.
+        rate = intent.target_image_rate_dps
+        if not 0.0 <= age <= .10 or (rate is not None and not math.isfinite(float(rate))):
+            return False
+        travel = max(15.0, abs(rate or 0.0)) * max(0.0, now - intent.published_at) / 60.0
+        return abs(intent.x_ratio - .5) - travel > .10
+    yaw = float(feedback.yaw_rate_right_dps)
     raw = getattr(feedback, "raw_yaw_rate_right_dps", None)
     if (not math.isfinite(yaw) or not 0.0 <= age <= 0.10 or abs(yaw) > 20.0
             or (raw is not None and (not math.isfinite(float(raw)) or abs(float(raw) - yaw) > 10.0))):

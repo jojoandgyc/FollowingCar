@@ -65,6 +65,11 @@ class PersonTarget:
     confidence: float
     area: float
     depth_observation: Optional[DepthTargetObservation] = None
+    # Geometry for braking only. NEVER consumed by depth or identity authority.
+    braking_observation: Optional[DepthTargetObservation] = None
+    # True only for a fresh, exact observation of the bank's first enrolled UID.
+    # Skips duplicate startup confirmation, never motion/depth safety checks.
+    initial_identity_confirmed: bool = False
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -166,10 +171,19 @@ class SteeringFeedback:
     # median-filtered value above; startup/brake pulse gates may use this value
     # to react to the first real wheel response without waiting for 3 samples.
     raw_yaw_rate_right_dps: Optional[float] = None
+    # High encoder yaw is accepted for braking only after two consecutive
+    # samples agree. This prevents one mode-switch spike from parking the car.
+    yaw_rate_confirmed: bool = True
     integrated_yaw_right_deg: float = 0.0
     left_error: int = 0
     right_error: int = 0
     trustworthy: bool = False
+    # Read intervals, not simultaneous physical sample times. Diagnostics
+    # only; no extra serial reads and no renewal of the original timestamp.
+    left_read_started: Optional[float] = None
+    left_read_finished: Optional[float] = None
+    right_read_started: Optional[float] = None
+    right_read_finished: Optional[float] = None
 
 
 @dataclass(frozen=True)

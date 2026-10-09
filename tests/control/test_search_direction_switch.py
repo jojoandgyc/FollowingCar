@@ -67,6 +67,8 @@ def test_current_left_candidate_overrides_right_history_on_search_entry():
             search_cooldown=0,
             search_timeout_sec=30.0,
             search_candidate_untracked_min_score=0.10,
+            center_left_ratio=0.30,
+            center_right_ratio=0.70,
         )
     )
     controller.active_target_id = 1
@@ -130,9 +132,9 @@ def test_edge_target_crossing_aimline_still_turns_toward_bbox_center():
     )
 
     assert controller.search_direction == "left"
-    assert decision.actions == []
-    assert decision.explicit_stop_requested is True
-    assert decision.reason == "search_candidate_aimline_brake"
+    assert decision.actions and decision.actions[0].kind == "rotate_left"
+    assert not decision.explicit_stop_requested
+    assert decision.reason == "search_candidate_approach_left"
     assert decision.evidence_capture_frame_id == 85
 
 

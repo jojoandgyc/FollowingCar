@@ -46,7 +46,7 @@ def test_protected_stop_survives_new_motion_revision(monkeypatch):
     rt._dispatch_context.command = command(s, protected_stop=True, soft_stop=False)
     owner._action_command_revision = 2
     rt.send_robot_command(s.stop)
-    assert driver.stops == [0]
+    assert driver.stops == [1, 0]
 
 
 def test_stop_uses_own_soft_mode_not_new_global_flags(monkeypatch):
@@ -56,7 +56,7 @@ def test_stop_uses_own_soft_mode_not_new_global_flags(monkeypatch):
     rt._dispatch_context.command = command(s, soft_stop=False)
     owner._use_soft_stop_next = True
     rt.send_robot_command(s.stop)
-    assert driver.stops == [0]
+    assert driver.stops == [1, 0]
 
 
 def arm(rt, owner, clock):
@@ -85,26 +85,31 @@ def test_search_stop_is_normal_once_and_no_zero_or_motion_can_unlock(monkeypatch
         rt.send_percent_drive(0)
         rt.send_rotate_pulse_zero_stop()
         rt.send_stop_with_brake_hold("ordinary_stop")
-    assert driver.stops == [0] and driver.pairs == [(0, 0)]  # NORMAL's pre-stop zero only
+    assert driver.stops == [1, 0] and driver.pairs == [(0, 0)]  # NORMAL's pre-stop zero only
     assert not rt.can_release_brake_hold(s.rotate_right)
 
 
-def test_only_two_distinct_post_stop_quiet_feedbacks_release(monkeypatch):
+def test_two_post_stop_quiet_feedbacks_and_new_image_release(monkeypatch):
     rt, owner, driver, _, clock, _ = setup_periodic(monkeypatch)
     arm(rt, owner, clock)
     rt._service_follow_wheels()
     rt.get_steering_feedback = lambda: quiet(10.)
     assert rt.search_reacquire_brake_pending()  # feedback predates/completes at stop
-    clock[0] = 10.05
-    rt.get_steering_feedback = lambda: quiet(10.05)
+    clock[0] = 10.50
+    rt._service_follow_wheels()  # current release is a motor tick, not a vision poll
+    clock[0] = 10.51
+    rt.get_steering_feedback = lambda: quiet(10.51)
     assert rt.search_reacquire_brake_pending()
     assert rt.search_reacquire_brake_pending()  # repeated cache is not sample two
-    clock[0] = 10.10
-    rt.get_steering_feedback = lambda: quiet(10.10)
-    assert not rt.search_reacquire_brake_pending()
+    clock[0] = 10.56
+    rt.get_steering_feedback = lambda: quiet(10.56)
+    assert rt.search_reacquire_brake_pending()  # polling cannot release
+    assert rt.search_reacquire_brake_pending(capture_timestamp=9.99)
+    assert rt.search_reacquire_brake_pending(capture_timestamp=10.535)  # before quiet
+    assert not rt.search_reacquire_brake_pending(capture_timestamp=10.56)
     assert owner._brake_hold_active  # latched until a new command is adopted
     assert rt.can_release_brake_hold(rt.symbols.rotate_right)
-    assert driver.stops == [0] and driver.pairs == [(0, 0)]
+    assert driver.stops == [1, 0, 2] and driver.pairs == [(0, 0)]  # only NORMAL pre-zero
 
 
 @pytest.mark.parametrize("kind", ["moving", "stale", "future", "invalid", "nan", "gap"])
@@ -117,13 +122,13 @@ def test_bad_feedback_never_releases_or_accumulates_quiet(kind, monkeypatch):
     assert rt.search_reacquire_brake_pending()
     clock[0] = 10.10 if kind != "gap" else 10.60
     fb = quiet(clock[0])
-    if kind == "moving": fb = replace(fb, left_speed_rpm=8, raw_yaw_rate_right_dps=-19)
+    if kind == "moving": fb = replace(fb, left_speed_rpm=8, left_forward_rpm=8, raw_yaw_rate_right_dps=-19)
     elif kind == "stale": fb = replace(fb, timestamp=9.)
     elif kind == "future": fb = replace(fb, timestamp=12.)
     elif kind == "invalid": fb = replace(fb, trustworthy=False)
-    elif kind == "nan": fb = replace(fb, raw_yaw_rate_right_dps=float("nan"))
+    elif kind == "nan": fb = replace(fb, left_forward_rpm=float("nan"))
     rt.get_steering_feedback = lambda: fb
-    assert rt.search_reacquire_brake_pending()
+    assert rt.search_reacquire_brake_pending(capture_timestamp=clock[0])
 
 
 def test_search_settle_never_releases_newer_safety_hold(monkeypatch):
@@ -136,7 +141,7 @@ def test_search_settle_never_releases_newer_safety_hold(monkeypatch):
         rt.get_steering_feedback = lambda: quiet(clock[0])
         rt.search_reacquire_brake_pending()
     assert owner._brake_hold_active and owner._brake_hold_label == "safety_hold_hard_stop"
-    assert driver.stops == [0, 1]
+    assert driver.stops == [1, 0, 1]
 
 
 def test_revision_changes_after_dispatch_before_final_stop_write(monkeypatch):
@@ -193,16 +198,18 @@ def test_released_search_brake_refresh_cannot_repark_new_motion(monkeypatch):
     rt, owner, driver, _, clock, state = setup_periodic(monkeypatch)
     arm(rt, owner, clock)
     rt._service_follow_wheels()
-    for t in (10.05, 10.10):
+    for t in (10.50, 10.51, 10.56):
         clock[0] = t
         rt.get_steering_feedback = lambda: quiet(clock[0])
+        rt._service_follow_wheels()
         rt.search_reacquire_brake_pending()
-    state[:] = [24., 5., 10.25, 10.25]
+    assert not rt.search_reacquire_brake_pending(capture_timestamp=10.56)
+    state[:] = [24., 5., 10.65, 10.65]
     assert rt.can_release_brake_hold(rt.symbols.steer_right)
     owner._brake_hold_active = False  # executor's release after a new decision
     owner._brake_hold_stop_mode = None
     owner._brake_hold_label = "brake"
     rt._service_follow_wheels()
     rt.send_percent_brake(mode="normal", label="search_reacquire_brake")
-    assert driver.stops == [0]
+    assert driver.stops == [1, 0, 2]
     assert driver.pairs[-1] == (29,-19)

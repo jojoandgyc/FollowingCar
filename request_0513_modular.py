@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from collections import deque
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -53,12 +53,16 @@ from car_control_modular.controllers import (
 from car_control_modular.action_runtime import ActionRuntimeConfig, ActionRuntimeSymbols, MotionActionRuntime
 from car_control_modular.action_queue_policy import merge_pending_actions
 from car_control_modular.action_command import ActionCommandSnapshot
-from car_control_modular.search_reacquire_braking import search_brake_reason
+from car_control_modular.search_reacquire_braking import (search_brake_reason, handoff_yaw_limit,
+    limit_handoff_yaw, handoff_retirement_reason, observe_moving_handoff, moving_handoff_yaw)
 from car_control_modular.distance_runtime import DistanceRuntime, DistanceRuntimeConfig
-from car_control_modular.depth_target_geometry import resolve_depth_target_observation
+from car_control_modular.depth_target_geometry import resolve_depth_target_observation, resolve_braking_target_observation
+from car_control_modular.startup_identity import resolve_initial_identity_confirmation
+from car_control_modular.cropped_depth_observation import resolve_cropped_depth_observation
 from car_control_modular.follow_distance_hold import is_follow_distance_hold
 from car_control_modular.hazard_runtime import BunkerHazardRuntime, BunkerHazardRuntimeConfig
 from car_control_modular.mssd_motor import MssdMotorBackend, MssdMotorConfig, normalize_mssd_stop_mode
+from car_control_modular.motor_ramp import validate_acceleration_rpm_s
 from car_control_modular.sensor_modules import SensorRuntime, SensorRuntimeConfig
 from car_control_modular.search_diagnostics import (
     DetectionObservation,
@@ -76,11 +80,19 @@ from car_control_modular.search_candidate_gate import (
     SearchCandidateGateConfig,
     SearchCandidateGateDecision,
 )
-from car_control_modular.search_observation_retry import SearchObservationRetry
+from car_control_modular.search_observation_retry import (
+    confirmed_observation_for_release,
+    SearchObservationRetry, DetectorObservationSettlement, retry_evidence_source,
+    DEFERRED_EDGE_COVERAGE, incomparable_edge_observation,
+)
 from car_control_modular.historical_direction_backfill import (
     HistoricalDirectionBackfill,
     HistoricalDirectionCandidate,
 )
+from car_control_modular.visual_steering_evidence import matching_control_x
+from car_control_modular.steering_limits import effective_correction_limit, clamp_correction
+from car_control_modular.turn_buildup import steering_buildup_allowed
+from car_control_modular.predictive_turn_brake import qualified_countersteer, MAX_CAPTURE_AGE_SEC
 from car_control_modular.lateral_intent import (
     with_forward_continuation,
     LateralControlIntent,
@@ -88,8 +100,10 @@ from car_control_modular.lateral_intent import (
     slew_signed_rpm,
 )
 from car_control_modular.low_quality_lateral import MultiPersonLateralGate
+from car_control_modular.search_brake_observation import SearchBrakeObservation
 from car_control_modular.near_yaw_parking import (
     NearYawParkRequest, newer_visual_evidence, predictive_or_center_stop,
+    low_speed_turn_stop_reason,
 )
 from car_control_modular.video_recorder import (
     AsyncVideoRecorder,
@@ -183,6 +197,13 @@ MOTOR_RS485_BAUDRATE = int(os.environ.get("MOTOR_RS485_BAUDRATE", "9600"))
 MOTOR_RS485_TIMEOUT = float(os.environ.get("MOTOR_RS485_TIMEOUT", "0.3"))
 MOTOR_RS485_LIB_DIR = os.environ.get("MOTOR_RS485_LIB_DIR", "/home/topeet/lianzhan").strip()
 MOTOR_RS485_MAX_TARGET = int(os.environ.get("MOTOR_RS485_MAX_TARGET", "100"))
+MOTOR_RAMP_DIAGNOSTICS_ENABLE = os.environ.get("MOTOR_RAMP_DIAGNOSTICS_ENABLE", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_motor_acceleration_text = os.environ.get("MOTOR_CLOSED_LOOP_ACCELERATION_RPM_S", "").strip()
+MOTOR_CLOSED_LOOP_ACCELERATION_RPM_S = validate_acceleration_rpm_s(
+    int(_motor_acceleration_text) if _motor_acceleration_text else None,
+)
 MOTOR_RS485_TARGET_MIN_INTERVAL_SEC = max(
     0.0,
     float(os.environ.get("MOTOR_RS485_TARGET_MIN_INTERVAL_SEC", "0.05")),
@@ -469,6 +490,7 @@ ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC = max(
 )
 # New control samples and all reverse grants retain their original 180ms gate.
 ASTRA_DEPTH_LONGITUDINAL_CONTROL_SAMPLE_MAX_AGE_SEC = 0.18
+ASTRA_DEPTH_CONTINUATION_SPEED_CAP_ENABLE = os.environ.get("ASTRA_DEPTH_CONTINUATION_SPEED_CAP_ENABLE", "0") == "1"
 # Stage-2 guard: the Depth supervisor may assist longitudinal control, but it
 # must remain a low-speed authority independent of the global follow cap.
 ASTRA_DEPTH_LONGITUDINAL_MAX_FORWARD_PERCENT = max(
@@ -498,6 +520,9 @@ VISION_CONTROL_MAX_RESULT_AGE_SEC = max(
     0.05,
     min(0.50, float(os.environ.get("VISION_CONTROL_MAX_RESULT_AGE_SEC", "0.18"))),
 )
+# Historical direction evidence only. This is NOT a motion/Depth lease and
+# must never extend VISION_CONTROL_MAX_RESULT_AGE_SEC or renew an old command.
+SEARCH_BRAKE_DIRECTION_OBSERVATION_MAX_AGE_SEC = 0.50
 
 # 跟踪参数
 DETECTION_CONFIRM_FRAMES = 3
@@ -1300,6 +1325,14 @@ VISIBLE_MOTION_MIN_RATIO = max(0.0, float(os.environ.get("VISIBLE_MOTION_MIN_RAT
 VISIBLE_MOTION_PROJECTION_GAIN = max(0.0, float(os.environ.get("VISIBLE_MOTION_PROJECTION_GAIN", "0.35")))
 VISIBLE_MOTION_STRONG_RATIO = max(0.0, float(os.environ.get("VISIBLE_MOTION_STRONG_RATIO", "0.10")))
 VISIBLE_STEERING_PID_ENABLE = os.environ.get("VISIBLE_STEERING_PID_ENABLE", "0").strip() != "0"
+VISIBLE_STEERING_PID_IMAGE_ERROR_ONLY = os.environ.get("VISIBLE_STEERING_PID_IMAGE_ERROR_ONLY", "0").strip() != "0"
+VISIBLE_STEERING_PID_IMAGE_BRAKE_ASSIST = os.environ.get("VISIBLE_STEERING_PID_IMAGE_BRAKE_ASSIST", "0").strip() != "0"
+VISIBLE_STEERING_PID_IMAGE_CAPTURE_MOTION = os.environ.get("VISIBLE_STEERING_PID_IMAGE_CAPTURE_MOTION", "0").strip() != "0"
+VISIBLE_STEERING_PID_IMAGE_SLOW_BRAKE_CONTINUITY_SEC = float(os.environ.get("VISIBLE_STEERING_PID_IMAGE_SLOW_BRAKE_CONTINUITY_SEC", "0"))
+VISIBLE_STEERING_PID_OUTWARD_LEAD_ENABLE = os.environ.get("VISIBLE_STEERING_PID_OUTWARD_LEAD_ENABLE", "0").lower() in ("1", "true", "yes", "on")
+VISIBLE_STEERING_PID_IMAGE_MOTION_RESPONSE_SEC = float(os.environ.get("VISIBLE_STEERING_PID_IMAGE_MOTION_RESPONSE_SEC", "0.18"))
+VISIBLE_STEERING_PID_EXECUTION_RESPONSE_TRIAL_SEC = float(os.environ.get("VISIBLE_STEERING_PID_EXECUTION_RESPONSE_TRIAL_SEC", "0"))
+VISIBLE_STEERING_PID_IMAGE_CENTER_RELEASE_MARGIN_DEG = float(os.environ.get("VISIBLE_STEERING_PID_IMAGE_CENTER_RELEASE_MARGIN_DEG", "1.8"))
 VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE = os.environ.get("VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE", "0").strip() != "0"
 VISIBLE_STEERING_PID_CAMERA_HFOV_DEG = float(os.environ.get("VISIBLE_STEERING_PID_CAMERA_HFOV_DEG", "90.0"))
 VISIBLE_STEERING_PID_CAMERA_LATENCY_SEC = float(os.environ.get("VISIBLE_STEERING_PID_CAMERA_LATENCY_SEC", "0.13"))
@@ -1346,6 +1379,20 @@ VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_MARGIN_DEG = max(
 VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_RESPONSE_SEC = max(
     0.0,
     float(os.environ.get("VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_RESPONSE_SEC", "0.0")),
+)
+VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MAX_CORRECTION_RPM = max(
+    0.0,
+    float(os.environ.get("VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MAX_CORRECTION_RPM", "0.0")),
+)
+VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MIN_YAW_RATE_DPS = max(
+    0.0,
+    float(os.environ.get("VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MIN_YAW_RATE_DPS", "4.0")),
+)
+VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MIN_CORRECTION_RPM = max(
+    0.0, float(os.environ.get("VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MIN_CORRECTION_RPM", "0.0")),
+)
+VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_GAIN_RPM_PER_DPS = max(
+    0.0, float(os.environ.get("VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_GAIN_RPM_PER_DPS", "0.10")),
 )
 VISIBLE_STEERING_PID_MIN_EFFECTIVE_ERROR_DEG = float(os.environ.get("VISIBLE_STEERING_PID_MIN_EFFECTIVE_ERROR_DEG", "0.0"))
 VISIBLE_STEERING_PID_MIN_EFFECTIVE_CORRECTION_RPM = float(os.environ.get("VISIBLE_STEERING_PID_MIN_EFFECTIVE_CORRECTION_RPM", "0.0"))
@@ -1447,6 +1494,8 @@ MSSD_MOTOR_CONFIG = MssdMotorConfig(
     stop_mode=MOTOR_RS485_STOP_MODE,
     stop_zero_delay_sec=MOTOR_RS485_STOP_ZERO_DELAY_SEC,
     parking_current_a=MOTOR_PARKING_CURRENT_A,
+    ramp_diagnostics_enable=MOTOR_RAMP_DIAGNOSTICS_ENABLE,
+    closed_loop_acceleration_rpm_s=MOTOR_CLOSED_LOOP_ACCELERATION_RPM_S,
 )
 
 # 动作参数
@@ -1686,6 +1735,9 @@ if not math.isfinite(DISTANCE_PI_MOTION_MEMORY_SEC) or not 0 <= DISTANCE_PI_MOTI
 DISTANCE_PI_LAUNCH_REQUEST_RPM = float(os.environ.get("DISTANCE_PI_LAUNCH_REQUEST_RPM", "0"))
 if not math.isfinite(DISTANCE_PI_LAUNCH_REQUEST_RPM) or not 0 <= DISTANCE_PI_LAUNCH_REQUEST_RPM <= 200:
     raise ValueError("DISTANCE_PI_LAUNCH_REQUEST_RPM must be finite and within 0..200")
+DISTANCE_PI_LAUNCH_FULL_ERROR_M = float(os.environ.get("DISTANCE_PI_LAUNCH_FULL_ERROR_M", "0"))
+if not math.isfinite(DISTANCE_PI_LAUNCH_FULL_ERROR_M) or not 0 <= DISTANCE_PI_LAUNCH_FULL_ERROR_M <= 2:
+    raise ValueError("DISTANCE_PI_LAUNCH_FULL_ERROR_M must be finite and within 0..2")
 for _pi_parameter_name in ("DISTANCE_PI_KP_PER_SEC", "DISTANCE_PI_KI_PER_SEC2",
                            "DISTANCE_PI_INTEGRAL_MAX_M_S", "DISTANCE_PI_MEMORY_SEC"):
     if not math.isfinite(globals()[_pi_parameter_name]) or globals()[_pi_parameter_name] < 0:
@@ -1883,6 +1935,13 @@ ACTION_RUNTIME_CONFIG = ActionRuntimeConfig(
     motor_forward_like_keepalive_sec=MOTOR_FORWARD_LIKE_KEEPALIVE_SEC,
     follow_wheel_period_sec=float(os.environ.get("FOLLOW_WHEEL_PERIOD_SEC", "0")),
     follow_forward_handoff_enable=os.environ.get("FOLLOW_FORWARD_HANDOFF_ENABLE", "0") == "1",
+    follow_residual_reverse_max_rpm=float(os.environ.get("FOLLOW_RESIDUAL_REVERSE_MAX_RPM", "0")),
+    follow_forward_loss_handoff_enable=os.environ.get("FOLLOW_FORWARD_LOSS_HANDOFF_ENABLE", "0") == "1",
+    follow_turn_residual_max_rpm=float(os.environ.get("FOLLOW_TURN_RESIDUAL_MAX_RPM", "0")),
+    follow_turn_acceleration_priority_enable=os.environ.get("FOLLOW_TURN_ACCELERATION_PRIORITY_ENABLE", "0") == "1",
+    follow_turn_response_assist_enable=os.environ.get("FOLLOW_TURN_RESPONSE_ASSIST_ENABLE", "0") == "1",
+    follow_cross_brake_enable=os.environ.get("FOLLOW_CROSS_BRAKE_ENABLE", "0") == "1",
+    follow_cross_brake_mode=os.environ.get("FOLLOW_CROSS_BRAKE_MODE", "zero").strip().lower(),
     motor_rs485_stop_mode=MOTOR_RS485_STOP_MODE,
     safety_stop_mode=SAFETY_STOP_MODE,
     motor_rs485_transition_stop_mode=MOTOR_RS485_TRANSITION_STOP_MODE,
@@ -1936,6 +1995,11 @@ class PersonTracker:
         self._capture_queue = queue.Queue(maxsize=RKNN_CAPTURE_QUEUE_SIZE)
         self._capture_frame_id = 0
         self._capture_state_lock = threading.Lock()
+        self._capture_started_ts = 0.0
+        self._capture_last_frame_ts = 0.0
+        self._capture_failure_reason = None
+        self._capture_recorder_disabled = False
+        self._capture_direction_disabled = False
         self._direction_result_backlog = []
         # DirectionEvidence is tiny (bbox/score/timestamp), so retain a short
         # capture-ordered ring instead of copying full 1080p frames into RAM.
@@ -1967,7 +2031,8 @@ class PersonTracker:
                     output_path=RKNN_CAMERA_RAW_OUTPUT,
                     fps=RKNN_CAMERA_FPS,
                     fourcc="MJPG",
-                    queue_capacity=60,
+                    queue_capacity=max(1, min(60, int(os.environ.get("FOLLOW_VIDEO_QUEUE_CAPACITY", "12")))),
+                    worker_nice=max(0, min(19, int(os.environ.get("FOLLOW_VIDEO_WORKER_NICE", "5")))),
                     fast_mjpeg=os.environ.get("FOLLOW_VIDEO_FAST_MJPEG", "1").lower()
                         not in {"0", "false", "off", "no"},
                 ),
@@ -2094,7 +2159,8 @@ class PersonTracker:
             "candidate_acquire=%drpm aimline_approach<=%.3f/%drpm "
             "aimline_intersection=active_brake "
             "identity_claim=False direction=geometry_only "
-            "edge_probe_skip_below=%.2f edge_center_margin=%.2f",
+            "edge_probe_skip_below=%.2f edge_center_margin=%.2f "
+            "unmatched_probe_observation_min_score=0.15",
             SEARCH_EVIDENCE_GATE_ENABLE,
             CONFIDENCE_THRESHOLD,
             SEARCH_EVIDENCE_PROBE_MIN_SCORE,
@@ -2181,11 +2247,13 @@ class PersonTracker:
         )
         logger.info(
             "Distance control: mode=%s pi_kp=%.3f/s pi_ki=%.3f/s2 pi_integral_max=%.3fm/s "
-            "pi_memory=%.3fs feedforward_diagnostic_only=%s rotation_only=%s launch_request_rpm=%.1f",
+            "pi_memory=%.3fs feedforward_diagnostic_only=%s rotation_only=%s launch_request_rpm=%.1f "
+            "launch_full_error_m=%.3f",
             DISTANCE_CONTROL_MODE, DISTANCE_PI_KP_PER_SEC, DISTANCE_PI_KI_PER_SEC2,
             DISTANCE_PI_INTEGRAL_MAX_M_S, DISTANCE_PI_MEMORY_SEC,
             DISTANCE_CONTROL_MODE == "distance_pi", FOLLOW_ROTATION_ONLY,
             DISTANCE_PI_LAUNCH_REQUEST_RPM,
+            DISTANCE_PI_LAUNCH_FULL_ERROR_M,
         )
         logger.info(
             "Distance PID: enabled=%s kp=%.2f ki=%.2f kd=%.2f deadband=%.3fm "
@@ -2397,6 +2465,8 @@ class PersonTracker:
             cfg.identity_preferred_search_reacquire_min_confidence,
         )
         self._rknn_pipeline = RKNNVisionPipeline(cfg, logger=logger)
+        from rk_vision.numeric_runtime import log_numeric_runtime
+        log_numeric_runtime(logger, "vision_initialized")
         if RKNN_DIRECTION_WORKERS > 0 and FOLLOW_DIRECTION_HISTORY_ENABLE:
             if DirectionInferencePool is None or YOLO11Config is None:
                 raise RuntimeError(f"direction worker import failed: {_RKNN_DIRECTION_IMPORT_ERROR}")
@@ -2506,6 +2576,10 @@ class PersonTracker:
                 max_area_ratio=SEARCH_EVIDENCE_MAX_AREA_RATIO,
                 probe_confirm_frames=SEARCH_EVIDENCE_PROBE_CONFIRM_FRAMES,
                 probe_edge_min_score=SEARCH_EVIDENCE_PROBE_EDGE_MIN_SCORE,
+                # CAP900/901's 0.140/0.111 central background probe must not
+                # stop search. Diagnostics retain it; current UID evidence
+                # and formal detections keep their bounded observation path.
+                probe_observation_min_score=0.15,
                 probe_edge_center_ratio=SEARCH_EVIDENCE_PROBE_EDGE_CENTER_RATIO,
                 hold_frames=SEARCH_EVIDENCE_HOLD_FRAMES,
                 max_hold_sec=SEARCH_EVIDENCE_MAX_HOLD_SEC,
@@ -2592,6 +2666,7 @@ class PersonTracker:
         # 运行状态
         self.running = True
         self._runtime_shutdown_requested = False
+        self._runtime_shutdown_reason = None
         # 需容纳多步动作（如 [STOP, 旋转]）；maxsize=1 会丢第二个，表现为旋转怪/不转
         self.action_queue = queue.Queue(maxsize=32)
         self.action_queue_lock = threading.Lock()
@@ -2796,6 +2871,7 @@ class PersonTracker:
                 distance_pi_memory_sec=DISTANCE_PI_MEMORY_SEC,
                 distance_pi_motion_memory_sec=DISTANCE_PI_MOTION_MEMORY_SEC,
                 distance_pi_launch_request_rpm=DISTANCE_PI_LAUNCH_REQUEST_RPM,
+                distance_pi_launch_full_error_m=DISTANCE_PI_LAUNCH_FULL_ERROR_M,
                 distance_approach_enable=DISTANCE_APPROACH_ENABLE and not FOLLOW_ROTATION_ONLY,
                 distance_approach_matching_enable=DISTANCE_APPROACH_MATCHING_ENABLE,
                 distance_approach_gain_per_sec=DISTANCE_APPROACH_GAIN_PER_SEC,
@@ -2840,6 +2916,7 @@ class PersonTracker:
                 search_revolution_feedback_stale_sec=FOLLOW_SEARCH_REVOLUTION_FEEDBACK_STALE_SEC,
                 exit_on_target_loss=FOLLOW_EXIT_ON_TARGET_LOSS,
                 initial_target_confirm_frames=FOLLOW_INITIAL_TARGET_CONFIRM_FRAMES,
+                initial_target_max_age_sec=VISION_CONTROL_MAX_RESULT_AGE_SEC,
                 release_target_on_lost=FOLLOW_RELEASE_TARGET_ON_LOST,
                 side_ir_blocks_rotation=SIDE_IR_BLOCKS_ROTATION,
                 search_rotate_front_block_enable=SEARCH_ROTATE_FRONT_BLOCK_ENABLE,
@@ -2867,6 +2944,14 @@ class PersonTracker:
                 visible_steering_pid_target_rate_feedforward_max_dps=VISIBLE_STEERING_PID_TARGET_RATE_FEEDFORWARD_MAX_DPS,
                 visible_steering_pid_target_speed_match_max_closing_dps=VISIBLE_STEERING_PID_TARGET_SPEED_MATCH_MAX_CLOSING_DPS,
                 visible_steering_pid_forward_tracking_enable=VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE,
+                visible_steering_pid_image_error_only=VISIBLE_STEERING_PID_IMAGE_ERROR_ONLY,
+                visible_steering_pid_image_brake_assist=VISIBLE_STEERING_PID_IMAGE_BRAKE_ASSIST,
+                visible_steering_pid_image_capture_motion=VISIBLE_STEERING_PID_IMAGE_CAPTURE_MOTION,
+                visible_steering_pid_image_motion_response_sec=VISIBLE_STEERING_PID_IMAGE_MOTION_RESPONSE_SEC,
+                visible_steering_pid_execution_response_trial_sec=VISIBLE_STEERING_PID_EXECUTION_RESPONSE_TRIAL_SEC,
+                visible_steering_pid_image_slow_brake_continuity_sec=VISIBLE_STEERING_PID_IMAGE_SLOW_BRAKE_CONTINUITY_SEC,
+                visible_steering_pid_outward_lead_enable=VISIBLE_STEERING_PID_OUTWARD_LEAD_ENABLE,
+                visible_steering_pid_image_center_release_margin_deg=VISIBLE_STEERING_PID_IMAGE_CENTER_RELEASE_MARGIN_DEG,
                 visible_steering_pid_max_yaw_rate_dps=VISIBLE_STEERING_PID_MAX_YAW_RATE_DPS,
                 visible_steering_pid_rate_kp_rpm_per_dps=VISIBLE_STEERING_PID_RATE_KP_RPM_PER_DPS,
                 visible_steering_pid_rate_ki_rpm_per_deg=VISIBLE_STEERING_PID_RATE_KI_RPM_PER_DEG,
@@ -2888,6 +2973,10 @@ class PersonTracker:
                 visible_steering_pid_predictive_brake_decel_dps2=VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_DECEL_DPS2,
                 visible_steering_pid_predictive_brake_margin_deg=VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_MARGIN_DEG,
                 visible_steering_pid_predictive_brake_response_sec=VISIBLE_STEERING_PID_PREDICTIVE_BRAKE_RESPONSE_SEC,
+                visible_steering_pid_predictive_countersteer_max_correction_rpm=VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MAX_CORRECTION_RPM,
+                visible_steering_pid_predictive_countersteer_min_correction_rpm=VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MIN_CORRECTION_RPM,
+                visible_steering_pid_predictive_countersteer_gain_rpm_per_dps=VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_GAIN_RPM_PER_DPS,
+                visible_steering_pid_predictive_countersteer_min_yaw_rate_dps=VISIBLE_STEERING_PID_PREDICTIVE_COUNTERSTEER_MIN_YAW_RATE_DPS,
                 visible_steering_pid_min_effective_error_deg=VISIBLE_STEERING_PID_MIN_EFFECTIVE_ERROR_DEG,
                 visible_steering_pid_min_effective_correction_rpm=VISIBLE_STEERING_PID_MIN_EFFECTIVE_CORRECTION_RPM,
                 visible_steering_pid_mechanical_tier2_error_deg=VISIBLE_STEERING_PID_MECHANICAL_TIER2_ERROR_DEG,
@@ -2919,6 +3008,9 @@ class PersonTracker:
         # I/O, new lock, timer or independent motor lease is introduced.
         self._follow_controller._live_longitudinal_authority_reader = (
             lambda uid: PersonTracker._fresh_depth_linear_snapshot(self, uid)
+        )
+        self._follow_controller._longitudinal_execution_reader = (
+            lambda uid, stamp, now: self._action_runtime.forward_execution_anchor(uid, stamp, now)
         )
         self._last_control_decision_log_key = None
         self._last_control_decision_reason = ""
@@ -3143,16 +3235,21 @@ class PersonTracker:
         if current - float(stamp) > ASTRA_DEPTH_LONGITUDINAL_CONTROL_SAMPLE_MAX_AGE_SEC:
             if getattr(self, "_depth30_continuation_veto", None) == (uid, stamp):
                 return None
-            allowed, reason = PersonTracker._depth_forward_continuation_safe(self, linear, timing, current)
-            audit = (linear, allowed, reason)
+            cap_percent, reason = PersonTracker._depth_forward_continuation_limit(self, linear, timing, current)
+            percent = min(int(percent), cap_percent)
+            allowed = percent > 0
+            audit = (linear, allowed, reason, percent)
             if getattr(self, "_last_depth_continuation_audit", None) != audit:
                 self._last_depth_continuation_audit = audit
                 logger.info(
                     "depth_forward_continuation uid=%s sample_ts=%s age_ms=%.1f allowed=%s "
                     "reason=%s speed_percent=%s deadline=%s max_age_ms=%.0f "
-                    "pid_updated=False acceleration_allowed=False deadline_renewed=False",
+                    "pid_updated=False acceleration_allowed=False deadline_renewed=False "
+                    "original_percent=%s braking_distance_m=%s original_speed_bound_m_s=%s",
                     uid, stamp, (current-stamp)*1000., allowed, reason, percent,
                     stamp+PersonTracker._depth_linear_max_age_sec(kind), PersonTracker._depth_linear_max_age_sec(kind)*1000.,
+                    linear[1], getattr(timing, "continuation_distance_m", None),
+                    getattr(timing, "continuation_speed_bound_m_s", None),
                 )
             if not allowed:
                 PersonTracker._veto_depth_continuation(self, linear, now)
@@ -3181,7 +3278,7 @@ class PersonTracker:
                 min(ASTRA_DEPTH_LONGITUDINAL_CONTROL_SAMPLE_MAX_AGE_SEC,
                     ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC))
 
-    def _depth_forward_continuation_safe(self, linear, timing, now: float):
+    def _depth_forward_continuation_safe(self, linear, timing, now: float, *, feedback=...):
         """Extra TTL is a bounded old-grant hold, never a new control sample."""
         if linear[0] != "forward" or timing is None or timing.snapshot != linear:
             return False, "missing_original_forward_grant"
@@ -3197,11 +3294,80 @@ class PersonTracker:
         delay = float(DISTANCE_APPROACH_RESPONSE_DELAY_SEC)
         if not math.isfinite(deceleration) or deceleration <= 0 or not math.isfinite(delay) or delay < 0:
             return False, "invalid_braking_model"
+        age = now-linear[3]
+        if not math.isfinite(age) or not 0 <= age <= min(.25, PersonTracker._depth_linear_max_age_sec("forward")):
+            return False, "invalid_braking_model"
+        # Both the full-speed and reduced-speed paths consume the same current
+        # encoder evidence. A far target must not bypass wheel/feedback checks.
+        if feedback is ...:
+            reader = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
+            feedback = reader() if callable(reader) else None
+        from car_control_modular.depth_continuation import continuation_feedback_speeds
+        _body, outer, feedback_reason = continuation_feedback_speeds(
+            feedback=feedback, now=now,
+            circumference=VISION_MMWAVE_FUSION_ENCODER_WHEEL_CIRCUMFERENCE_M,
+            max_rpm=FORWARD_MAX_RPM, original_speed_bound=speed)
+        if outer is None:
+            audit = (linear, feedback_reason)
+            if getattr(self, "_last_depth_continuation_feedback_veto", None) != audit:
+                self._last_depth_continuation_feedback_veto = audit
+                exceeded = feedback_reason == "continuation_speed_exceeds_bound"
+                logger.info(
+                    "depth_continuation_feedback_veto uid=%s sample_ts=%s reason=%s "
+                    "feedback_ts=%s body_rpm=%s outer_rpm=%s original_speed_bound_m_s=%s "
+                    "bound_scope=longitudinal_body braking_scope=outer_wheel deadline_renewed=False",
+                    linear[2], linear[3], feedback_reason, getattr(feedback, "timestamp", None),
+                    .5*(feedback.left_forward_rpm+feedback.right_forward_rpm) if exceeded else None,
+                    max(feedback.left_forward_rpm, feedback.right_forward_rpm) if exceeded else None,
+                    speed)
+            return False, feedback_reason
         # Assume the target stops moving, reserve all travel since the ORIGINAL
         # capture plus modeled braking. Approved speed is not a target-speed FF.
+        # Preserve the original full-bound test; newer outer-wheel momentum may
+        # only tighten it, never replace the old bound by a smaller body speed.
         remaining = distance - max(TARGET_DISTANCE+DISTANCE_PID_DEADBAND_M, FOLLOW_BRAKE_DISTANCE_M)
-        needed = speed * (max(0., now-linear[3]) + delay) + speed*speed/(2*deceleration) + .02
+        braking_speed = max(speed, outer)
+        needed = speed*age + braking_speed*delay + braking_speed*braking_speed/(2*deceleration) + .02
         return (True, "same_grant_braking_margin") if remaining >= needed else (False, "braking_margin")
+
+    def _depth_forward_continuation_limit(self, linear, timing, now):
+        """One policy for motor reads AND later evidence tightening the lease."""
+        reader = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
+        feedback = reader() if callable(reader) else None
+        allowed, reason = PersonTracker._depth_forward_continuation_safe(
+            self, linear, timing, now, feedback=feedback)
+        if allowed:
+            return int(linear[1]), reason
+        if reason != "braking_margin" or not ASTRA_DEPTH_CONTINUATION_SPEED_CAP_ENABLE:
+            return 0, reason
+        from car_control_modular.depth_continuation import continuation_speed_cap
+        cap, reason = continuation_speed_cap(
+            distance=timing.continuation_distance_m,
+            stop_distance=max(TARGET_DISTANCE+DISTANCE_PID_DEADBAND_M, FOLLOW_BRAKE_DISTANCE_M),
+            original_speed_bound=timing.continuation_speed_bound_m_s,
+            sample_age=now-linear[3], feedback=feedback, now=now,
+            circumference=VISION_MMWAVE_FUSION_ENCODER_WHEEL_CIRCUMFERENCE_M,
+            max_rpm=FORWARD_MAX_RPM, deceleration=DISTANCE_APPROACH_DECELERATION_M_S2,
+            response_delay=DISTANCE_APPROACH_RESPONSE_DELAY_SEC,
+        )
+        percent = min(int(linear[1]), int(cap*100./FORWARD_MAX_RPM))
+        audit = (linear, reason, percent)
+        if getattr(self, "_last_depth_continuation_cap_audit", None) != audit:
+            self._last_depth_continuation_cap_audit = audit
+            logger.info(
+                "depth_continuation_cap uid=%s sample_ts=%.6f age_ms=%.1f "
+                "original_percent=%s cap_rpm=%.2f approved_percent=%s reason=%s "
+                "feedback_ts=%s feedback_forward_rpm=%s distance_m=%s "
+                "original_speed_bound_m_s=%s body_rpm=%s outer_rpm=%s "
+                "bound_scope=longitudinal_body braking_scope=outer_wheel deadline_renewed=False",
+                linear[2], linear[3], (now-linear[3])*1000., linear[1], cap, percent, reason,
+                getattr(feedback, "timestamp", None),
+                None if feedback is None else (feedback.left_forward_rpm, feedback.right_forward_rpm),
+                timing.continuation_distance_m, timing.continuation_speed_bound_m_s,
+                None if feedback is None else .5*(feedback.left_forward_rpm+feedback.right_forward_rpm),
+                None if feedback is None else max(feedback.left_forward_rpm, feedback.right_forward_rpm),
+            )
+        return percent, reason
 
     def _depth_continuation_evidence(self, frame, target_id, percent, now):
         """Capture a conservative bound only while the original grant is fresh."""
@@ -3221,6 +3387,8 @@ class PersonTracker:
                 or state.safety_distance_m is not None or state.brake_latched
                 or not any(p.track_id == target_id for p in frame.persons)):
             return None, None
+        # Keep this original conservative bound unchanged. Later body/outer
+        # separation is not permission to weaken the captured travel budget.
         speed = max(percent*FORWARD_MAX_RPM/100., feedback.left_forward_rpm,
                     feedback.right_forward_rpm) * VISION_MMWAVE_FUSION_ENCODER_WHEEL_CIRCUMFERENCE_M/60.
         result = getattr(self._follow_controller, "last_distance_pid_result", None)
@@ -3271,11 +3439,11 @@ class PersonTracker:
         # timestamp is not installed as either an accepted sample or deadline.
         if timing.continuation_distance_m is not None:
             timing = replace(timing, continuation_distance_m=min(timing.continuation_distance_m, *distances))
-        allowed, reason = PersonTracker._depth_forward_continuation_safe(self, timing.snapshot, timing, now)
-        if not allowed:
+        cap_percent, reason = PersonTracker._depth_forward_continuation_limit(self, timing.snapshot, timing, now)
+        if cap_percent <= 0:
             self._revoke_depth_linear_authority("late_depth_"+reason)
             return [ControlAction.forward(0, "late_depth_"+reason)], True
-        percent = min([previous[1]] + [max(0, int(a.speed_percent)) for a in decision.actions if a.kind == "forward"])
+        percent = min([previous[1], cap_percent] + [max(0, int(a.speed_percent)) for a in decision.actions if a.kind == "forward"])
         if percent <= 0:
             self._revoke_depth_linear_authority("late_depth_requested_zero")
             return [ControlAction.forward(0, "late_depth_requested_zero")], True
@@ -3605,8 +3773,31 @@ class PersonTracker:
             limiter_feedback(stamp, float(linear.speed_percent) * FORWARD_MAX_RPM / 100.0)
         positive = bool(linear is not None and linear.kind in {"forward", "backward"}
                         and int(linear.speed_percent) > 0 and target_id is not None)
+        execution_check = getattr(self._follow_controller, "longitudinal_execution_proof_valid", None)
         if positive and is_fresh_depth:
-            self._depth30_linear_snapshot = (linear.kind, int(linear.speed_percent), int(target_id), authority_stamp)
+            proof = getattr(self._follow_controller, "_distance_pi_execution_anchor_proof", None)
+            proof_pending = bool(pi_forward_request and proof is not None and proof[0] == stamp)
+            # Existing order is control lock -> motor lock. Only the rare
+            # receipt-based handoff needs atomic check/publication; no I/O is
+            # performed here. A concurrent zero/STOP cannot slip between them.
+            with self.motor_io_lock if proof_pending else nullcontext():
+                publish_now = time.monotonic()
+                proof_valid = (not proof_pending or (
+                    self._depth_frame_sample_timestamp(frame, publish_now) == stamp
+                    and stamp + PersonTracker._depth_linear_max_age_sec("forward")
+                        - publish_now >= dispatch_budget
+                    and callable(execution_check) and execution_check(stamp, publish_now)))
+                if proof_valid:
+                    self._depth30_linear_snapshot = (linear.kind, int(linear.speed_percent), int(target_id), authority_stamp)
+                    consume_execution = getattr(self._follow_controller, "consume_longitudinal_execution_proof", None)
+                    if pi_forward_request and callable(consume_execution):
+                        consume_execution(stamp)
+                else:
+                    if callable(reject_sample):
+                        reject_sample(stamp, reason="execution_packet_changed_before_admission")
+                    self._depth30_linear_snapshot = None
+                    linear = ControlAction.forward(0, "execution_packet_changed_before_admission")
+                    actions = [linear]
         elif positive:
             previous = PersonTracker._fresh_depth_linear_snapshot(self, target_id, now=now)
             if previous is not None and previous[0] == linear.kind:
@@ -3782,7 +3973,6 @@ class PersonTracker:
             or not self._vision_control_state.startswith("target_visible")
             or decision.explicit_stop_requested or decision.shutdown_requested
             or self._explicit_stop_requested or self._runtime_shutdown_requested or not self.running
-            or bool(getattr(self, "_brake_hold_active", False))
             or getattr(self, "_near_yaw_park_request", None) is not None
             or frame.hazard.active or frame.obstacles.front or frame.obstacles.left or frame.obstacles.right
             or bool(getattr(frame.distance_state, "brake_latched", False))
@@ -3796,6 +3986,40 @@ class PersonTracker:
         canonical = getattr(self._follow_controller, "_longitudinal_only_decision", None)
         if not callable(canonical):
             return False
+        if bool(getattr(self, "_brake_hold_active", False)):
+            # Search NORMAL used to wait for a forward command while this
+            # admission gate waited for NORMAL to release (CAP357 onward).
+            # Only this independently qualified NEW observation may bridge
+            # the handoff; every other parking owner keeps its old semantics.
+            observation = target.depth_observation
+            state = frame.distance_state
+            distances = (frame.distance_m, state.raw_distance_m)
+            trusted = getattr(self._follow_controller, "_distance_longitudinally_untrusted", None)
+            eligible = bool(
+                getattr(self, "_brake_hold_label", "") == "search_reacquire_brake"
+                and sum(p.track_id == target.track_id for p in frame.persons) == 1
+                and observation is not None and observation.source == "yolo_detector"
+                and observation.target_id == target.track_id
+                and observation.capture_frame_id == frame.capture_frame_id
+                and observation.capture_timestamp == frame.capture_timestamp
+                and state.sample_timestamp is not None
+                and not state.target_latched and state.safety_distance_m is None
+                and all(d is not None and math.isfinite(d)
+                        and d > TARGET_DISTANCE + DISTANCE_PID_DEADBAND_M for d in distances)
+                and not (callable(trusted) and trusted(frame))
+                and any(a.kind in {"forward", "steer_left", "steer_right"}
+                        and a.speed_percent > 0 for a in decision.actions)
+            )
+            release = getattr(getattr(self, "_action_runtime", None),
+                              "release_settled_search_brake_for_depth", None)
+            if not eligible or not callable(release) or not release(
+                uid=target.track_id, capture_id=frame.capture_frame_id,
+                capture_timestamp=frame.capture_timestamp, sample_timestamp=stamp,
+                depth_max_age=min(ASTRA_DEPTH_LONGITUDINAL_CONTROL_SAMPLE_MAX_AGE_SEC,
+                                  ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC),
+                image_max_age=VISION_CONTROL_MAX_RESULT_AGE_SEC,
+            ):
+                return False
         last_action_frame = getattr(self._follow_controller, "last_action_frame", -1)
         visual_pid = getattr(self._follow_controller, "last_steering_pid_result", None)
         try:
@@ -3831,6 +4055,8 @@ class PersonTracker:
         Called with motor_io_lock held; do not acquire the control/command
         locks here (the producer may be waiting for the motor thread).
         """
+        if getattr(self._follow_controller, "active_target_id", None) is None:
+            return False  # No startup search, including legacy/default packets.
         source = str(getattr(self, "_current_rotate_raw_source", ""))
         if source == "stale_vision_zero_yaw":
             return False
@@ -3884,12 +4110,20 @@ class PersonTracker:
                 request = NearYawParkRequest(
                     intent.target_id, intent.capture_frame_id,
                     intent.capture_timestamp, now, str(reason),
+                    countersteer_rpm=int(intent.countersteer_rpm),
+                    visual_error_deg=float(intent.visual_error_deg or 0.0),
+                    image_rate_dps=float(intent.target_image_rate_dps or 0.0),
+                    countersteer_until=min(intent.valid_until,
+                                           intent.capture_timestamp + MAX_CAPTURE_AGE_SEC),
                 )
                 self._near_yaw_park_request = request
+                parking = getattr(self._follow_controller, "set_normal_parking", None)
+                if callable(parking):
+                    parking(True, request.uid)
                 self._near_yaw_park_evidence = (intent.capture_frame_id, intent.capture_timestamp)
                 logger.info(
                     "near_yaw_park_requested uid=%s capture_frame_id=%s reason=%s "
-                    "base_rpm=0 yaw_rpm=0 mode=normal",
+                    "base_rpm=0 yaw_rpm=0 mode=runtime_selected",
                     intent.target_id, intent.capture_frame_id, reason,
                 )
             else:
@@ -3908,6 +4142,9 @@ class PersonTracker:
         self, *, capture_id: int, capture_timestamp: float, reason: str,
         target_id: Optional[int] = None, qualified: bool = False,
         handoff: bool = False,
+        x_ratio: Optional[float] = None, translation_requested: bool = False,
+        outward_lead=None,
+        forward_resume_sample_ts=None,
     ) -> bool:
         """Only newer physical visual evidence can release this ordinary hold.
 
@@ -3927,9 +4164,53 @@ class PersonTracker:
                     or self._runtime_shutdown_requested
                     or not (handoff or (qualified and target_id == request.uid))):
                 return False
+            if (getattr(self, "_brake_hold_active", False)
+                    and getattr(self, "_brake_hold_label", "") != "near_yaw_park"):
+                return False
+            trajectory_release = False
+            if not handoff and not translation_requested:
+                cfg = getattr(self._follow_controller, "cfg", None)
+                margin = max(0.0, float(getattr(cfg, "visible_steering_pid_image_center_release_margin_deg", 1.8)))
+                hfov = max(1.0, float(getattr(cfg, "visible_steering_pid_camera_hfov_deg", 60.0)))
+                left = float(getattr(cfg, "center_left_ratio", .45)) - margin / hfov
+                right = float(getattr(cfg, "center_right_ratio", .55)) + margin / hfov
+                if x_ratio is None or not math.isfinite(x_ratio):
+                    return False
+                if left <= x_ratio <= right:
+                    # Only exact new capture evidence can take this narrow
+                    # early-release route. Require the full quiet/minimum-hold gate.
+                    evidence = getattr(getattr(self, "_action_runtime", None),
+                                       "_near_yaw_park_settling", None)
+                    trajectory_release = bool(
+                        qualified and outward_lead is not None
+                        and getattr(cfg, "visible_steering_pid_outward_lead_enable", False)
+                        and outward_lead.matches(target_id, capture_id, capture_timestamp, time.monotonic())
+                        and abs(x_ratio-outward_lead.x) <= .06
+                        and (x_ratio-.5)*outward_lead.correction_rpm > 0
+                        and evidence is not None and evidence.request is request
+                        and outward_lead.first_timestamp > evidence.sent_at)
+                if left <= x_ratio <= right and not trajectory_release:
+                    logger.info("near_yaw_park_release_blocked reason=center_release_band x=%s band=%.3f/%.3f", x_ratio, left, right)
+                    return False
+            # Pure recentering must finish the previous stop before restarting
+            # either direction. Qualified translation retains its independent
+            # handoff so centered forward recovery does not deadlock on this.
+            resume = getattr(getattr(self, "_action_runtime", None), "request_near_yaw_forward_resume", None)
+            if (not handoff and qualified and translation_requested
+                    and forward_resume_sample_ts is not None and callable(resume)):
+                resume(request, capture_timestamp, forward_resume_sample_ts, time.monotonic())
+            ready = getattr(getattr(self, "_action_runtime", None),
+                            "near_yaw_park_release_ready" if handoff or not translation_requested else "near_yaw_park_motion_ready", None)
+            if not callable(ready) or not ready(request, capture_timestamp, time.monotonic()):
+                return False
+            if trajectory_release:
+                reason += ":outward_trajectory"
             self._retire_near_yaw_park_commands()
             self._lateral_intent_store.clear()
             self._near_yaw_park_request = None
+            parking = getattr(self._follow_controller, "set_normal_parking", None)
+            if callable(parking):
+                parking(False, request.uid)
             if getattr(self, "_brake_hold_label", "") == "near_yaw_park":
                 self._brake_hold_active = False
                 self._brake_hold_stop_mode = None
@@ -3952,6 +4233,9 @@ class PersonTracker:
         *, control_source: str, target_steerable: bool, low_quality_visible: bool,
     ) -> bool:
         """Release before committing NEW Depth, including straight-ahead restart."""
+        if getattr(getattr(self._follow_controller, "last_steering_pid_result", None),
+                   "output_floor_reason", "") == "predictive_countersteer":
+            return False  # Braking evidence cannot unlock an existing NORMAL.
         if (getattr(self, "_near_yaw_park_request", None) is None
                 or control_source != "vision" or target is None
                 or decision.explicit_stop_requested or decision.shutdown_requested
@@ -3968,17 +4252,61 @@ class PersonTracker:
                 and (action.speed_percent > 0 or action.steer_correction_rpm != 0))
             for action in decision.actions
         )
-        if not motion:
+        c = self._follow_controller
+        state = frame.distance_state
+        stamp = state.sample_timestamp
+        preview_demand = 0.0
+        resume_demand = getattr(c, "parked_forward_resume_demand_rpm", None)
+        if (not motion and not FOLLOW_ROTATION_ONLY
+                and target_steerable and not low_quality_visible
+                and callable(resume_demand)):
+            preview_demand = resume_demand(frame, target.track_id)
+        if not motion and preview_demand <= 0:
             return False
-        return self._release_near_yaw_park(
+        forward_requested = bool(preview_demand > 0 or any(
+            a.kind in ("forward", "steer_left", "steer_right") and a.speed_percent > 0
+            for a in decision.actions))
+        # Only fresh, outward distance evidence may interrupt ordinary dwell.
+        # Rotation, unknown speed, stale depth and identity candidates cannot.
+        early_forward = bool(
+            target_steerable and not low_quality_visible
+            and getattr(c, "_braking_rate_source", None) == "raw_depth_window"
+            and getattr(c, "_braking_range_rate", 0.) > 0.
+            and isinstance(stamp, (int, float)) and math.isfinite(stamp)
+            and 0 <= time.monotonic()-stamp <= .18 and c._is_fresh_depth_state(frame)
+            and not c._distance_longitudinally_untrusted(frame)
+            and all(v is not None and math.isfinite(v)
+                    and v > c.cfg.target_distance_m+c.cfg.distance_pid_deadband_m
+                    for v in (frame.distance_m, state.raw_distance_m))
+            and forward_requested)
+        released = self._release_near_yaw_park(
             capture_id=int(getattr(self, "_last_command_capture_frame", frame.capture_frame_id)),
             capture_timestamp=frame.capture_timestamp,
-            target_id=target.track_id, qualified=bool(target_steerable and not low_quality_visible),
+            target_id=target.track_id,
+            qualified=bool(target_steerable or (low_quality_visible and target_steerable is False
+                                                and any(a.kind in ("rotate_left", "rotate_right")
+                                                        and a.speed_percent > 0 for a in decision.actions))),
             reason="new_visual_decision:" + str(decision.reason),
+            x_ratio=target.center[0] / max(1, frame.width),
+            translation_requested=bool(preview_demand > 0 or any(
+                a.kind in ("forward", "backward", "steer_left", "steer_right")
+                and a.speed_percent > 0 for a in decision.actions)),
+            outward_lead=(getattr(self._follow_controller.last_steering_pid_result, "outward_lead", None)
+                          if target_steerable and not low_quality_visible else None),
+            forward_resume_sample_ts=stamp if early_forward else None,
         )
+        if preview_demand > 0:
+            logger.info(
+                "near_yaw_park_resume_demand uid=%s capture_frame_id=%s sample_ts=%s "
+                "brake_limited_demand_rpm=%.2f preview_output_rpm=0 released=%s "
+                "motion_authorized=False reason=fresh_parked_pi_demand",
+                target.track_id, frame.capture_frame_id, stamp, preview_demand, released,
+            )
+        return released
 
     def _publish_lateral_zero(
         self, intent: LateralControlIntent, reason: str, *, park_requested: bool = False,
+        pid_result=None,
     ) -> bool:
         """Revoke yaw through the single action executor, preserving Depth v.
 
@@ -4009,12 +4337,42 @@ class PersonTracker:
         self._current_rotate_pulse_enabled = False
 
         linear = PersonTracker._fresh_depth_linear_snapshot(self, intent.target_id, now=now)
+        stop_turn = False
+        if ((intent.park_requested or park_requested)
+                and getattr(self, "_near_yaw_park_request", None) is None):
+            reader = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
+            feedback = reader() if callable(reader) else None  # existing encoder cache only
+            linear_rpm = (0.0 if linear is None else
+                          float(linear[1]) * FORWARD_MAX_RPM / 100.
+                          * (1 if linear[0] == "forward" else -1))
+            stop_reason = low_speed_turn_stop_reason(
+                intent, feedback, now=now,
+                active_uid=getattr(self._follow_controller, "active_target_id", None),
+                linear_rpm=linear_rpm, max_image_age=VISION_CONTROL_MAX_RESULT_AGE_SEC,
+            )
+            stop_turn = stop_reason == "low_speed_turn_stop"
+            logger.info(
+                "lateral_turn_stop_gate capture_frame_id=%s uid=%s reason=%s "
+                "near_mode=%s linear_rpm=%.1f feedback_left=%s feedback_right=%s "
+                "feedback_age_ms=%s",
+                intent.capture_frame_id, intent.target_id, stop_reason,
+                intent.near_distance_mode, linear_rpm,
+                getattr(feedback, "left_forward_rpm", None),
+                getattr(feedback, "right_forward_rpm", None),
+                (now-feedback.timestamp)*1000 if feedback is not None else None,
+            )
+            if stop_turn:
+                # Latch before another depth/periodic writer can restore a
+                # tiny translation. The executor owns the actual NORMAL I/O.
+                self._request_near_yaw_park(intent, "low_speed_turn_stop:" + str(reason))
         preserve = bool(
             linear is not None and intent.bbox_quality == "reliable"
             and getattr(self, "_near_yaw_park_request", None) is None
         )
         if not preserve and getattr(self, "_depth30_linear_snapshot", None) is not None:
-            self._revoke_depth_linear_authority("lateral_zero_no_qualified_depth:" + str(reason))
+            self._revoke_depth_linear_authority(
+                ("lateral_low_speed_turn_stop:" if stop_turn else
+                 "lateral_zero_no_qualified_depth:") + str(reason))
         self._current_forward_allow_below_min = preserve
         if preserve:
             kind, percent, _target_id, _stamp = linear
@@ -4031,7 +4389,7 @@ class PersonTracker:
             self.is_forwarding = False
             action = ACTION_STOP
             self._use_soft_stop_next = not bool(getattr(self, "_brake_hold_active", False))
-            if intent.near_distance_mode and (intent.park_requested or park_requested):
+            if not stop_turn and intent.near_distance_mode and (intent.park_requested or park_requested):
                 self._request_near_yaw_park(intent, reason)
             if getattr(self, "_near_yaw_park_request", None) is not None:
                 self._use_soft_stop_next = False
@@ -4049,9 +4407,14 @@ class PersonTracker:
         self._lateral_intent_last_publish_ts = now
         logger.info(
             "lateral_zero_publish seq=%d capture_frame_id=%d reason=%s "
-            "yaw_rpm=0 preserve_depth=%s linear_percent=%d action=%s",
+            "yaw_rpm=0 preserve_depth=%s linear_percent=%d action=%s "
+            "brake_continuity_reason=%s brake_continuity_elapsed_ms=%.1f "
+            "brake_continuity_remaining_ms=%.1f",
             intent.sequence, intent.capture_frame_id, reason, preserve,
             int(linear[1]) if preserve else 0, ACTION_NAMES.get(action, str(action)),
+            getattr(pid_result, "brake_continuity_reason", "not_evaluated"),
+            1000. * getattr(pid_result, "brake_continuity_elapsed_sec", 0.),
+            1000. * getattr(pid_result, "brake_continuity_remaining_sec", 0.),
         )
         return True
 
@@ -4229,6 +4592,7 @@ class PersonTracker:
             LATERAL_INTENT_CONTROL_ENABLE
             and VISIBLE_STEERING_PID_ENABLE
             and target is not None
+            and getattr(self._follow_controller, "active_target_id", None) == target.track_id
             and int(width) > 0
             and (pid_result is not None or zero_requested)
             and (target_steerable or limited_low_quality_yaw or zero_requested)
@@ -4243,6 +4607,7 @@ class PersonTracker:
             return False
         motion_requested = bool(
             not zero_requested
+            and getattr(pid_result, "output_floor_reason", "") != "predictive_countersteer"
             and (int(getattr(pid_result, "correction_rpm", 0)) != 0
                  or (action.kind in ("forward", "backward", "steer_left", "steer_right")
                      and int(action.speed_percent) > 0))
@@ -4252,8 +4617,16 @@ class PersonTracker:
                 capture_id=int(getattr(self, "_last_command_capture_frame", 0)),
                 capture_timestamp=float(getattr(self, "_last_command_capture_timestamp", 0.0)),
                 target_id=int(target.track_id),
-                qualified=bool(target_steerable and not low_quality_visible),
+                # A mapped low-quality target may release a NORMAL pivot hold
+                # for bounded yaw only. It never releases into translation.
+                qualified=bool((target_steerable or limited_low_quality_yaw)
+                               and not (low_quality_visible and not limited_low_quality_yaw)),
                 reason="new_visible_motion",
+                x_ratio=target.center[0] / max(1, width),
+                translation_requested=bool(action.kind in ("forward", "backward", "steer_left", "steer_right")
+                                           and action.speed_percent > 0),
+                outward_lead=(getattr(pid_result, "outward_lead", None)
+                              if target_steerable and not low_quality_visible else None),
             )
         if not zero_requested and getattr(self, "_near_yaw_park_request", None) is not None:
             # No new owner from old/low-quality motion evidence. The last
@@ -4271,6 +4644,10 @@ class PersonTracker:
 
         cx, _cy = target.center
         x_ratio = max(0.0, min(1.0, float(cx) / float(max(1, int(width)))))
+        x_ratio = matching_control_x(
+            getattr(self._follow_controller, "last_capture_steering_observation", None),
+            int(target.track_id), int(getattr(self, "_last_command_capture_frame", 0)),
+            float(getattr(self, "_last_command_capture_timestamp", 0.0)), x_ratio)
         motion_samples = getattr(self._follow_controller, "_visible_motion_samples", [])
         motion_dx_ratio = 0.0
         if len(motion_samples) >= 2:
@@ -4287,6 +4664,9 @@ class PersonTracker:
         policy_limit = getattr(pid_result, "correction_policy_limit_rpm", None)
         if policy_limit is None or mode != "forward" or low_quality_visible or not target_steerable:
             policy_limit = getattr(pid_result, "correction_limit_rpm", 0.0)
+        handoff_limit = handoff_yaw_limit(self, int(target.track_id))
+        if handoff_limit is not None:
+            policy_limit = min(float(policy_limit), handoff_limit)
         now = time.monotonic()
         previous_intent = self._lateral_intent_store.snapshot()
         capture_id = int(getattr(self, "_last_command_capture_frame", 0))
@@ -4297,6 +4677,24 @@ class PersonTracker:
             previous_cap = max(previous_cap, watermark_cap)
         if 0 < capture_id <= previous_cap and not zero_requested:
             return False  # Replaying one observation cannot renew yaw authority.
+        brake_observation = getattr(self._follow_controller, "last_capture_steering_observation", None)
+        turnaround_rate = getattr(pid_result, "braking_image_rate_dps", None)
+        crop_outward_rate = getattr(pid_result, "outward_continuity_rate_dps", None)
+        if not (not zero_requested and mode == "yaw_only" and limited_low_quality_yaw
+                and brake_observation is not None
+                and brake_observation.target_id == int(target.track_id)
+                and brake_observation.capture_frame_id == capture_id
+                and brake_observation.capture_timestamp == float(
+                    getattr(self, "_last_command_capture_timestamp", 0.0))
+                and crop_outward_rate == brake_observation.outward_continuity_rate_dps):
+            crop_outward_rate = None
+        if not (not zero_requested and mode == "yaw_only" and brake_observation is not None
+                and brake_observation.target_id == int(target.track_id)
+                and brake_observation.capture_frame_id == capture_id
+                and brake_observation.capture_timestamp == float(
+                    getattr(self, "_last_command_capture_timestamp", 0.0))
+                and turnaround_rate == brake_observation.inward_turnaround_rate_dps):
+            turnaround_rate = None
         intent = LateralControlIntent(
                 sequence=0,
                 target_id=int(target.track_id),
@@ -4309,7 +4707,8 @@ class PersonTracker:
                 mode=mode,
                 base_percent=max(0, int(action.speed_percent)),
                 base_rpm=max(0, int(getattr(pid_result, "base_rpm", 0))),
-                initial_correction_rpm=0 if zero_requested else int(pid_result.correction_rpm),
+                initial_correction_rpm=0 if zero_requested else int(limit_handoff_yaw(
+                    self, int(target.track_id), pid_result.correction_rpm)),
                 correction_limit_rpm=max(0.0, float(policy_limit)),
                 confidence=max(0.0, min(1.0, float(target.confidence))),
                 bbox_quality=(
@@ -4323,18 +4722,36 @@ class PersonTracker:
                 decision_capture_frame_id=int(getattr(self, "_active_capture_frame_id", 0)),
                 hold_zero=zero_requested,
                 near_distance_mode=str(self._last_control_decision_reason).startswith("near_distance_rotation_only"),
-                park_requested=bool(near_yaw_park_requested),
+                park_requested=bool(near_yaw_park_requested or predictive_or_center_stop(pid_result)),
+                visual_error_deg=getattr(pid_result, "visual_error_deg", None),
+                outward_lead=(getattr(pid_result, "outward_lead", None)
+                              if not zero_requested and mode in {"yaw_only", "forward"} and target_steerable
+                              and not low_quality_visible else None),
+                braking_image_rate_dps=turnaround_rate,
+                outward_continuity_rate_dps=crop_outward_rate,
+                forward_countersteer=bool(mode == "forward" and getattr(
+                    pid_result, "output_floor_reason", "") == "predictive_countersteer"
+                    and getattr(getattr(self._follow_controller, "cfg", None),
+                                "visible_steering_pid_execution_response_trial_sec", 0) > 0),
+                response_boost_allowed=bool(
+                    not zero_requested and mode == "forward" and target_steerable
+                    and not low_quality_visible and handoff_limit is None
+                    and steering_buildup_allowed(pid_result)),
         )
         if VISIBLE_STEERING_PID_FORWARD_TRACKING_ENABLE:
             get_feedback = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
+            intent = replace(intent, image_error_only=bool(getattr(
+                getattr(self._follow_controller, "cfg", None), "visible_steering_pid_image_error_only", False)))
             intent = with_forward_continuation(intent, get_feedback() if callable(get_feedback) else None)
         published = self._lateral_intent_store.publish(intent)
         if capture_id > 0:
             self._lateral_observation_watermark = (int(target.track_id), max(previous_cap, capture_id))
         self._lateral_intent_owned_frame = int(self.frame_index)
-        if zero_requested:
+        if self._request_predictive_turn_brake(published, pid_result):
+            return True
+        if zero_requested or (published.initial_correction_rpm == 0 and published.park_requested):
             # Do not wait for the next lateral tick or a 250ms motor timeout.
-            self._publish_lateral_zero(published, published.reason)
+            self._publish_lateral_zero(published, published.reason, pid_result=pid_result)
         elif publish_depth_immediately:
             # New range and yaw become one wheel target, including a range
             # zero which must withdraw an earlier forward target immediately.
@@ -4392,9 +4809,12 @@ class PersonTracker:
         stop_event.set()
         thread = getattr(self, "_lateral_intent_thread", None)
         if thread is not None:
-            thread.join(timeout=1.0)
-            if not thread.is_alive():
-                self._lateral_intent_thread = None
+            if thread.is_alive():
+                thread.join(timeout=1.0)
+            if thread.is_alive():
+                logger.error("runtime_shutdown worker=lateral_intent still_alive=True cleanup_deferred=True")
+                return
+            self._lateral_intent_thread = None
         if hasattr(self, "_lateral_intent_store"):
             self._clear_lateral_intent("runtime_stop")
 
@@ -4509,6 +4929,26 @@ class PersonTracker:
             "distance_too_close",
         ))
 
+    def _request_predictive_turn_brake(self, intent, result) -> bool:
+        cfg = getattr(self._follow_controller, "cfg", None)
+        if (intent.mode == "forward" and getattr(
+                cfg, "visible_steering_pid_execution_response_trial_sec", 0) > 0):
+            return False  # A forward brake never degrades into a parked pulse.
+        if (intent.hold_zero or intent.bbox_quality != "reliable"
+                or not intent.valid(time.monotonic())
+                or not qualified_countersteer(result, intent.x_ratio, getattr(
+                    cfg, "visible_steering_pid_predictive_countersteer_max_correction_rpm", 0.0))):
+            return False
+        # Never turn a normal forward curve into a whole-chassis brake pulse.
+        if PersonTracker._fresh_depth_linear_snapshot(self, intent.target_id, now=time.monotonic()) is not None:
+            return False
+        braking = replace(intent, countersteer_rpm=int(result.correction_rpm),
+                          visual_error_deg=float(result.visual_error_deg),
+                          target_image_rate_dps=float(result.target_image_rate_dps),
+                          park_requested=True)
+        self._request_near_yaw_park(braking, "predictive_countersteer_then_normal")
+        return True
+
     def _service_lateral_intent(self, now: float) -> None:
         if getattr(self, "_near_yaw_park_request", None) is not None:
             return  # A control tick/replayed image can never release parking.
@@ -4574,6 +5014,33 @@ class PersonTracker:
                 max_projection_sec=LATERAL_INTENT_MAX_PROJECTION_SEC,
                 max_projection_ratio=LATERAL_INTENT_MAX_PROJECTION_RATIO,
             )
+            if getattr(getattr(self._follow_controller, "cfg", None), "visible_steering_pid_image_error_only", False):
+                projected_x, projection_sec = intent.x_ratio, 0.0
+            cfg = getattr(self._follow_controller, "cfg", None)
+            effective_mode = intent.mode
+            effective_base = intent.base_rpm
+            effective_near = intent.near_distance_mode
+            if (getattr(cfg, "visible_steering_pid_image_error_only", False)
+                    and self._depth_longitudinal_authority_enabled()):
+                live_linear = (PersonTracker._fresh_depth_linear_snapshot(
+                    self, intent.target_id, now=now) if intent.bbox_quality == "reliable" else None)
+                if live_linear is None:
+                    effective_mode, effective_base, effective_near = "yaw_only", 0, True
+                else:
+                    effective_mode = "reverse" if live_linear[0] == "backward" else "forward"
+                    effective_base = live_linear[1] * FORWARD_MAX_RPM / 100.0
+            effective_limit = effective_correction_limit(
+                cfg, effective_base, near_distance=effective_near,
+                policy_limit=intent.correction_limit_rpm)
+            recenter = getattr(self._follow_controller, "post_park_recenter_limit", None)
+            if effective_mode == "yaw_only" and callable(recenter):
+                recenter_limit = recenter(intent.target_id)
+                if recenter_limit is not None:
+                    effective_limit = min(effective_limit, recenter_limit)
+            elif effective_mode in {"forward", "reverse"} and effective_base > 0:
+                clear_recenter = getattr(self._follow_controller, "clear_post_park_recenter", None)
+                if callable(clear_recenter):
+                    clear_recenter("fresh_translation")
             new_sequence = int(intent.sequence) != int(self._lateral_intent_last_sequence)
             if new_sequence:
                 # The vision decision already advanced the PID for this sample.
@@ -4584,22 +5051,29 @@ class PersonTracker:
             else:
                 refresh_pid = (
                     self._follow_controller.refresh_parked_lateral_pid
-                    if intent.mode == "yaw_only"
+                    if effective_mode == "yaw_only"
                     else self._follow_controller.refresh_visible_lateral_pid
                 )
                 refresh_kwargs = {}
-                if intent.mode == "yaw_only":
-                    refresh_kwargs["near_distance_mode"] = intent.near_distance_mode
-                elif intent.mode == "reverse":
+                if effective_mode == "yaw_only":
+                    refresh_kwargs["near_distance_mode"] = effective_near
+                    refresh_kwargs["braking_image_rate_dps"] = intent.braking_image_rate_dps
+                    refresh_kwargs["outward_continuity_rate_dps"] = intent.outward_continuity_rate_dps
+                elif effective_mode == "reverse":
                     refresh_kwargs["allow_forward_tracking"] = False
+                if (effective_mode in {"yaw_only", "forward"}
+                        and intent.outward_lead is not None and intent.bbox_quality == "reliable"
+                        and intent.outward_lead.matches(intent.target_id, intent.capture_frame_id,
+                                                       intent.capture_timestamp, now)):
+                    refresh_kwargs["outward_lead"] = intent.outward_lead
                 result = refresh_pid(
                     x_ratio=projected_x,
-                    base_rpm=int(intent.base_rpm),
+                    base_rpm=int(effective_base),
                     feedback=feedback,
                     now=now,
                     motion_dx_ratio=float(intent.motion_dx_ratio),
                     target_image_rate_dps=intent.target_image_rate_dps,
-                    max_correction_rpm=float(intent.correction_limit_rpm),
+                    max_correction_rpm=float(effective_limit),
                     visual_age_sec=(
                         None
                         if float(intent.capture_timestamp) <= 0.0
@@ -4608,6 +5082,9 @@ class PersonTracker:
                     **refresh_kwargs,
                 )
                 requested = int(result.correction_rpm)
+
+            if not new_sequence and self._request_predictive_turn_brake(intent, result):
+                return
 
             if (
                 self._lateral_intent_last_target_id != int(intent.target_id)
@@ -4628,10 +5105,29 @@ class PersonTracker:
                 rise_rpm_per_sec=LATERAL_INTENT_RISE_RPM_PER_SEC,
                 brake_rpm_per_sec=LATERAL_INTENT_BRAKE_RPM_PER_SEC,
             )
+            if (effective_mode == "forward" and getattr(
+                    cfg, "visible_steering_pid_execution_response_trial_sec", 0) > 0
+                    and qualified_countersteer(result, intent.x_ratio, getattr(
+                        cfg, "visible_steering_pid_predictive_countersteer_max_correction_rpm", 0))):
+                # This reverses the differential, NOT either wheel. The final
+                # writer rechecks current feedback and the depth grant.
+                correction = requested
             if requested == 0:
                 # Zero is an immediate axis cancellation, not a ramp that can
                 # keep the last turn alive while stopping is already required.
                 correction = 0
+            if (getattr(result, "brake_continuity_reason", "") in {
+                    "recent_outward_deceleration", "fresh_position_deceleration"}
+                    and getattr(result, "brake_continuity_remaining_sec", 0.) > 0.):
+                # This is a bounded braking target, not a new acceleration
+                # request. Slew must not keep an old -10 above the new -2 cap,
+                # nor carry an opposite residual direction through the hold.
+                correction = (int(math.copysign(min(abs(correction), abs(requested)), requested))
+                              if correction * requested > 0 else 0)
+            correction = int(limit_handoff_yaw(self, int(intent.target_id), correction))
+            # Also clamp the first reused visual result and the slew output.
+            # A policy decrease must not decay slowly from an obsolete 15RPM.
+            correction = int(clamp_correction(correction, effective_limit))
             direction = "right" if correction > 0 else "left" if correction < 0 else "hold"
             action = self._lateral_intent_action(intent.mode, correction)
             if action is None:
@@ -4668,6 +5164,10 @@ class PersonTracker:
                 )
 
             self._lateral_direction_intent = direction
+            # Publish the fast loop's current braking veto before its output.
+            # An untapered visual frame is not permission to amplify a later
+            # encoder/visual predictive taper of that same frame.
+            self._lateral_turn_response_policy = (int(intent.sequence), steering_buildup_allowed(result))
             self._lateral_intent_last_target_id = int(intent.target_id)
             self._lateral_intent_last_mode = intent.mode
             self._lateral_intent_last_sequence = int(intent.sequence)
@@ -4679,7 +5179,8 @@ class PersonTracker:
             ):
                 self._publish_lateral_zero(
                     intent, "pid_zero:" + intent.reason,
-                    park_requested=bool(intent.near_distance_mode and predictive_or_center_stop(result)),
+                    park_requested=predictive_or_center_stop(result),
+                    pid_result=result,
                 )
                 return
 
@@ -4789,7 +5290,11 @@ class PersonTracker:
                     "target_rate=%s desired_yaw=%+.2fdps measured_yaw=%+.2fdps "
                     "requested=%+drpm output=%+drpm limit=%.1frpm floor=%s action=%s "
                     "confidence=%.2f quality=%s feedback=%s publish=%s "
-                    "policy_limit_rpm=%.1f limit_reason=%s remaining_ms=%.1f forward_phase=%s continuation=%s capture_age_ms=%.1f",
+                    "policy_limit_rpm=%.1f limit_reason=%s remaining_ms=%.1f forward_phase=%s continuation=%s capture_age_ms=%.1f "
+                    "effective_mode=%s effective_limit_rpm=%.1f "
+                    "position_demand_rpm=%s brake_reduction_rpm=%s buildup_pid_allowed=%s "
+                    "brake_continuity_reason=%s brake_continuity_elapsed_ms=%.1f "
+                    "brake_continuity_remaining_ms=%.1f",
                     intent.sequence,
                     intent.frame_index,
                     int(intent.capture_frame_id),
@@ -4823,6 +5328,14 @@ class PersonTracker:
                     getattr(result, "forward_phase", "legacy"),
                     bool(intent.nominal_valid_until > 0 and now > intent.nominal_valid_until),
                     max(0.0, now - intent.capture_timestamp) * 1000.0 if intent.capture_timestamp > 0 else -1.0,
+                    effective_mode,
+                    effective_limit,
+                    getattr(result, "position_demand_rpm", None),
+                    getattr(result, "brake_reduction_rpm", None),
+                    steering_buildup_allowed(result),
+                    getattr(result, "brake_continuity_reason", "not_evaluated"),
+                    1000. * getattr(result, "brake_continuity_elapsed_sec", 0.),
+                    1000. * getattr(result, "brake_continuity_remaining_sec", 0.),
                 )
 
     def _lateral_intent_control_loop(self) -> None:
@@ -4907,15 +5420,22 @@ class PersonTracker:
             wake.set()
 
     def _depth_roi_age_allowed(self, capture_ts, now):
-        from car_control_modular.depth_roi_policy import roi_age_allowed
+        from car_control_modular.depth_roi_policy import roi_age_allowed, bounded_roi_history_allowed
         feedback = None
         if now - capture_ts > .18:
             reader = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
             try:
                 feedback = reader() if callable(reader) else None
             except Exception:
-                return False
-        return roi_age_allowed(capture_ts, now, ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC, feedback)
+                feedback = None
+        if roi_age_allowed(capture_ts, now, ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC, feedback):
+            return True
+        # This only permits a ranging attempt. DistanceRuntime and the actual
+        # camera must select/recheck a real sample inside the original 180ms
+        # association window; no old ROI receives unrestricted latest access.
+        return bool(getattr(getattr(self, "_sensor_runtime", None), "supports_bounded_depth_roi", False) is True
+                    and bounded_roi_history_allowed(capture_ts, now,
+                                                    ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC))
 
     def _visible_latest_depth_eligible(
         self, targets, selected, capture_id, capture_ts, *,
@@ -4969,10 +5489,13 @@ class PersonTracker:
             return
         logger.info(
             "depth_clock_config roi_max_ms=%.0f roi_normal_ms=180 extended_max_yaw_dps=5 "
-            "physical_depth_ttl_ms=%.0f forward_max_rpm=%d forward_motor_max_rpm=%d",
+            "physical_depth_ttl_ms=%.0f forward_max_rpm=%d forward_motor_max_rpm=%d "
+            "bounded_roi_history=%s bounded_association_max_ms=180 "
+            "bounded_sample_max_ms=180 depth_timestamp_kind=arrival",
             ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC * 1000,
             ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC * 1000,
             FORWARD_MAX_RPM, MOTOR_FORWARD_MAX_TARGET_RPM,
+            getattr(getattr(self, "_sensor_runtime", None), "supports_bounded_depth_roi", False) is True,
         )
         self._longitudinal_stop_event.clear()
         self._longitudinal_thread = threading.Thread(
@@ -5000,9 +5523,32 @@ class PersonTracker:
             wake.set()
         thread = self._longitudinal_thread
         if thread is not None:
-            thread.join(timeout=0.50)
+            if thread.is_alive():
+                thread.join(timeout=0.50)
+            if thread.is_alive():
+                # Do not lose ownership of a live worker or wait indefinitely
+                # on the very control lock that prevented it from exiting.
+                logger.error("runtime_shutdown worker=depth30 still_alive=True cleanup_deferred=True")
+                return
         self._longitudinal_thread = None
-        self._clear_longitudinal_context(reason="runtime_stop")
+        if not self._control_update_lock.acquire(blocking=False):
+            logger.warning("runtime_shutdown worker=depth30 cleanup_deferred=True reason=control_lock_busy")
+            return
+        context_acquired = False
+        try:
+            context_acquired = self._longitudinal_context_lock.acquire(blocking=False)
+            if not context_acquired:
+                logger.warning("runtime_shutdown worker=depth30 cleanup_deferred=True reason=context_lock_busy")
+                return
+            # The latched shutdown gate already forbids all motion. Cleanup
+            # need not call controller/logging callbacks while holding locks.
+            self._longitudinal_context = None
+            self._depth30_linear_snapshot = None
+            self._depth30_linear_timing = None
+        finally:
+            if context_acquired:
+                self._longitudinal_context_lock.release()
+            self._control_update_lock.release()
 
     def _longitudinal_control_loop(self) -> None:
         period_sec = 1.0 / max(1.0, float(ASTRA_DEPTH_LONGITUDINAL_CONTROL_HZ))
@@ -5011,6 +5557,7 @@ class PersonTracker:
             if wake is not None:
                 wake.clear()
             cycle_started = time.monotonic()
+            control_deferred = False
             with self._longitudinal_context_lock:
                 context = (
                     None
@@ -5029,7 +5576,7 @@ class PersonTracker:
                 )
                 if context_valid:
                     try:
-                        self._queue_actions_for_persons(
+                        processed = self._queue_actions_for_persons(
                             int(context["width"]),
                             int(context["height"]),
                             list(context["persons"]),
@@ -5043,6 +5590,7 @@ class PersonTracker:
                             evidence_capture_frame_id=int(context["capture_frame_id"]),
                             evidence_capture_timestamp=float(context["capture_timestamp"]),
                         )
+                        control_deferred = processed is False
                     except Exception as exc:
                         logger.warning("30Hz Depth纵向监督单次更新失败: %s", exc)
                 elif context_age > ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC:
@@ -5057,7 +5605,12 @@ class PersonTracker:
                         )
             elapsed = time.monotonic() - cycle_started
             waiter = wake if wake is not None else self._longitudinal_stop_event
-            waiter.wait(max(0.001, period_sec - elapsed))
+            # A busy control lock is not a failed depth sample. Retry from the
+            # *latest* published context, rather than queueing this ROI behind
+            # a visual decision or sleeping a complete 30 Hz period. No
+            # ranging, PID update, queue write or authority renewal took place.
+            retry_sec = min(period_sec, 0.005) if control_deferred else period_sec
+            waiter.wait(max(0.001, retry_sec - elapsed))
 
     def _action_names_for_log(self, actions: List[int]) -> List[str]:
         return [ACTION_NAMES.get(a, str(a)) for a in actions]
@@ -5390,7 +5943,12 @@ class PersonTracker:
         queued = 0
         # Serialize publication with the final motor write. A popped ordinary
         # STOP cannot cross this commit and override a newer steering intent.
-        with getattr(self, "motor_io_lock", nullcontext()), self.action_queue_lock:
+        motor_wait_started = time.perf_counter()
+        with ExitStack() as publish_locks:
+            publish_locks.enter_context(getattr(self, "motor_io_lock", nullcontext()))
+            motor_acquired = time.perf_counter()
+            publish_locks.enter_context(self.action_queue_lock)
+            queue_acquired = time.perf_counter()
             self._action_command_revision = int(getattr(self, "_action_command_revision", 0)) + 1
             revision = self._action_command_revision
             old_commands = tuple(self.action_queue.queue)
@@ -5462,6 +6020,7 @@ class PersonTracker:
                     break
             after_actions = self._action_queue_snapshot_locked()
             after = len(after_actions)
+            publish_finished = time.perf_counter()
         total_ms = (time.perf_counter() - start) * 1000.0
         new_primary = requested_actions[0] if requested_actions else None
         prev_primary = self._last_tracker_action_kind
@@ -5506,7 +6065,7 @@ class PersonTracker:
             self._last_action_queue_actions = list(queued_actions)
             self._last_action_queue_signature = action_signature
         logger.info(
-            "action queue replace: seq=%d control_frame_id=%d decision_capture_frame_id=%d evidence_capture_frame_id=%d source_module=%s reason=%s actions=%s signature=%s before=%d cleared=%d queued=%d after=%d clear_ms=%.3f total_ms=%.3f queue_before=%s queue_after=%s current=%s last_dispatched=%s since_last_enqueue_ms=%.1f search=%s/%s",
+            "action queue replace: seq=%d control_frame_id=%d decision_capture_frame_id=%d evidence_capture_frame_id=%d source_module=%s reason=%s actions=%s signature=%s before=%d cleared=%d queued=%d after=%d clear_ms=%.3f total_ms=%.3f queue_before=%s queue_after=%s current=%s last_dispatched=%s since_last_enqueue_ms=%.1f search=%s/%s motor_lock_wait_ms=%.3f queue_lock_wait_ms=%.3f locked_publish_ms=%.3f",
             self._last_action_queue_seq,
             self.frame_index,
             int(getattr(self, "_last_decision_capture_frame", -1)),
@@ -5528,6 +6087,9 @@ class PersonTracker:
             since_last_replace_ms,
             self.search_state,
             self.search_direction,
+            (motor_acquired - motor_wait_started) * 1000.0,
+            (queue_acquired - motor_acquired) * 1000.0,
+            (publish_finished - queue_acquired) * 1000.0,
         )
 
     def _get_obstacle_status(self) -> dict:
@@ -5591,15 +6153,29 @@ class PersonTracker:
         }.get(action)
 
     def clear_active_target(self, reason: str = "manual", *, stop_current: bool = True) -> None:
-        """Clear the locked follow target so the next visible person can be selected."""
-        self._follow_controller.clear_active_target(reason)
-        self.search_state = self._follow_controller.search_state
-        self.search_direction = self._follow_controller.search_direction
-        self.lost_confirm_frames = self._follow_controller.lost_confirm_frames
-        self._reset_search_geometry_reacquire()
-        self._clear_visual_reacquire_hold("active_target_cleared")
-        self._reacquire_depth_pending = False
-        self._reacquire_depth_pending_uid = None
+        """Release the control lock; identity enrollment is reset only on restart."""
+        with self._control_update_lock:
+            self._follow_controller.clear_active_target(reason)
+            self.search_state = self._follow_controller.search_state
+            self.search_direction = self._follow_controller.search_direction
+            self.lost_confirm_frames = self._follow_controller.lost_confirm_frames
+            self._vision_control_state = "initial_wait"
+            self._clear_longitudinal_context(reason="active_target_cleared")
+            self._clear_lateral_intent("active_target_cleared")
+            self._current_forward_percent = self._current_steer_base_percent = 0
+            self._current_steer_correction_rpm = self._current_rotate_raw_target = 0
+            self._current_rotate_raw_source = "initial_lock_required"
+            self._current_rotate_pulse_enabled = False
+            self._lateral_yaw_revision = int(getattr(self, "_lateral_yaw_revision", 0)) + 1
+            self.is_forwarding = False
+            # Draining alone cannot retire a packet already popped by the
+            # action thread. Invalidate it under the final motor-write lock.
+            with self.motor_io_lock, self.action_queue_lock:
+                self._action_command_revision = int(getattr(self, "_action_command_revision", 0)) + 1
+            self._reset_search_geometry_reacquire()
+            self._clear_visual_reacquire_hold("active_target_cleared")
+            self._reacquire_depth_pending = False
+            self._reacquire_depth_pending_uid = None
         if stop_current:
             self._clear_action_queue(f"clear_active_target:{reason}")
             if not self._should_skip_redundant_direct_stop("clear_active_target"):
@@ -5612,21 +6188,42 @@ class PersonTracker:
     ) -> List[PersonTarget]:
         tracker = getattr(getattr(self, "_rknn_pipeline", None), "tracker", None)
         observations = getattr(tracker, "last_identity_observations", ()) or ()
+        initial_uid = getattr(getattr(tracker, "identity_bank", None), "_initial_enrolled_uid", None)
+        startup_pending = not getattr(getattr(self, "_follow_controller", None), "_has_seen_person", False)
         capture_id = int(getattr(self, "_active_capture_frame_id", 0))
         capture_ts = float(getattr(self, "_active_capture_timestamp", 0.0))
         targets: List[PersonTarget] = []
         for bbox, track_id, conf, area in persons:
+            if startup_pending and initial_uid is not None and int(track_id) != initial_uid:
+                # Enrollment may have finished on a late frame. Do not let a
+                # later sole/larger UID become the first control lock instead.
+                continue
+            initial_confirmed = resolve_initial_identity_confirmation(
+                target_id=int(track_id), display_bbox=bbox,
+                capture_frame_id=capture_id, capture_timestamp=capture_ts,
+                observations=observations, width=int(width), height=int(height),
+            )
+            if startup_pending and initial_uid is not None and not initial_confirmed:
+                # The official enrollment path must not fall back to counting
+                # cached mapped UIDs when current appearance proof is missing.
+                continue
             targets.append(
                 PersonTarget(
                     bbox=tuple(float(v) for v in bbox),
                     track_id=int(track_id),
                     confidence=float(conf),
                     area=float(area),
+                    initial_identity_confirmed=initial_confirmed,
                     depth_observation=resolve_depth_target_observation(
                         target_id=int(track_id), display_bbox=bbox,
                         capture_frame_id=capture_id, capture_timestamp=capture_ts,
                         observations=observations, width=int(width), height=int(height),
                     ),
+                    braking_observation=(resolve_braking_target_observation(
+                        target_id=int(track_id), display_bbox=bbox,
+                        capture_frame_id=capture_id, capture_timestamp=capture_ts,
+                        observations=observations, width=int(width), height=int(height),
+                    ) if int(track_id) == getattr(getattr(self, "_follow_controller", None), "active_target_id", None) else None),
                 )
             )
         return targets
@@ -5899,6 +6496,8 @@ class PersonTracker:
         if linear is not None and linear[0] == "backward":
             return None  # reverse retains its dedicated safety/zero-cross path
         base = 0.0 if linear is None else linear[1] * MOTOR_FORWARD_MAX_TARGET_RPM / 100.0
+        if getattr(self, "_vision_control_state", "") == "target_visible_low_quality":
+            base = 0.0
         yaw = 0.0
         if self._has_fresh_lateral_yaw(uid):
             intent = self._lateral_intent_store.snapshot()
@@ -6206,6 +6805,20 @@ class PersonTracker:
         # In this test mode that output is a request to stop rotating in place.
         return ControlAction.stop(reason)
 
+    def _finish_limited_yaw_handoff(self, uid, capture_frame_id, lateral_intent_published):
+        """Finish a queue-only mode switch without clearing any real stop."""
+        runtime = getattr(self, "_action_runtime", None)
+        check = getattr(runtime, "can_handoff_limited_yaw", None)
+        accepted = bool(lateral_intent_published and callable(check)
+                        and check(uid, capture_frame_id))
+        if not accepted:
+            self.stop_action_execution = True
+        logger.info("limited_yaw_decision_handoff uid=%s capture_frame_id=%s accepted=%s "
+                    "queue_cancelled=True motor_stop_requested=%s "
+                    "forward_authorized=False reversal_guard=preserved",
+                    uid, capture_frame_id, accepted, not accepted)
+        return accepted
+
     def _publish_follow_recording(self, frame, decision, source):
         """Diagnostics only, called under the existing control-update lock."""
         if getattr(self, '_camera_video_recorder', None) is None:
@@ -6262,6 +6875,37 @@ class PersonTracker:
                 None if stamp is None else (latest.timestamp-stamp)*1000., latest.trustworthy,
             )
         return latest
+
+    def _observe_cropped_target_depth(self, persons, width, height, capture_id, capture_ts, feedback):
+        """Low-quality follow branch may measure, never grant longitudinal trust."""
+        runtime = getattr(self, '_distance_runtime', None)
+        measure = getattr(runtime, 'get_cropped_observation_state', None)
+        if not callable(measure):
+            return None
+        empty = DistanceState(source='cropped_depth_observation', source_detail='crop_observation:unqualified')
+        tracker = getattr(getattr(self, '_rknn_pipeline', None), 'tracker', None)
+        bank = getattr(tracker, 'identity_bank', None)
+        rows = tuple(getattr(tracker, 'last_identity_observations', ()) or ())
+        active_uid = getattr(self._follow_controller, 'active_target_id', None)
+        if bank is None or len(persons) != 1 or len(rows) != 1 or persons[0][1] != active_uid:
+            return empty
+        observation, reason = resolve_cropped_depth_observation(
+            bank=bank, observations=rows, uid=active_uid, raw_track_id=rows[0].get('raw_track_id'),
+            display_bbox=persons[0][0], capture_id=capture_id, capture_timestamp=capture_ts,
+            width=width, height=height, now=time.monotonic())
+        key = (active_uid, capture_id, capture_ts)
+        if observation is None or getattr(self, '_cropped_depth_last_capture', None) == key:
+            return replace(empty, source_detail='crop_observation:' + (reason if observation is None else 'duplicate_capture'))
+        self._cropped_depth_last_capture = key
+        started = time.perf_counter()
+        state = measure(width, height, observation, steering_feedback=feedback)
+        logger.info('cropped_depth_observation cap=%s uid=%s raw_track=%s distance=%s '
+                    'sample_ts=%s age_ms=%s detail=%s processing_ms=%.2f '
+                    'identity_confirmed=False template_updated=False motion_authorized=False',
+                    capture_id, active_uid, observation.raw_track_id, state.used_distance_m,
+                    state.sample_timestamp, None if state.sample_age_sec is None else state.sample_age_sec*1000,
+                    state.source_detail, (time.perf_counter()-started)*1000)
+        return state
 
     def _process_detections_modular(
         self,
@@ -6333,10 +6977,15 @@ class PersonTracker:
                 width, height, persons, person_targets=tuple(person_targets),
             )
             depth_use_latest = True
+        ranging_started = time.perf_counter()
+        ranging_cpu_started = time.thread_time()
         if low_quality_visible:
-            # Do not clear/re-read the depth fusion anchor with an invalid box.
-            # The controller will issue a safe hold and wait for a complete box.
-            distance_state = self._last_frame_distance_state or DistanceState(source="vision_depth")
+            # Explicit observation permission, not a normal target or motion
+            # ROI. The normal fusion anchor and Depth30 context remain closed.
+            observed = PersonTracker._observe_cropped_target_depth(
+                self, persons, width, height, capture_id, capture_ts, steering_feedback)
+            distance_state = observed if observed is not None else (
+                self._last_frame_distance_state or DistanceState(source="vision_depth"))
         else:
             distance_state = self._distance_runtime.get_frame_distance_state(
                 int(width),
@@ -6352,10 +7001,18 @@ class PersonTracker:
                     else capture_ts
                 ),
             )
+        # Diagnostic state only, written/read under _control_update_lock.
+        # Do not move sensor filters or the fusion anchor outside that lock.
+        self._last_control_ranging_timing = (
+            control_source, capture_id,
+            (time.perf_counter() - ranging_started) * 1000.0,
+            (time.thread_time() - ranging_cpu_started) * 1000.0,
+        )
         if priority_latest:
             logger.info(
                 "vision_depth_priority capture_frame_id=%s uid=%s roi_age_ms=%.1f "
-                "source=latest sample_ts=%s sample_age_ms=%s historical_pid=False deadline_renewed=False",
+                "request=latest_or_bounded_history sample_ts=%s sample_age_ms=%s "
+                "capture_aligned_replay=False deadline_renewed=False",
                 capture_id, distance_target.track_id,
                 (time.monotonic() - capture_ts) * 1000.0,
                 distance_state.sample_timestamp,
@@ -6472,8 +7129,33 @@ class PersonTracker:
             rotation_only=bool(FOLLOW_ROTATION_ONLY),
             low_quality_visible=bool(low_quality_visible),
         )
+        initial_lock_pending = self._follow_controller.active_target_id is None
+        if initial_lock_pending:
+            # Runtime invariant, independent of legacy controller reasons:
+            # an unbound candidate never owns either motion axis.
+            initial_reason = decision.reason if (
+                decision.explicit_stop_requested or decision.shutdown_requested
+                or decision.reason.startswith(("initial_", "wait_first_person"))
+            ) else "initial_lock_required"
+            safety_stop = bool(decision.explicit_stop_requested or decision.shutdown_requested)
+            decision = replace(
+                decision,
+                actions=[ControlAction.stop(initial_reason, brake_hold=safety_stop)],
+                reason=initial_reason, clear_action_queue=True,
+                stop_action_execution=True, soft_stop_requested=not safety_stop,
+                current_forward_percent=0, is_forwarding=False,
+                near_yaw_park_requested=False,
+            )
+            self._vision_control_state = "initial_wait"
+            self._clear_longitudinal_context(reason="initial_lock_required")
+            self._clear_lateral_intent("initial_lock_required")
+            self._current_forward_percent = self._current_steer_base_percent = 0
+            self._current_steer_correction_rpm = self._current_rotate_raw_target = 0
+            self._current_rotate_raw_source = "initial_lock_required"
+            self._current_rotate_pulse_enabled = False
+            self.is_forwarding = False
         depth_linear_actions = list(decision.actions)
-        if control_source == "depth30" and depth_authority:
+        if control_source == "depth30" and depth_authority and not initial_lock_pending:
             if decision.explicit_stop_requested or decision.shutdown_requested:
                 self._revoke_depth_linear_authority("depth_safety:" + str(decision.reason))
             else:
@@ -6489,9 +7171,9 @@ class PersonTracker:
             self._last_command_capture_frame = int(evidence_capture_frame)
 
         longitudinal_only = control_source == "depth30"
-        decision_target = self._follow_controller.last_selected_target
+        decision_target = None if initial_lock_pending else self._follow_controller.last_selected_target
         preserve_depth_lateral = bool(
-            longitudinal_only
+            not initial_lock_pending and longitudinal_only
             and self._depth30_should_preserve_lateral_motion(
                 decision_target,
                 depth_linear_actions,
@@ -6505,7 +7187,7 @@ class PersonTracker:
         # forward-versus-rotate race.  Once the window expires (or search
         # becomes active), the normal lost/search action is allowed through.
         preserve_depth_translation = bool(
-            control_source == "vision"
+            not initial_lock_pending and control_source == "vision"
             and depth_authority
             and self._should_preserve_depth30_translation_for_visual_loss(
                 decision.reason
@@ -6524,7 +7206,7 @@ class PersonTracker:
                 )
                 * 1000.0,
             )
-        if longitudinal_only and self._depth_zero_longitudinal_preserves_visible_rotation(
+        if not initial_lock_pending and longitudinal_only and self._depth_zero_longitudinal_preserves_visible_rotation(
             decision
         ):
             # Rotation already has zero longitudinal wheel speed.  Depth has
@@ -6533,7 +7215,9 @@ class PersonTracker:
             return []
         if not longitudinal_only:
             previous_control_state = self._vision_control_state
-            if decision_target is not None:
+            if initial_lock_pending:
+                control_state = "initial_wait"
+            elif decision_target is not None:
                 control_state = (
                     "target_visible_low_quality"
                     if not target_steerable
@@ -6670,7 +7354,7 @@ class PersonTracker:
         ):
             self._revoke_depth_linear_authority("decision_safety_or_target:" + str(decision.reason))
         visual_depth_committed = bool(
-            not longitudinal_only
+            not initial_lock_pending and not longitudinal_only
             and self._refresh_visual_depth_linear_authority(
                 frame, decision_target, decision,
                 is_fresh_depth=is_fresh_depth, target_steerable=target_steerable,
@@ -6708,7 +7392,7 @@ class PersonTracker:
             control_source == "vision" and depth_authority
         )
         visual_stop_safety_override = bool(
-            control_source == "vision"
+            not initial_lock_pending and control_source == "vision"
             and depth_authority
             and decision.explicit_stop_requested
             and not self._visual_stop_may_override_depth(decision.reason, frame)
@@ -6718,7 +7402,29 @@ class PersonTracker:
         ):
             self.is_forwarding = decision.is_forwarding
             self._current_forward_percent = decision.current_forward_percent
+        # A clipped-but-qualified target can retain yaw, not translation.
+        # Cancel the old queued action now, but defer its generic motor-stop
+        # flag until the NEW bounded yaw intent has been published and checked.
+        # Never clear an already pending stop, or apply this to legacy writers.
+        defer_limited_yaw_interrupt = bool(
+            control_source == "vision" and not longitudinal_only
+            and LATERAL_INTENT_CONTROL_ENABLE and depth_authority
+            and decision.reason == "target_visible_low_quality_yaw"
+            and decision.stop_action_execution and decision.clear_action_queue
+            and not decision.explicit_stop_requested and not decision.shutdown_requested
+            and not getattr(decision, "near_yaw_park_requested", False)
+            and not getattr(decision, "soft_stop_requested", False)
+            and active_before is not None and decision_target is not None
+            and active_before == decision_target.track_id
+            and getattr(getattr(getattr(self, "_action_runtime", None), "config", None),
+                        "follow_wheel_period_sec", 0.0) >= .05)
+        if defer_limited_yaw_interrupt:
+            # Invalidate already-dequeued old snapshots BEFORE publishing the
+            # replacement, not afterwards (which would invalidate it too).
+            with self.action_queue_lock:
+                self._action_command_revision = int(getattr(self, "_action_command_revision", 0)) + 1
         if (decision.stop_action_execution and not visual_stop_safety_override
+                and not defer_limited_yaw_interrupt
                 and not (LATERAL_INTENT_CONTROL_ENABLE
                          and getattr(decision, "near_yaw_park_requested", False))):
             self.stop_action_execution = True
@@ -6747,7 +7453,8 @@ class PersonTracker:
             # speed cap; safety stops and lost-target rotation remain direct.
             suppressed_actions = runtime_actions
             allow_direct = bool(
-                (decision.explicit_stop_requested and not visual_stop_safety_override)
+                initial_lock_pending
+                or (decision.explicit_stop_requested and not visual_stop_safety_override)
                 or self.search_state != "none"
                 or decision.reason.startswith(("lost_", "search_"))
             )
@@ -6772,7 +7479,7 @@ class PersonTracker:
                 int(self.frame_index),
                 str(decision.reason or "none"),
             )
-        selected_target = self._follow_controller.last_selected_target
+        selected_target = None if initial_lock_pending else self._follow_controller.last_selected_target
         selected_target_id = None if selected_target is None else int(selected_target.track_id)
         if FOLLOW_ROTATION_ONLY:
             original_actions = runtime_actions
@@ -6888,7 +7595,6 @@ class PersonTracker:
                 # recentering. Only fully lost search keeps a fixed scan RPM.
                 parked_recenter = (
                     decision.reason.startswith("person_parked_recenter_")
-                    or decision.reason.startswith("initial_candidate_centering_")
                     or decision.reason in (
                         "near_distance_rotation_only",
                         "target_visible_low_quality_yaw",
@@ -6945,6 +7651,26 @@ class PersonTracker:
                     elif pid_result is None:
                         rotate_raw = PARKED_RECENTER_MIN_RPM
                         rotate_raw_source = "parked_recenter_fallback"
+                    elif getattr(pid_result, "post_park_recenter", False):
+                        # A ceiling, not a floor: preserve 4 -> 3 -> 2 -> 0.
+                        rotate_raw = min(4, PARKED_RECENTER_MAX_RPM,
+                                         abs(int(pid_result.correction_rpm)))
+                        rotate_raw_source = "post_park_recenter"
+                    elif getattr(pid_result, "outward_lead", None) is not None:
+                        # The early trajectory lead deliberately sits below
+                        # the ordinary 5RPM startup floor, including Depth30
+                        # copies of this decision before the lateral tick.
+                        rotate_raw = min(4, PARKED_RECENTER_MAX_RPM,
+                                         abs(int(pid_result.correction_rpm)))
+                        rotate_raw_source = "parked_outward_trajectory"
+                    elif getattr(pid_result, "forward_phase", "") in {
+                            "image_crop_outward_continuity", "image_outward_continuity"}:
+                        # A brake-relief ceiling, never the normal startup
+                        # floor. Keep the camera path and fast tick identical.
+                        ceiling = (2 if pid_result.forward_phase == "image_crop_outward_continuity" else 4)
+                        rotate_raw = min(ceiling, PARKED_RECENTER_MAX_RPM,
+                                         abs(int(pid_result.correction_rpm)))
+                        rotate_raw_source = pid_result.forward_phase
                     else:
                         rotate_raw = max(
                             PARKED_RECENTER_MIN_RPM,
@@ -6971,6 +7697,10 @@ class PersonTracker:
             publish_depth_immediately=visual_depth_committed,
             near_yaw_park_requested=bool(getattr(decision, "near_yaw_park_requested", False)),
         )
+        if defer_limited_yaw_interrupt:
+            self._finish_limited_yaw_handoff(
+                selected_target_id, int(getattr(self, "_last_command_capture_frame", 0)),
+                lateral_intent_published)
         if lateral_intent_published:
             logger.debug(
                 "vision frame published to lateral action owner: frame=%d target=%s reason=%s",
@@ -7067,7 +7797,7 @@ class PersonTracker:
             pid_result = self._follow_controller.last_steering_pid_result
             if pid_result is not None:
                 logger.info(
-                    "视觉转向PID: control_frame_id=%d capture_frame_id=%d 视觉误差=%.2f度 延迟补偿误差=%.2f度 滤波误差=%.2f度 误差变化率=%.2f度/秒 目标速度有效=%s 目标画面角速度=%+.2f度/秒 目标方位角速度=%+.2f度/秒 目标速度前馈=%+.2f度/秒 目标速度匹配=%s/%.2f度/秒 期望右转角速度=%.2f度/秒 当前角速度上限=%.2f度/秒 编码器右转角速度=%.2f度/秒 反馈年龄=%.0f毫秒 反馈有效=%s 换向制动=%s 同向超调制动=%s 视觉方向保护=%s 预测制动=%s 制动延迟=%.0f毫秒 剩余角=%.2f度 停车角=%.2f度 角速度超调=%.2f度/秒 超调制动=%.2fRPM 有效下限=%.1fRPM(%s) 启动补偿=%s/%.0f毫秒/%s 边缘增强=%s 原始前进=%dRPM 动态前进=%dRPM 当前轮差上限=%.2fRPM 轮差限幅原因=%s 前馈=%.2fRPM 速度P=%.2fRPM 速度I=%.2fRPM 输出轮差=%dRPM",
+                    "视觉转向PID: control_frame_id=%d capture_frame_id=%d 视觉误差=%.2f度 延迟补偿误差=%.2f度 滤波误差=%.2f度 误差变化率=%.2f度/秒 目标速度有效=%s 目标画面角速度=%+.2f度/秒 目标方位角速度=%+.2f度/秒 目标速度前馈=%+.2f度/秒 目标速度匹配=%s/%.2f度/秒 期望右转角速度=%.2f度/秒 当前角速度上限=%.2f度/秒 编码器右转角速度=%.2f度/秒 反馈年龄=%.0f毫秒 反馈有效=%s 换向制动=%s 同向超调制动=%s 视觉方向保护=%s 预测制动=%s 制动延迟=%.0f毫秒 剩余角=%.2f度 停车角=%.2f度 角速度超调=%.2f度/秒 超调制动=%.2fRPM 有效下限=%.1fRPM(%s) 启动补偿=%s/%.0f毫秒/%s 边缘增强=%s 原始前进=%dRPM 动态前进=%dRPM 当前单轮修正上限=%.2fRPM 轮差限幅原因=%s 前馈=%.2fRPM 速度P=%.2fRPM 速度I=%.2fRPM 输出单轮修正=%dRPM 请求双轮差=%dRPM",
                     self.frame_index,
                     int(getattr(self, "_active_capture_frame_id", -1)),
                     pid_result.visual_error_deg,
@@ -7108,6 +7838,7 @@ class PersonTracker:
                     pid_result.rate_p_rpm,
                     pid_result.rate_i_rpm,
                     pid_result.correction_rpm,
+                    2 * pid_result.correction_rpm,
                 )
                 trace_target = target_dbg
                 trace_action = "+".join(action_kinds) if action_kinds else "none"
@@ -7559,6 +8290,9 @@ class PersonTracker:
             "defer_sec": round(float(gate_decision.defer_sec), 4),
             "ignored_edge_probes": [detection_item(item, "probe") for item in
                                     getattr(self._search_candidate_gate, "last_ignored_edge_probes", ())],
+            "ignored_weak_probes": [detection_item(item, "probe") for item in
+                                    getattr(self._search_candidate_gate, "last_ignored_weak_probes", ())],
+            "probe_observation_min_score": self._search_candidate_gate.config.probe_observation_min_score,
             "edge_probe_min_score": SEARCH_EVIDENCE_PROBE_EDGE_MIN_SCORE,
             "edge_probe_center_ratio": SEARCH_EVIDENCE_PROBE_EDGE_CENTER_RATIO,
             "internal_probe_streak": int(
@@ -8785,6 +9519,41 @@ class PersonTracker:
         )
         return fresh, state
 
+    def _hold_for_identity_boundary_recheck(self, records) -> bool:
+        """Pause one qualified borderline observation, without declaring loss.
+
+        UID remains unconfirmed. No distance/steering anchor, search clock,
+        gallery or motor deadline is renewed; existing safety has priority.
+        """
+        controller = getattr(self, "_follow_controller", None)
+        uid = getattr(controller, "active_target_id", None)
+        if (uid is None or len(records) != 1
+                or getattr(controller, "search_state", "none") != "none"):
+            return False
+        rec = records[0]
+        assignment = self._identity_assignment_debug_for_track(int(rec.track_id))
+        deadline = assignment.get("identity_recheck_deadline")
+        cap = getattr(self, "_active_capture_frame_id", None)
+        stamp = getattr(self, "_active_capture_timestamp", None)
+        now = time.monotonic()
+        if (assignment.get("identity_recheck_pending") is not True
+                or assignment.get("reason") != "partial_boundary_recheck"
+                or assignment.get("mapped_uid") != uid
+                or assignment.get("uid") != 0
+                or int(getattr(rec, "reid_uid", 0)) != 0
+                or assignment.get("identity_control_rejected") is not True
+                or assignment.get("identity_recheck_capture") != cap
+                or deadline is None or not math.isfinite(deadline)
+                or stamp is None or not math.isfinite(stamp)
+                or not stamp <= now <= deadline
+                or int(getattr(rec, "time_since_update", 0)) != 0):
+            return False
+        self._publish_observation_soft_zero("identity_boundary_recheck", use_stop_action=True)
+        logger.info("identity_boundary_recheck capture=%s uid=%s deadline=%.6f "
+                    "action=soft_stop identity_confirmed=False authority_renewed=False "
+                    "search_started=False", cap, uid, deadline)
+        return True
+
     def _publish_observation_soft_zero(
         self,
         reason: str,
@@ -8859,7 +9628,8 @@ class PersonTracker:
             # transition while preserving their existing control semantics.
             self._replace_action_queue([ACTION_FORWARD], reason)
 
-    def _hold_search_reacquire_brake(self, *, bbox, width, eligible, confirmed=False) -> bool:
+    def _hold_search_reacquire_brake(self, *, bbox, width, eligible, confirmed=False,
+                                    raw_track_id=None) -> bool:
         """Brake before search early returns. No UID, forward grant or template mutation."""
         runtime = getattr(self, "_action_runtime", None)
         pending = getattr(runtime, "search_reacquire_brake_pending", None)
@@ -8880,11 +9650,62 @@ class PersonTracker:
             return False
         direction = (getattr(self, "_search_handoff_direction", None) if handoff and not search_active
                      else getattr(self._follow_controller, "search_direction", self.search_direction))
+        feedback = runtime.get_steering_feedback()
+        now = time.monotonic()  # cache acquisition may cross the image/feedback deadline
+        if not 0 <= now-stamp <= VISION_CONTROL_MAX_RESULT_AGE_SEC:
+            if handoff:
+                self._search_handoff_moving_evidence = None
+            return False
+        dispatch_delay = max(.05, min(.15, float(getattr(runtime, "_search_brake_dispatch_delay_sec", .05))))
         reason = search_brake_reason(
             bbox=bbox, width=width, direction=direction, eligible=eligible,
             now=now, capture_timestamp=stamp, max_age=VISION_CONTROL_MAX_RESULT_AGE_SEC,
-            feedback=runtime.get_steering_feedback(), policy=policy,
-        )
+            feedback=feedback, policy=policy, execution_delay_sec=dispatch_delay)
+        moving = None
+        if handoff and not search_active:
+            evidence = observe_moving_handoff(
+                self, eligible=eligible, uid=self._search_handoff_uid,
+                raw_track_id=raw_track_id, cap=int(getattr(self, "_active_capture_frame_id", 0)),
+                stamp=stamp, bbox=bbox, width=width, direction=direction,
+                now=now, max_age=VISION_CONTROL_MAX_RESULT_AGE_SEC)
+            fresh_linear = getattr(self, "_fresh_depth_linear_snapshot", None)
+            linear = fresh_linear(self._search_handoff_uid, now=now) if callable(fresh_linear) else None
+            if linear and linear[0] == "forward" and linear[1] > 0:
+                moving = moving_handoff_yaw(self, evidence=evidence, uid=self._search_handoff_uid,
+                    base=float(linear[1])*MOTOR_FORWARD_MAX_TARGET_RPM/100., yaw=0., feedback=feedback, now=now,
+                    policy=policy, execution_delay_sec=dispatch_delay)
+            retired = handoff_retirement_reason(
+                self, eligible=eligible, uid=self._search_handoff_uid,
+                raw_track_id=raw_track_id,
+                cap=int(getattr(self, "_active_capture_frame_id", 0)),
+                stamp=stamp, bbox=bbox, width=width, direction=direction)
+            raw_yaw = getattr(feedback, "raw_yaw_rate_right_dps", None)
+            feedback_current = bool(feedback is not None and feedback.trustworthy
+                and raw_yaw is not None and math.isfinite(raw_yaw)
+                and 0 <= now-feedback.timestamp <= min(.10, policy.visible_steering_pid_feedback_stale_sec))
+            residual_pending = bool(
+                (moving is not None and moving[1] == "residual_counter_differential")
+                or (getattr(self, "_search_handoff_moving_active", False)
+                    and (not feedback_current or (reason and abs(raw_yaw) > 2.))))
+            if retired is not None and not residual_pending:
+                logger.info("search_handoff_retired capture_frame_id=%s uid=%s reason=%s "
+                            "normal_steering_required=True motion_authorized=False",
+                            getattr(self, "_active_capture_frame_id", 0),
+                            self._search_handoff_uid, retired)
+                self._search_handoff_uid = None
+                self._search_handoff_observation = None
+                self._search_handoff_moving_evidence = None
+                return False
+        if moving is not None:
+            # This merely selects the execution constraint. Only the writer's
+            # current Depth/yaw leases authorize motion, rechecked at each tick.
+            self._search_handoff_moving_active = True
+            if reason is not None:
+                logger.info("search_handoff_moving_convergence capture_frame_id=%s uid=%s "
+                            "reason=%s phase=%s parking_requested=False deadline_renewed=False",
+                            getattr(self, "_active_capture_frame_id", 0), self._search_handoff_uid,
+                            reason, moving[1])
+            return False
         if reason is None:
             self._search_candidate_brake_episode = None
             return False
@@ -8898,17 +9719,19 @@ class PersonTracker:
                 return True
             return False
         self._search_candidate_brake_episode = now
+        # Install the execution veto BEFORE revoking axes. Revoking yaw can
+        # otherwise publish a forward-only packet while STOP is being built.
+        accepted = runtime.request_search_reacquire_brake(
+            int(getattr(self, "_active_capture_frame_id", 0)), stamp, reason)
+        if accepted is False:
+            self._search_candidate_brake_episode = None
+            return False
         self._search_handoff_uid = None  # one stop per acquisition, not normal-follow braking
         self._clear_lateral_intent("search_reacquire_brake")
         self._clear_longitudinal_context(reason="search_reacquire_brake")
         self._current_forward_percent = self._current_steer_base_percent = 0
         self._current_steer_correction_rpm = self._current_rotate_raw_target = 0
         self._use_soft_stop_next = False
-        accepted = runtime.request_search_reacquire_brake(
-            int(getattr(self, "_active_capture_frame_id", 0)), stamp, reason)
-        if accepted is False:
-            self._search_candidate_brake_episode = None
-            return False
         logger.info("search_reacquire_brake_gate capture_frame_id=%s reason=%s "
                     "confirmed=%s identity_claim=False longitudinal_allowed=False",
                     getattr(self, "_active_capture_frame_id", 0), reason, confirmed)
@@ -9002,7 +9825,7 @@ class PersonTracker:
                     if PersonTracker._hold_search_reacquire_brake(
                             self, bbox=current["bbox"], width=width,
                             eligible=int(getattr(current["rec"], "time_since_update", 0)) == 0,
-                            confirmed=True):
+                            confirmed=True, raw_track_id=getattr(current["rec"], "track_id", None)):
                         return True
             elif len(confirmed) != 1:
                 self._search_handoff_uid = None
@@ -9163,8 +9986,27 @@ class PersonTracker:
                 # It never supplies identity or motion authorization itself.
                 if getattr(self, "_search_candidate_brake_episode", None) is None:
                     self._search_handoff_uid = uid
+                    self._search_handoff_started_capture_ts = float(self._active_capture_timestamp)
+                    self._search_handoff_observation = None
+                    self._search_handoff_last_capture = None
+                    self._search_handoff_moving_active = False
+                    self._search_handoff_moving_evidence = None
+                    # Capture the old search budget BEFORE visible PID can
+                    # overwrite it with a saturated normal-follow correction.
+                    old_search_rpm = abs(float(getattr(self, "_current_rotate_raw_target", 0)))
+                    self._search_handoff_cap_rpm = min(7., old_search_rpm) if old_search_rpm > 0 else 7.
+                    logger.info("search_handoff_yaw_armed capture_frame_id=%s uid=%s "
+                                "search_rpm=%.1f cap_rpm=%.1f release=stop_or_fresh_follow_750ms "
+                                "identity_changed=False deadline_renewed=False",
+                                getattr(self, "_active_capture_frame_id", 0), uid,
+                                old_search_rpm, self._search_handoff_cap_rpm)
                     self._search_handoff_direction = getattr(
                         self._follow_controller, "search_direction", self.search_direction)
+                    observe_moving_handoff(self, eligible=True, uid=uid, raw_track_id=track_id,
+                        cap=int(getattr(self, "_active_capture_frame_id", 0)),
+                        stamp=float(self._active_capture_timestamp), bbox=bbox, width=width,
+                        direction=self._search_handoff_direction, now=time.monotonic(),
+                        max_age=VISION_CONTROL_MAX_RESULT_AGE_SEC)
                 releaser(
                     "visual_reacquire_depth_pending"
                     if depth_gate_pending
@@ -9233,18 +10075,83 @@ class PersonTracker:
         )
         return True
 
+    def _deferred_search_observation_bboxes(
+        self, *, search_active, width, height, formal_candidates,
+        capture_id, capture_timestamp, stale=False,
+    ):
+        """Current incomparable edge crops defer STOP only, never claim UID."""
+        uid = getattr(self._follow_controller, "active_target_id", None)
+        now = time.monotonic()
+        if (not search_active or stale or uid is None
+                or not math.isfinite(capture_timestamp)
+                or not 0 <= now-capture_timestamp <= .19):
+            return ()
+        valid = self._search_candidate_gate._valid_candidates(
+            formal_candidates, width=width, height=height,
+            min_score=self._search_candidate_gate.config.formal_min_score)
+        unique = []
+        for item in valid:
+            if not any(SearchCandidateGate._iou(item.bbox, old.bbox) >= .85 for old in unique):
+                unique.append(item)
+        if len(unique) != 1:
+            return ()
+        item = unique[0]
+        tracker = getattr(getattr(self, "_rknn_pipeline", None), "tracker", None)
+        matches = []
+        for observation in getattr(tracker, "last_identity_observations", ()) or ():
+            try:
+                metadata = observation.get("sample_metadata") or {}
+                bbox = tuple(float(v) for v in observation["detector_bbox"])
+                if (metadata.get("is_fresh") is not True
+                        or metadata.get("capture_frame_id") != capture_id
+                        or metadata.get("capture_timestamp") != capture_timestamp
+                        or len(bbox) != 4 or not all(math.isfinite(v) for v in bbox)
+                        or SearchCandidateGate._iou(item.bbox, bbox) < .85):
+                    continue
+                assignment = self._identity_assignment_debug_for_track(int(observation["raw_track_id"]))
+                matches.append(incomparable_edge_observation(
+                    assignment, metadata, observation.get("uid"), uid, bbox, width))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+        if matches != [True]:
+            return ()
+        logger.info("search_observation_deferred capture_frame_id=%s uid=%s bbox=%s "
+                    "reason=incomparable_side_crop identity_claim=False "
+                    "direction_change=False longitudinal_allowed=False", capture_id, uid, item.bbox)
+        return (item.bbox,)
+
     def _retry_search_candidate_observation(
         self, decision, *, search_active, width, height, formal_candidates,
         capture_id, capture_timestamp, stale=False,
     ):
-        """One additional stop for credible evidence; no UID/direction mutation."""
+        """Shared observation budget; bank confirmation returns normal control."""
         retry = getattr(self, "_search_observation_retry", None)
         if retry is None:
             retry = self._search_observation_retry = SearchObservationRetry(SEARCH_EVIDENCE_MAX_HOLD_SEC)
         uid = getattr(self._follow_controller, "active_target_id", None)
         enabled = SEARCH_EVIDENCE_GATE_ENABLE and SEARCH_EVIDENCE_RETRY_ENABLE
         session = (int(getattr(self, "_search_epoch", 0)), uid) if enabled and search_active and uid else None
+        now = time.monotonic()
+        reader = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
+        feedback = reader() if callable(reader) else None
+        settlement = getattr(self, "_search_detector_settlement", None)
+        if settlement is None:
+            settlement = self._search_detector_settlement = DetectorObservationSettlement()
+        if not retry.active:
+            if (search_active and not stale and decision.entered and decision.pause_rotation
+                    and not settlement.active):
+                retry.spend_detector_budget(session)
+                self._search_retry_zero_requested_at = now
+                self._search_retry_zero_sent_at = None
+            decision = settlement.update(
+                decision, now=now, capture_timestamp=capture_timestamp, capture_id=capture_id,
+                search_active=search_active and SEARCH_EVIDENCE_GATE_ENABLE,
+                zero_sent_at=getattr(self, "_search_retry_zero_sent_at", None),
+                feedback=feedback, max_hold_sec=SEARCH_EVIDENCE_MAX_HOLD_SEC,
+                stale=stale,
+            )
         candidate = None
+        confirmed_candidate = False
         evidence_reason = "no_unique_formal_candidate"
         # Use existing detector geometry limits. Overlapping probe/formal
         # duplicates cannot create a second person, but distinct people veto
@@ -9257,7 +10164,8 @@ class PersonTracker:
         for item in valid:
             if not any(SearchCandidateGate._iou(item.bbox, old.bbox) >= .85 for old in unique):
                 unique.append(item)
-        if len(unique) == 1 and session is not None and not stale:
+        if (len(unique) == 1 and session is not None and not stale
+                and decision.reason != DEFERRED_EDGE_COVERAGE):
             item = unique[0]
             tracker = getattr(getattr(self, "_rknn_pipeline", None), "tracker", None)
             matches = []
@@ -9272,27 +10180,39 @@ class PersonTracker:
                             or SearchCandidateGate._iou(item.bbox, bbox) < .85):
                         continue
                     assignment = self._identity_assignment_debug_for_track(int(observation["raw_track_id"]))
-                    matched_uid = assignment.get("best_uid") or assignment.get("mapped_uid") or assignment.get("uid")
-                    distance = float(assignment.get("strong_distance", assignment.get("distance")))
-                    if (int(matched_uid or 0) != int(uid)
-                            or assignment.get("match_source") != "strong"
-                            or assignment.get("search_excluded") is True
-                            or not math.isfinite(distance) or not 0 <= distance <= .30):
+                    confirmed = confirmed_observation_for_release(
+                        assignment, metadata, observation.get("uid"), uid)
+                    source = retry_evidence_source(assignment, metadata, uid)
+                    if source is None and not confirmed:
                         evidence_reason = "identity_evidence_insufficient"
                         continue
-                    matches.append(item)
+                    matches.append((item, source or "confirmed", confirmed))
                 except (KeyError, TypeError, ValueError, OverflowError):
                     continue
             if len(matches) == 1:
-                candidate = matches[0]
-                evidence_reason = "unique_strong_observation"
+                candidate, source, confirmed_candidate = matches[0]
+                evidence_reason = "unique_" + source + "_observation"
+        if (confirmed_candidate and (retry.active or settlement.active or decision.pause_rotation
+                or getattr(self, "_search_evidence_observation_active", False))
+                and not stale and 0 <= now-capture_timestamp <= .19
+                and (retry.last_capture is None or (
+                    capture_id > retry.last_capture[0] and capture_timestamp > retry.last_capture[1]))):
+            # End only the observation pause. UID/depth/yaw and motor reversal
+            # are rechecked by normal control; no old packet is restored.
+            settlement.active = False
+            result = retry.confirmed_release(session, candidate.bbox, candidate.score)
+            retry.last_capture = (capture_id, capture_timestamp)
+            logger.info("search_observation_confirmed_release capture_frame_id=%s uid=%s "
+                        "normal_control_required=True motion_authorized=False", capture_id, uid)
+            return result
         override = retry.update(
-            now=time.monotonic(), session=session, capture_id=capture_id,
+            now=now, session=session, capture_id=capture_id,
             capture_timestamp=capture_timestamp, eligible=candidate is not None and not stale,
             bbox=None if candidate is None else candidate.bbox,
             score=0.0 if candidate is None else candidate.score,
             blocked=decision.reason == "candidate_already_observed",
             zero_sent_at=getattr(self, "_search_retry_zero_sent_at", None),
+            feedback=feedback,
         )
         if override is not None and override.entered:
             self._search_retry_zero_requested_at = retry.started_at
@@ -9301,9 +10221,11 @@ class PersonTracker:
             logger.info(
                 "search_observation_retry capture_frame_id=%d uid=%s reason=%s evidence=%s "
                 "active=%s spent=%s capture_ts=%.6f zero_sent_at=%s deadline=%.6f "
+                "quiet_samples=%d settled_at=%s "
                 "identity_claim=False direction_change=False",
                 capture_id, uid, retry.reason, evidence_reason, retry.active, retry.spent,
                 capture_timestamp, getattr(self, "_search_retry_zero_sent_at", None), retry.deadline,
+                retry.settled.quiet_count, retry.settled.ready_at,
             )
         return decision if override is None else override
 
@@ -9386,6 +10308,9 @@ class PersonTracker:
         if retry is not None:
             retry.release()
         self._search_retry_zero_requested_at = 0.0
+        settlement = getattr(self, "_search_detector_settlement", None)
+        if settlement is not None:
+            settlement.active = False
         setter = getattr(self._follow_controller, "set_search_observation_hold", None)
         if callable(setter):
             setter(False)
@@ -9662,9 +10587,11 @@ class PersonTracker:
         cap = int(getattr(self, "_active_capture_frame_id", 0))
         stamp = float(getattr(self, "_active_capture_timestamp", 0.0))
         age = time.monotonic() - stamp
+        self._search_brake_observation_age_sec = age
         if uid is None or int(uid) <= 0 or width <= 0 or height <= 0:
             return "no_active_target"
-        if not math.isfinite(age) or stamp <= 0 or not 0 <= age <= VISION_CONTROL_MAX_RESULT_AGE_SEC:
+        if (not math.isfinite(age) or stamp <= 0
+                or not 0 <= age <= SEARCH_BRAKE_DIRECTION_OBSERVATION_MAX_AGE_SEC):
             return "stale_capture"
         if cap <= int(getattr(controller, "_direction_latest_visible_capture_id", 0)):
             return "duplicate_or_old_capture"
@@ -9693,6 +10620,7 @@ class PersonTracker:
                 or assignment.get("bbox_quality_ok") is not True
                 or assignment.get("reacquire_geometry_ok") is False
                 or assignment.get("search_excluded")
+                or assignment.get("identity_control_rejected")
                 or competition.get("passed") is False):
             return "identity_or_quality_rejected"
         bindings = PersonTracker._search_exclusion_bindings(self)
@@ -9720,6 +10648,44 @@ class PersonTracker:
         self._search_brake_latest_observation = (int(uid), cap)
         return "trusted_observation_recorded"
 
+    def _record_search_brake_hold_observation(self, records, width: int, height: int) -> None:
+        """Record verified capture history without releasing the actuator hold."""
+        if not getattr(self, "_search_brake_observation_active", False):
+            self._search_brake_observation_active = True
+            self._search_brake_latest_observation = None
+            self._search_brake_candidate_observation = SearchBrakeObservation()
+            invalidate = getattr(getattr(self, "_follow_controller", None),
+                                 "invalidate_pre_brake_steering", None)
+            if callable(invalidate):
+                invalidate()
+        reason = PersonTracker._observe_target_during_search_brake(self, records, width, height)
+        tracker = getattr(getattr(self, "_rknn_pipeline", None), "tracker", None)
+        self._search_brake_center_candidate = self._search_brake_candidate_observation.centered_candidate(
+            getattr(tracker, "last_identity_observations", ()),
+            getattr(self._follow_controller, "active_target_id", None),
+            int(getattr(self, "_active_capture_frame_id", 0)),
+            float(getattr(self, "_active_capture_timestamp", 0.0)), width, height, time.monotonic())
+        cap = getattr(self, "_active_capture_frame_id", 0)
+        timing = getattr(self, "_brake_observation_pipeline_timing", {})
+        if (timing.get("capture_frame_id") != cap
+                or timing.get("capture_timestamp") != getattr(self, "_active_capture_timestamp", None)):
+            timing = {}
+        request = getattr(getattr(self, "_action_runtime", None), "_search_reacquire_brake_request", None)
+        logger.info(
+            "search_reacquire_brake_wait capture_frame_id=%s "
+            "latest_observation_capture_frame_id=%s action_evidence_capture_frame_id=%s "
+            "observation_reason=%s control=held longitudinal_allowed=False "
+            "capture_age_ms=%.1f capture_to_pipeline_ms=%s vision_processing_ms=%s "
+            "history_max_age_ms=%.1f motion_max_age_ms=%.1f motion_authorized=False",
+            cap, getattr(getattr(self, "_follow_controller", None),
+                         "_direction_latest_visible_capture_id", None),
+            getattr(request, "capture_frame_id", None), reason,
+            self._search_brake_observation_age_sec * 1000.,
+            timing.get("capture_to_pipeline_ms"), timing.get("vision_processing_ms"),
+            SEARCH_BRAKE_DIRECTION_OBSERVATION_MAX_AGE_SEC * 1000.,
+            VISION_CONTROL_MAX_RESULT_AGE_SEC * 1000.,
+        )
+
     def _finish_search_brake_observation_hold(self) -> None:
         if not getattr(self, "_search_brake_observation_active", False):
             return
@@ -9727,6 +10693,14 @@ class PersonTracker:
         evidence = getattr(self, "_search_brake_latest_observation", None)
         self._search_brake_latest_observation = None
         controller = getattr(self, "_follow_controller", None)
+        runtime = getattr(self, "_action_runtime", None)
+        sent_at = float(getattr(runtime, "_search_reacquire_brake_sent_at", 0.0))
+        if sent_at > 0:
+            controller.retire_pre_search_brake_direction(sent_at)
+            visible = controller._target_direction_history.latest_visible_evidence()
+            if visible is None or not evidence or visible.capture_frame_id != evidence[1]:
+                evidence = None
+            self.search_state, self.search_direction = controller.search_state, controller.search_direction
         reset = bool(evidence and controller.resume_direction_after_brake_hold(*evidence))
         if reset:
             self.search_state = controller.search_state
@@ -9751,23 +10725,18 @@ class PersonTracker:
         if callable(pending) and pending():
             # New vision may finish identity processing, but it cannot restore
             # forward/yaw while the search NORMAL stop is still settling.
-            if not getattr(self, "_search_brake_observation_active", False):
-                self._search_brake_observation_active = True
-                self._search_brake_latest_observation = None
-                invalidate = getattr(getattr(self, "_follow_controller", None),
-                                     "invalidate_pre_brake_steering", None)
-                if callable(invalidate):
-                    invalidate()
-            observation_reason = PersonTracker._observe_target_during_search_brake(self, records, width, height)
-            request = getattr(runtime, "_search_reacquire_brake_request", None)
-            logger.info("search_reacquire_brake_wait capture_frame_id=%s "
-                        "latest_observation_capture_frame_id=%s action_evidence_capture_frame_id=%s "
-                        "observation_reason=%s control=held longitudinal_allowed=False",
-                        getattr(self, "_active_capture_frame_id", 0),
-                        getattr(getattr(self, "_follow_controller", None),
-                                "_direction_latest_visible_capture_id", None),
-                        getattr(request, "capture_frame_id", None), observation_reason)
-            return
+            PersonTracker._record_search_brake_hold_observation(self, records, width, height)
+            # Process THIS frame before releasing; CAP159 previously consumed
+            # CAP156's direction because the current identity was still pending.
+            settling = getattr(runtime, "_search_reacquire_settling", None)
+            ready_at = getattr(settling, "ready_at", None)
+            hold = bool(getattr(self, "_search_brake_center_candidate", False)
+                        and ready_at is not None
+                        and time.monotonic()-ready_at < SEARCH_EVIDENCE_MAX_HOLD_SEC)
+            if settling is None or pending(
+                    capture_timestamp=float(getattr(self, "_active_capture_timestamp", 0.0)),
+                    keep_observing=hold):
+                return
         PersonTracker._finish_search_brake_observation_hold(self)
         # CAP1786->1790: clearing the accepted speed here made a fresh
         # STEER become TURN + transition STOP on every older RGB observation.
@@ -10110,6 +11079,10 @@ class PersonTracker:
         ):
             return
 
+        if (not selected_candidates
+                and PersonTracker._hold_for_identity_boundary_recheck(self, single_person_records)):
+            return
+
         active_uid = getattr(self._follow_controller, "active_target_id", None)
         retry = getattr(self, "_search_observation_retry", None)
         if (retry is not None and retry.active
@@ -10337,19 +11310,54 @@ class PersonTracker:
         depth_target_snapshot: Optional[Tuple[PersonTarget, ...]] = None,
         evidence_capture_frame_id: Optional[int] = None,
         evidence_capture_timestamp: Optional[float] = None,
-    ) -> None:
+    ) -> bool:
+        """Return False only when Depth30 should retry from its latest context.
+
+        Mutable ranging/filtering/decision state stays under the same mutex.
+        Only the independent depth worker is non-blocking: a visual/safety
+        decision must still enter the serialized control path normally.
+        """
+        if getattr(self, "_runtime_shutdown_requested", False) or not getattr(self, "running", True):
+            return True
         requested_at = time.monotonic()
-        with self._control_update_lock:
+        wait_started = time.perf_counter()
+        acquired = self._control_update_lock.acquire(blocking=control_source != "depth30")
+        if not acquired:
+            pending = getattr(self, "_depth30_deferred_schedule", None)
+            if pending is None or pending[0] != evidence_capture_frame_id:
+                self._depth30_deferred_schedule = (evidence_capture_frame_id, requested_at, 1)
+                logger.info(
+                    "depth30_schedule_deferred capture_frame_id=%s reason=control_busy "
+                    "retry_latest_context=True retry_max_ms=5 measurement_started=False "
+                    "deadline_renewed=False",
+                    evidence_capture_frame_id,
+                )
+            else:
+                self._depth30_deferred_schedule = (pending[0], pending[1], pending[2] + 1)
+            return False
+        acquired_counter = time.perf_counter()
+        acquired_cpu = time.thread_time()
+        self._control_lock_stage_snapshot = None
+        try:
+            # A shutdown may have been latched while vision waited for Depth.
+            if getattr(self, "_runtime_shutdown_requested", False) or not getattr(self, "running", True):
+                return True
             if control_source == "depth30":
                 acquired_at = time.monotonic()
                 capture_age = None if evidence_capture_timestamp is None else acquired_at - evidence_capture_timestamp
+                deferred = getattr(self, "_depth30_deferred_schedule", None)
+                self._depth30_deferred_schedule = None
                 logger.info(
                     "depth30_schedule capture_frame_id=%s lock_wait_ms=%.1f "
-                    "roi_age_ms=%s roi_remaining_ms=%s publication_age_ms=%s",
+                    "roi_age_ms=%s roi_remaining_ms=%s publication_age_ms=%s "
+                    "deferred_capture_frame_id=%s deferred_count=%d deferred_elapsed_ms=%.1f",
                     evidence_capture_frame_id, (acquired_at - requested_at) * 1000.0,
                     None if capture_age is None else round(capture_age * 1000.0, 1),
                     None if capture_age is None else round((ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC - capture_age) * 1000.0, 1),
                     None if context_published_ts is None else round((acquired_at - context_published_ts) * 1000.0, 1),
+                    None if deferred is None else deferred[0],
+                    0 if deferred is None else deferred[2],
+                    0.0 if deferred is None else (acquired_at - deferred[1]) * 1000.0,
                 )
             if control_source == "depth30" and depth_target_snapshot is not None:
                 # The loop may have copied this context before a visual
@@ -10368,7 +11376,7 @@ class PersonTracker:
                         "depth30_context_revoked capture_frame_id=%s target=%s",
                         evidence_capture_frame_id, expected_target_id,
                     )
-                    return
+                    return True
             if expected_target_id is not None:
                 # 30Hz线程等待控制锁期间，视觉线程可能已切换目标或进入搜索。
                 # 必须在锁内重新确认，禁止旧人物框覆盖刚产生的新视觉动作。
@@ -10382,7 +11390,8 @@ class PersonTracker:
                     )
                 )
                 if (
-                    context_age < 0.0
+                    not math.isfinite(context_age)
+                    or context_age < 0.0
                     or context_age > ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC
                     or active_target_id is None
                     or int(active_target_id) != int(expected_target_id)
@@ -10393,7 +11402,7 @@ class PersonTracker:
                     or self._runtime_shutdown_requested
                     or not self.running
                 ):
-                    return
+                    return True
             # RGB frame numbers cannot deduplicate independent Depth frames.
             # Process the current qualified ROI immediately; the sensor's
             # physical timestamp gate skips duplicate clustering, and replay
@@ -10413,6 +11422,26 @@ class PersonTracker:
                 evidence_capture_frame_id=evidence_capture_frame_id,
                 evidence_capture_timestamp=evidence_capture_timestamp,
             )
+            return True
+        finally:
+            finished_counter = time.perf_counter()
+            finished_cpu = time.thread_time()
+            stage = self._control_lock_stage_snapshot
+            self._control_update_lock.release()
+            # Format/write this aggregate after releasing the shared mutex.
+            # The mutable ranging/fusion/controller commit remains atomic.
+            wait_ms = (acquired_counter - wait_started) * 1000.0
+            hold_ms = (finished_counter - acquired_counter) * 1000.0
+            if stage is not None or max(wait_ms, hold_ms) >= 10.0:
+                if stage is None:
+                    stage = (evidence_capture_frame_id, control_source, hold_ms, None, None, None, None)
+                logger.info(
+                    "control_lock_stage capture_frame_id=%s source=%s total_ms=%.2f "
+                    "process_ms=%s ranging_ms=%s ranging_cpu_ms=%s queue_ms=%s "
+                    "ranging_in_process=True lock_wait_ms=%.2f lock_hold_ms=%.2f "
+                    "lock_hold_cpu_ms=%.2f log_after_unlock=True",
+                    *stage, wait_ms, hold_ms, (finished_cpu - acquired_cpu) * 1000.0,
+                )
 
     def _queue_actions_for_persons_locked(
         self,
@@ -10431,6 +11460,7 @@ class PersonTracker:
         evidence_capture_frame_id: Optional[int] = None,
         evidence_capture_timestamp: Optional[float] = None,
     ) -> None:
+        started = time.perf_counter()
         was_searching_before = self.search_state == "searching"
         previous_target_id = getattr(self._follow_controller, "active_target_id", None)
         previous_search_state = getattr(self._follow_controller, "search_state", "none")
@@ -10450,6 +11480,7 @@ class PersonTracker:
             evidence_capture_frame_id=evidence_capture_frame_id,
             evidence_capture_timestamp=evidence_capture_timestamp,
         )
+        decision_finished = time.perf_counter()
         selected_after = self._follow_controller.last_selected_target
         loss_started_at = getattr(self._follow_controller, "_lost_started_at", None)
         loss_age_sec = (
@@ -10599,7 +11630,22 @@ class PersonTracker:
                 FOLLOW_SEARCH_TIMEOUT_SEC,
             )
             self.running = False
-            self.action_stop_event.set()
+        finished = time.perf_counter()
+        if finished - started >= .01:
+            # Report only material control-lock holds; routine fast ticks do
+            # not generate another high-rate line. Ranging CPU/wall separates
+            # actual processing from scheduling/measurement-lock contention.
+            cap = (getattr(self, "_active_capture_frame_id", 0)
+                   if evidence_capture_frame_id is None else evidence_capture_frame_id)
+            timing = getattr(self, "_last_control_ranging_timing", None)
+            timing = timing if timing is not None and timing[:2] == (control_source, cap) else None
+            self._control_lock_stage_snapshot = (
+                cap, control_source, (finished - started) * 1000.0,
+                round((decision_finished - started) * 1000.0, 2),
+                None if timing is None else round(timing[2], 2),
+                None if timing is None else round(timing[3], 2),
+                round((finished - decision_finished) * 1000.0, 2),
+            )
 
     def _ensure_rknn_camera_started(self) -> None:
         if not RKNN_CAMERA_ENABLE:
@@ -10686,15 +11732,30 @@ class PersonTracker:
     def _start_capture_thread(self) -> None:
         if self._direction_pool is None:
             return
+        if getattr(self, "_runtime_shutdown_requested", False):
+            return
         if self._capture_thread is not None and self._capture_thread.is_alive():
             return
+        if self._capture_thread is not None or getattr(self, "_capture_failure_reason", None):
+            # An unexpectedly dead reader is a fault, not permission to open
+            # another concurrent camera reader or silently restart hardware.
+            self._send_runtime_shutdown_stop("runtime_fault_capture_thread_dead")
+            return
         self._capture_stop_event.clear()
+        self._capture_started_ts = time.monotonic()
+        self._capture_last_frame_ts = 0.0
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
             name="camera-capture-30fps",
             daemon=True,
         )
-        self._capture_thread.start()
+        try:
+            self._capture_thread.start()
+        except Exception as exc:
+            self._capture_failure_reason = f"thread_start:{type(exc).__name__}:{exc}"
+            self._send_runtime_shutdown_stop("runtime_fault_capture")
+            logger.exception("Camera capture startup failed; shutdown latched, automatic_restart=False")
+            return
         logger.info(
             "Camera capture queue started: fps=%.1f queue=%d",
             RKNN_CAMERA_FPS,
@@ -10702,6 +11763,14 @@ class PersonTracker:
         )
 
     def _capture_loop(self) -> None:
+        try:
+            self._capture_frames()
+        except Exception as exc:
+            self._capture_failure_reason = f"{type(exc).__name__}:{exc}"
+            self._send_runtime_shutdown_stop("runtime_fault_capture")
+            logger.exception("Camera capture worker failed; shutdown latched, automatic_restart=False")
+
+    def _capture_frames(self) -> None:
         while self.running and not self._capture_stop_event.is_set():
             camera = self._rknn_camera
             if camera is None:
@@ -10717,10 +11786,7 @@ class PersonTracker:
                 time.sleep(0.01)
                 continue
             timestamp = time.monotonic()
-            recording_feedback = (self._action_runtime.get_recording_feedback()
-                                  if self._camera_video_recorder is not None else None)
-            recording_follow = getattr(self, '_video_follow_snapshot', None)
-            recording_timing = recording_authority(self) if self._camera_video_recorder is not None else None
+            self._capture_last_frame_ts = timestamp
             with self._capture_state_lock:
                 self._capture_frame_id += 1
                 capture_id = int(self._capture_frame_id)
@@ -10730,19 +11796,9 @@ class PersonTracker:
             self._capture_metadata_ring.append(
                 (capture_id, float(timestamp), frame_width, frame_height)
             )
-            self._record_depth_diagnostic_rgb(capture_id, timestamp, frame)
-            if self._camera_video_recorder is not None:
-                self._camera_video_recorder.submit(
-                    frame,
-                    capture_frame_id=capture_id,
-                    monotonic_sec=timestamp,
-                    unix_sec=time.time(),
-                    wheel_feedback=recording_feedback,
-                    follow_snapshot=recording_follow,
-                    linear_timing=recording_timing,
-                )
-            if self._direction_pool is not None:
-                self._direction_pool.submit(capture_id, timestamp, frame, "BGR")
+            # The control RGB is published before optional copies, encoding
+            # metadata or direction-worker submission. Those consumers must
+            # never make a successfully acquired control image disappear.
             packet = (capture_id, timestamp, frame)
             try:
                 self._capture_queue.put_nowait(packet)
@@ -10755,6 +11811,58 @@ class PersonTracker:
                     self._capture_queue.put_nowait(packet)
                 except queue.Full:
                     pass
+            self._submit_capture_sidecars(capture_id, timestamp, frame)
+
+    def _submit_capture_sidecars(self, capture_id, timestamp, frame) -> None:
+        self._record_depth_diagnostic_rgb(capture_id, timestamp, frame)
+        recorder = self._camera_video_recorder
+        if recorder is not None and not getattr(self, "_capture_recorder_disabled", False):
+            try:
+                recorder.submit(
+                    frame, capture_frame_id=capture_id, monotonic_sec=timestamp,
+                    unix_sec=time.time(), wheel_feedback=self._action_runtime.get_recording_feedback(),
+                    follow_snapshot=getattr(self, "_video_follow_snapshot", None),
+                    linear_timing=recording_authority(self),
+                )
+            except Exception:
+                self._capture_recorder_disabled = True
+                # Keep the reference for normal shutdown/partial-file cleanup.
+                logger.exception("Camera sidecar disabled: recorder; control_capture_continues=True")
+        pool = self._direction_pool
+        if pool is not None and not getattr(self, "_capture_direction_disabled", False):
+            try:
+                pool.submit(capture_id, timestamp, frame, "BGR")
+            except Exception:
+                self._capture_direction_disabled = True
+                # Do not set _direction_pool=None: that selects synchronous
+                # camera.read in the main loop, creating a second reader.
+                logger.exception("Camera sidecar disabled: direction; control_capture_continues=True")
+
+    def _capture_health_ok(self) -> bool:
+        """Fail closed on a dead/stalled reader; no automatic camera reopen.
+
+        One second is a liveness alarm, NOT a motion-evidence TTL. Existing
+        190/250ms motion gates still withdraw old image/depth authorization.
+        """
+        if getattr(self, "_runtime_shutdown_requested", False) or not self.running:
+            return False
+        thread = self._capture_thread
+        if thread is None:
+            return True  # Synchronous camera mode has no worker to supervise.
+        reason = None
+        if not thread.is_alive():
+            reason = "runtime_fault_capture_thread_dead"
+        else:
+            last = (getattr(self, "_capture_last_frame_ts", 0.0)
+                    or getattr(self, "_capture_started_ts", 0.0))
+            if last > 0.0 and time.monotonic() - last > 1.0:
+                reason = "runtime_fault_capture_stalled"
+        if reason is None:
+            return True
+        self._capture_failure_reason = self._capture_failure_reason or reason
+        self._send_runtime_shutdown_stop(reason)
+        logger.error("Camera capture unhealthy: reason=%s automatic_restart=False", reason)
+        return False
 
     def _recording_depth_sample(self, capture_id, timestamp):
         # Invoked only by the video writer. Reads bounded diagnostics, not
@@ -11031,12 +12139,15 @@ class PersonTracker:
         self._ensure_rknn_camera_started()
         if self._rknn_camera is None:
             return
+        if not self._capture_health_ok():
+            return
         if self._direction_pool is not None:
             self._drain_direction_results()
             read_started = time.perf_counter()
             try:
                 capture_id, capture_timestamp, frame = self._capture_queue.get(timeout=0.25)
             except queue.Empty:
+                self._capture_health_ok()
                 return
             while True:
                 try:
@@ -11114,8 +12225,9 @@ class PersonTracker:
     ):
         """Process one externally supplied frame through RKNN vision and control."""
         pipeline_started = time.perf_counter()
+        pipeline_started_mono = time.monotonic()
         frame_received_ts = (
-            time.monotonic()
+            pipeline_started_mono
             if capture_timestamp is None
             else float(capture_timestamp)
         )
@@ -11255,6 +12367,17 @@ class PersonTracker:
             records = probe_processor(frame, frame_format)
         else:
             records = self._rknn_pipeline.process_frame(frame, frame_format)
+        if not getattr(self, "_numeric_runtime_first_frame_logged", False):
+            from rk_vision.numeric_runtime import log_numeric_runtime
+            log_numeric_runtime(logger, "first_frame")
+            self._numeric_runtime_first_frame_logged = True
+        if (not getattr(self, "_numeric_runtime_first_match_logged", False)
+                and getattr(self._rknn_pipeline, "last_timing_ms", {}).get("deepsort_matched_count", 0) > 0):
+            # SciPy's matcher can load a second BLAS library lazily. Report it
+            # once after the first real association, not on every frame.
+            from rk_vision.numeric_runtime import log_numeric_runtime
+            log_numeric_runtime(logger, "first_track_match")
+            self._numeric_runtime_first_match_logged = True
         video_detections = []
         if self._camera_video_recorder is not None:
             video_detections = list(
@@ -11287,6 +12410,12 @@ class PersonTracker:
         height = int(getattr(self._rknn_pipeline, "last_frame_height", VISION_FRAME_HEIGHT))
         control_started = time.perf_counter()
         vision_result_age_sec = max(0.0, vision_finished - pipeline_started)
+        self._brake_observation_pipeline_timing = {
+            "capture_frame_id": current_capture_id,
+            "capture_timestamp": frame_received_ts,
+            "capture_to_pipeline_ms": max(0.0, pipeline_started_mono - frame_received_ts) * 1000.,
+            "vision_processing_ms": vision_result_age_sec * 1000.,
+        }
         stale_result_discarded = vision_result_age_sec > VISION_CONTROL_MAX_RESULT_AGE_SEC
         evidence_getter = getattr(
             self._rknn_pipeline,
@@ -11570,6 +12699,11 @@ class PersonTracker:
         # A stale full-vision result must not advance candidate hold/probe
         # counters. It is evidence for neither the current search nor a new
         # candidate; preserving the gate state avoids delayed-frame pollution.
+        deferred_observation_bboxes = PersonTracker._deferred_search_observation_bboxes(
+            self, search_active=search_active_before, width=width, height=height,
+            formal_candidates=formal_evidence, capture_id=int(current_capture_id),
+            capture_timestamp=frame_received_ts, stale=stale_result_discarded or search_settling_pending,
+        )
         gate_decision = (
             SearchCandidateGateDecision(reason="rotate_settling")
             if search_settling_pending
@@ -11584,6 +12718,7 @@ class PersonTracker:
                 formal_candidates=formal_evidence,
                 probe_candidates=probe_evidence,
                 preferred_bbox=preferred_candidate_bbox,
+                deferred_observation_bboxes=deferred_observation_bboxes,
             )
         )
         gate_decision = PersonTracker._retry_search_candidate_observation(
@@ -11592,6 +12727,10 @@ class PersonTracker:
             capture_id=int(current_capture_id), capture_timestamp=frame_received_ts,
             stale=stale_result_discarded,
         )
+        gate_observation_confirmed = bool(gate_decision.completed and gate_decision.reason not in {
+            "observation_timeout_unsettled", "observation_candidate_lost_or_changed",
+            DEFERRED_EDGE_COVERAGE,
+        })
         note_candidate = getattr(
             self._follow_controller,
             "note_search_candidate_evidence",
@@ -11615,7 +12754,7 @@ class PersonTracker:
             note_candidate(
                 gate_decision.bbox,
                 frame_width=width,
-                confirmed=bool(gate_decision.completed),
+                confirmed=gate_observation_confirmed,
                 source=str(gate_decision.source),
                 candidate_score=float(gate_decision.score),
                 candidate_tracked=candidate_tracked,
@@ -11684,7 +12823,7 @@ class PersonTracker:
         if (
             lateral_candidate is not None
             and not bool(lateral_candidate.active_target_match)
-            and not bool(gate_decision.completed and gate_decision.source != "credible_retry")
+            and not bool(gate_observation_confirmed and gate_decision.source != "credible_retry")
         ):
             lateral_candidate_deferred = True
             logger.info(
@@ -11733,6 +12872,13 @@ class PersonTracker:
                 width=width,
                 result_age_sec=vision_result_age_sec,
             )
+            # Safety invalidation remains unconditional. Only AFTER it marks
+            # the capture stale may a verified observation replace that history
+            # slot. Never route a stale result through normal motion control.
+            pending = getattr(getattr(self, "_action_runtime", None),
+                              "search_reacquire_brake_pending", None)
+            if callable(pending) and pending():
+                PersonTracker._record_search_brake_hold_observation(self, records, width, height)
             logger.warning(
                 "视觉结果过期，跳过运动决策: control_frame_id=%d capture_frame_id=%d age=%.1fms limit=%.1fms records=%d",
                 int(self.frame_index),
@@ -11780,7 +12926,7 @@ class PersonTracker:
             "predicted_reid_verify_ms=%.2f vision_total_ms=%.2f control_ms=%.2f "
             "end_to_end_ms=%.2f result_age_ms=%.2f stale_result_discarded=%s "
             "reid_color_ms=%.2f reid_postprocess_exclusive_ms=%.2f "
-            "tracker_stages_wall_cpu_ms=%s",
+            "tracker_stages_wall_cpu_ms=%s kalman_counts=%s kalman_solver=%s",
             int(self.frame_index),
             int(getattr(self, "_active_capture_frame_id", 0)),
             float(camera_read_ms or 0.0),
@@ -11814,8 +12960,16 @@ class PersonTracker:
                     "tracker_evidence", "tracker_records", "tracker_probe",
                     "identity_match_evidence", "identity_decision",
                     "identity_quarantine", "identity_logging",
+                    "deepsort_kf_predict", "deepsort_kf_project", "deepsort_kf_cholesky",
+                    "deepsort_kf_solve_lower", "deepsort_kf_solve_upper", "deepsort_kf_fallback",
                 )
             ),
+            json.dumps({key: int(timing.get("deepsort_" + key, 0)) for key in (
+                "tracks_count", "detections_count", "matched_count", "initiated_count",
+                "kf_predict_calls", "kf_project_calls", "kf_cholesky_calls",
+                "kf_cholesky_retries", "kf_solve_lower_calls", "kf_solve_upper_calls", "kf_fallback_calls",
+            )}, separators=(",", ":")),
+            os.environ.get("FOLLOW_KALMAN_SOLVER", "numpy"),
         )
         diagnostic_now = time.monotonic()
         controller_status_after = self._follow_controller.search_status(diagnostic_now)
@@ -11850,6 +13004,10 @@ class PersonTracker:
                         quality_reason=str(assignment.get("bbox_quality_reason") or ""),
                         fresh=int(getattr(record, "time_since_update", 0)) == 0,
                         active_target=record is video_active_record,
+                        initial_enrollment_detail=str(
+                            (assignment.get("initial_enrollment_evidence") or {}).get("reason") or ""),
+                        initial_enrollment_blocker=str(
+                            (assignment.get("initial_enrollment_state") or {}).get("bridge_blocker") or ""),
                     )
                 )
             feedback_for_video = self._action_runtime.get_steering_feedback()
@@ -12036,6 +13194,11 @@ class PersonTracker:
                         command_name=ACTION_NAMES.get(current_command, str(current_command)),
                         requested_rotate_raw=int(self._current_rotate_raw_target),
                         requested_rotate_source=self._current_rotate_raw_source,
+                        left_forward_rpm=None if feedback is None else feedback.left_forward_rpm,
+                        right_forward_rpm=None if feedback is None else feedback.right_forward_rpm,
+                        feedback_timestamp=None if feedback is None else feedback.timestamp,
+                        left_position_deg=None if feedback is None else feedback.left_position_deg,
+                        right_position_deg=None if feedback is None else feedback.right_position_deg,
                         left_speed_rpm=(
                             None if feedback is None else int(feedback.left_speed_rpm)
                         ),
@@ -12081,15 +13244,50 @@ class PersonTracker:
     def process_frame(self):
         return self._process_frame_rknn_camera()
 
+    def _latch_runtime_shutdown(self, reason: str = "runtime_shutdown") -> None:
+        """Signal-safe state latch: no control/motor lock, logging or I/O.
+
+        Leave the action worker alive until a direct STOP has been attempted.
+        It also observes this latch, so a blocked main/vision thread cannot
+        prevent its independent shutdown-stop service from running.
+        """
+        if not getattr(self, "_runtime_shutdown_reason", None):
+            self._runtime_shutdown_reason = str(reason or "runtime_shutdown")
+        self._runtime_shutdown_requested = True
+        self._explicit_stop_requested = True
+        self.running = False
+        self.stop_action_execution = True
+        self._use_soft_stop_next = False
+
+    def _send_runtime_shutdown_stop(self, reason: str = "runtime_shutdown") -> bool:
+        """Stop before worker cleanup, independently of the control mutex.
+
+        Serial I/O still uses its own transaction locks; this deliberately
+        does not promise recovery from a blocked serial driver. No driver is
+        opened implicitly when initialization failed.
+        """
+        self._latch_runtime_shutdown(reason)
+        backend = getattr(self, "_motor_backend", None)
+        if backend is None or backend.driver is None:
+            logger.info("runtime_shutdown stop_skipped=True reason=motor_not_initialized implicit_open=False")
+            return False
+        try:
+            self._action_runtime.send_stop_with_brake_hold(self._runtime_shutdown_reason)
+            return True
+        except Exception:
+            logger.exception("runtime_shutdown direct_stop_failed=True reason=%s", self._runtime_shutdown_reason)
+            return False
+
     def _run_shutdown_step(self, label: str, callback, timeout_sec: float = SHUTDOWN_STEP_TIMEOUT_SEC) -> bool:
         """Run one potentially blocking close operation with a hard timeout."""
         done = threading.Event()
         errors = []
+        results = []
         started = time.monotonic()
 
         def _close_worker() -> None:
             try:
-                callback()
+                results.append(callback())
             except Exception as exc:
                 errors.append(exc)
             finally:
@@ -12112,22 +13310,33 @@ class PersonTracker:
         if errors:
             logger.warning("退出清理步骤失败: %s elapsed=%.1fms error=%s", label, elapsed_ms, errors[0])
             return False
+        if results and results[0] is False:
+            logger.warning("退出清理步骤未完成: %s elapsed=%.1fms cleanup_deferred=True", label, elapsed_ms)
+            return False
         logger.info("退出清理步骤完成: %s elapsed=%.1fms", label, elapsed_ms)
         return True
 
-    def _release_rknn_camera(self) -> None:
+    def _release_rknn_camera(self) -> bool:
         self._capture_stop_event.set()
         capture_thread = self._capture_thread
-        self._capture_thread = None
-        if capture_thread is not None:
+        if capture_thread is not None and capture_thread.is_alive():
             capture_thread.join(timeout=SHUTDOWN_STEP_TIMEOUT_SEC)
+            if capture_thread.is_alive():
+                # A blocked native read must not race release() on that same
+                # camera. Keep ownership for diagnostics/process teardown;
+                # no hardware restart is permitted after the shutdown latch.
+                logger.error("RKNN camera release_deferred=True capture_worker_alive=True "
+                             "native_read_not_interrupted=True")
+                return False
+        self._capture_thread = None
         camera = self._rknn_camera
-        # 先摘掉共享引用，超时后遗留的 daemon 线程不会再被主流程重复释放。
+        # The reader is confirmed stopped; it is now safe to close its owner.
         self._rknn_camera = None
         if camera is None:
-            return
+            return True
         camera.release()
         logger.info("RKNN camera released")
+        return True
 
     def _close_camera_video_recorder(self) -> None:
         recorder = self._camera_video_recorder
@@ -12167,7 +13376,10 @@ class PersonTracker:
         except KeyboardInterrupt:
             logger.info("收到停止信号，正在关闭...")
         finally:
-            self.running = False
+            # Revoke movement and issue the first STOP BEFORE diagnostics,
+            # worker joins or control-state cleanup can wait on any mutex.
+            self._send_runtime_shutdown_stop("runtime_shutdown")
+            self.action_stop_event.set()
             search_diagnostics = getattr(self, "_search_diagnostics", None)
             if search_diagnostics is not None and search_diagnostics.active:
                 final_search_status = self._follow_controller.search_status()
@@ -12178,15 +13390,6 @@ class PersonTracker:
                 )
             self._stop_lateral_intent_thread()
             self._stop_longitudinal_thread()
-            self.action_stop_event.set()
-            # 先发 STOP，确保 Ctrl+C 后车一定停（避免中断发生在 detect 后、发停前的空窗期）
-            if self._motor_backend.driver is not None:
-                try:
-                    self._action_runtime.send_stop_with_brake_hold(self._last_explicit_stop_reason or "explicit_stop")
-                except Exception as e:
-                    logger.warning(f"finally 中发送 STOP 失败: {e}")
-            else:
-                logger.info("电机初始化未完成，退出时跳过 STOP，禁止隐式重新打开串口")
             if self.action_thread:
                 self.action_thread.join(timeout=1.0)
             self._action_runtime.join_feedback(timeout=1.0)
@@ -12218,9 +13421,9 @@ def main():
         logger.info(f"未传模型路径，使用默认: {YOLO_MODEL_PATH}")
     tracker = PersonTracker(model_path=model_path)
     def _request_shutdown(signum, _frame):
-        logger.info("收到系统信号 %s，准备安全停车并退出", signal.Signals(signum).name)
-        tracker.running = False
-        tracker.action_stop_event.set()
+        # A Python signal can interrupt this thread while it owns the command
+        # lock. Never perform synchronous motor I/O/logging in that callback.
+        tracker._latch_runtime_shutdown("runtime_shutdown_signal")
 
     signal.signal(signal.SIGINT, _request_shutdown)
     signal.signal(signal.SIGTERM, _request_shutdown)

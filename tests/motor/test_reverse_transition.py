@@ -12,9 +12,9 @@ def main() -> int:
     args = parser.parse_args()
 
     mod = _load_request_module(args.config)
-    if abs(float(mod.FOLLOW_REVERSE_IMMEDIATE_DISTANCE_M) - 1.30) > 1e-9:
+    if abs(float(mod.FOLLOW_REVERSE_IMMEDIATE_DISTANCE_M) - (mod.TARGET_DISTANCE - .20)) > 1e-9:
         raise AssertionError(
-            "runtime did not load reverse_immediate_distance_m=1.30"
+            "runtime did not derive immediate reverse from the selected target distance"
         )
     tracker = _make_tracker_shell(mod)
     runtime = tracker._action_runtime

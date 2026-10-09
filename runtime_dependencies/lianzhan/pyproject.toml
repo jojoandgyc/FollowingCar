@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lz30ema-rs485"
+version = "0.1.0"
+description = "Python Modbus RTU library for LZ-30EMA_2EC_N brushless motor drivers."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "LZ-30EMA RS485 users" }]
+license = { text = "MIT" }
+keywords = ["modbus", "rs485", "motor", "lz30ema"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+serial = ["pyserial>=3.5"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

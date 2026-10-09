@@ -64,7 +64,7 @@ def _bbox(value, width: int, height: int) -> Optional[BBox]:
 def resolve_depth_target_observation(
     *, target_id, display_bbox, capture_frame_id, capture_timestamp,
     observations, width, height, allow_confirmed_mapped: bool = False,
-    expected_raw_track_id=None,
+    expected_raw_track_id=None, _braking_only: bool = False,
 ) -> Optional[DepthTargetObservation]:
     """Return immutable detector geometry only for one proven UID association.
 
@@ -143,14 +143,25 @@ def resolve_depth_target_observation(
     if bbox is None:
         return None
     reason = str(assignment.get("reason") or "").strip().lower()
+    competition = metadata.get("identity_competition") or {}
+    if _braking_only and (assignment.get("identity_control_rejected")
+            or not isinstance(competition, Mapping) or competition.get("passed") is False):
+        return None
+    braking_mapped = bool(_braking_only and raw_track_id > 0
+        and _integer(assignment.get("mapped_uid")) == uid
+        and _integer(observation.get("uid")) in (0, uid)
+        and _integer(assignment.get("uid")) in (0, uid)
+        and reason in {"mapped_low_quality", "mapped_weak_observed"}
+        and not assignment.get("identity_control_rejected")
+        and competition.get("passed") is not False)
     if (
-        assignment.get("bbox_quality_ok") is not True
-        or str(assignment.get("bbox_quality_tier") or "").lower() in {"weak", "reject"}
+        (not braking_mapped and (assignment.get("bbox_quality_ok") is not True
+        or str(assignment.get("bbox_quality_tier") or "").lower() in {"weak", "reject"}))
         or assignment.get("reacquire_geometry_ok") is False
         or assignment.get("search_excluded") is True
         or metadata.get("search_observation_only") is True
         or assignment.get("search_observation_only") is True
-        or reason in _OBSERVATION_REASONS
+        or (reason in _OBSERVATION_REASONS and not braking_mapped)
         or any(token in reason for token in ("pending", "wait", "reject", "excluded"))
     ):
         return None
@@ -166,12 +177,22 @@ def resolve_depth_target_observation(
     if observed_uid == uid:
         if "uid" in assignment and assigned_uid != uid:
             return None
-    elif not (
+    elif not braking_mapped and not (
         allow_confirmed_mapped and observed_uid == 0 and mapped_uid == uid
         and assigned_uid in (0, uid) and reason in _CONFIRMED_MAPPED_REASONS
     ):
         return None
     return DepthTargetObservation(
         bbox=bbox, target_id=uid, raw_track_id=raw_track_id,
-        capture_frame_id=capture_id, capture_timestamp=timestamp, source="yolo_detector",
+        capture_frame_id=capture_id, capture_timestamp=timestamp,
+        source="yolo_braking_only" if _braking_only else "yolo_detector",
     )
+
+
+def resolve_braking_target_observation(**kwargs):
+    """Exact mapped geometry for braking/bounded yaw continuity, never a depth ROI.
+
+    Outward continuity additionally needs a recent reliable anchor and three
+    independent crops at the consumer; this object alone grants none of it.
+    """
+    return resolve_depth_target_observation(**kwargs, _braking_only=True)

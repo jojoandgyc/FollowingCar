@@ -1,0 +1,314 @@
+{
+  "source": "run_20260924_145716_13747_8ce0fb16",
+  "rows": [
+    {
+      "frame_index": 100,
+      "raw_track_id": 1,
+      "uid": 1,
+      "display_bbox": [
+        0,
+        0,
+        294.9106451152106,
+        479
+      ],
+      "detector_bbox": [
+        18.83917999267578,
+        3.0985565185546875,
+        278.7577819824219,
+        476.22015380859375
+      ],
+      "sample_metadata": {
+        "track_id": 1,
+        "capture_frame_id": 231,
+        "capture_timestamp": 9775.917616788,
+        "integrated_yaw_deg": -38.00764033926311,
+        "candidate_count": 1,
+        "source_detection_index": 0,
+        "is_fresh": true,
+        "search_reacquire_context_active": false,
+        "detector_confidence": 0.9381020069122314,
+        "identity_competition": {
+          "uid": 1,
+          "frame_index": 100,
+          "candidate_count": 1,
+          "source_detection_index": 0,
+          "distance": 0.10161471366882324,
+          "competitor_index": null,
+          "competitor_distance": null,
+          "distance_gap": null,
+          "min_margin": 0.05,
+          "passed": true,
+          "reason": "single_candidate"
+        }
+      },
+      "assignment": {
+        "uid": 1,
+        "reason": "updated_diverse",
+        "bbox_quality_ok": true,
+        "bbox_quality_tier": "strong",
+        "bbox_quality_reason": null,
+        "template_recent_evidence": {
+          "count": 8,
+          "distance": 0.10161471366882324,
+          "query_coverage": "top1_bottom1_side0",
+          "winner_coverage": "top1_bottom1_side0",
+          "comparable_count": 4,
+          "comparable_distance": 0.10161471366882324,
+          "winner_cap": 180,
+          "winner_age_sec": 2.65775394999946,
+          "winner_crop_shape_consistent": null
+        },
+        "reacquire_partial_state": "match",
+        "search_excluded": false
+      }
+    },
+    {
+      "frame_index": 102,
+      "raw_track_id": 1,
+      "uid": 0,
+      "display_bbox": [
+        0,
+        0,
+        289.4665543077384,
+        479
+      ],
+      "detector_bbox": [
+        3.6717987060546875,
+        1.699737548828125,
+        266.48480224609375,
+        476.55517578125
+      ],
+      "sample_metadata": {
+        "track_id": 1,
+        "capture_frame_id": 236,
+        "capture_timestamp": 9776.16762718,
+        "integrated_yaw_deg": -51.59143451697392,
+        "candidate_count": 1,
+        "source_detection_index": 0,
+        "is_fresh": true,
+        "search_reacquire_context_active": false,
+        "detector_confidence": 0.9456369876861572,
+        "identity_competition": {
+          "uid": 1,
+          "frame_index": 102,
+          "candidate_count": 1,
+          "source_detection_index": 0,
+          "distance": 0.11491423845291138,
+          "competitor_index": null,
+          "competitor_distance": null,
+          "distance_gap": null,
+          "min_margin": 0.05,
+          "passed": true,
+          "reason": "single_candidate"
+        }
+      },
+      "assignment": {
+        "uid": 0,
+        "mapped_uid": 1,
+        "reason": "mapped_weak_observed",
+        "bbox_quality_ok": false,
+        "bbox_quality_tier": "weak",
+        "bbox_quality_reason": "edge_touch>2",
+        "template_recent_evidence": {
+          "count": 8,
+          "distance": 0.1149141788482666,
+          "query_coverage": "top1_bottom1_side1",
+          "winner_coverage": "top0_bottom1_side0",
+          "comparable_count": 0,
+          "comparable_distance": null,
+          "winner_cap": 219,
+          "winner_age_sec": 0.8805900250008563,
+          "winner_crop_shape_consistent": null
+        },
+        "reacquire_partial_state": "unknown",
+        "search_excluded": false
+      }
+    },
+    {
+      "frame_index": 103,
+      "raw_track_id": 1,
+      "uid": 0,
+      "display_bbox": [
+        0,
+        0,
+        275.877541695007,
+        479
+      ],
+      "detector_bbox": [
+        0,
+        3.0950775146484375,
+        241.3970184326172,
+        475.80230712890625
+      ],
+      "sample_metadata": {
+        "track_id": 1,
+        "capture_frame_id": 239,
+        "capture_timestamp": 9776.316340427,
+        "integrated_yaw_deg": -55.19827429425565,
+        "candidate_count": 1,
+        "source_detection_index": 0,
+        "is_fresh": true,
+        "search_reacquire_context_active": false,
+        "detector_confidence": 0.9569393992424011,
+        "identity_competition": {
+          "uid": 1,
+          "frame_index": 103,
+          "candidate_count": 1,
+          "source_detection_index": 0,
+          "distance": 0.1173095703125,
+          "competitor_index": null,
+          "competitor_distance": null,
+          "distance_gap": null,
+          "min_margin": 0.05,
+          "passed": true,
+          "reason": "single_candidate"
+        }
+      },
+      "assignment": {
+        "uid": 0,
+        "mapped_uid": 1,
+        "reason": "mapped_weak_observed",
+        "bbox_quality_ok": false,
+        "bbox_quality_tier": "weak",
+        "bbox_quality_reason": "edge_touch>2",
+        "template_recent_evidence": {
+          "count": 8,
+          "distance": 0.11730968952178955,
+          "query_coverage": "top1_bottom1_side1",
+          "winner_coverage": "top1_bottom1_side0",
+          "comparable_count": 0,
+          "comparable_distance": null,
+          "winner_cap": 231,
+          "winner_age_sec": 0.39872363900030905,
+          "winner_crop_shape_consistent": null
+        },
+        "reacquire_partial_state": "unknown",
+        "search_excluded": false
+      }
+    },
+    {
+      "frame_index": 104,
+      "raw_track_id": 1,
+      "uid": 0,
+      "display_bbox": [
+        0,
+        0,
+        268.3617925696992,
+        479
+      ],
+      "detector_bbox": [
+        0.02172088623046875,
+        3.213043212890625,
+        234.03045654296875,
+        477.9696044921875
+      ],
+      "sample_metadata": {
+        "track_id": 1,
+        "capture_frame_id": 240,
+        "capture_timestamp": 9776.38422671,
+        "integrated_yaw_deg": -55.116305526190146,
+        "candidate_count": 1,
+        "source_detection_index": 0,
+        "is_fresh": true,
+        "search_reacquire_context_active": false,
+        "detector_confidence": 0.9381020069122314,
+        "identity_competition": {
+          "uid": 1,
+          "frame_index": 104,
+          "candidate_count": 1,
+          "source_detection_index": 0,
+          "distance": 0.15270990133285522,
+          "competitor_index": null,
+          "competitor_distance": null,
+          "distance_gap": null,
+          "min_margin": 0.05,
+          "passed": true,
+          "reason": "single_candidate"
+        }
+      },
+      "assignment": {
+        "uid": 0,
+        "mapped_uid": 1,
+        "reason": "mapped_weak_observed",
+        "bbox_quality_ok": false,
+        "bbox_quality_tier": "weak",
+        "bbox_quality_reason": "edge_touch>2",
+        "template_recent_evidence": {
+          "count": 8,
+          "distance": 0.15270990133285522,
+          "query_coverage": "top1_bottom1_side1",
+          "winner_coverage": "top0_bottom1_side0",
+          "comparable_count": 0,
+          "comparable_distance": null,
+          "winner_cap": 219,
+          "winner_age_sec": 1.097189555001023,
+          "winner_crop_shape_consistent": null
+        },
+        "reacquire_partial_state": "unknown",
+        "search_excluded": false
+      }
+    },
+    {
+      "frame_index": 105,
+      "raw_track_id": 1,
+      "uid": 0,
+      "display_bbox": [
+        0,
+        0,
+        263.903588330395,
+        479
+      ],
+      "detector_bbox": [
+        0.03147125244140625,
+        3.0635986328125,
+        231.2156219482422,
+        476.19287109375
+      ],
+      "sample_metadata": {
+        "track_id": 1,
+        "capture_frame_id": 241,
+        "capture_timestamp": 9776.448545988,
+        "integrated_yaw_deg": -54.61763461639827,
+        "candidate_count": 1,
+        "source_detection_index": 0,
+        "is_fresh": true,
+        "search_reacquire_context_active": false,
+        "detector_confidence": 0.9418694972991943,
+        "identity_competition": {
+          "uid": 1,
+          "frame_index": 105,
+          "candidate_count": 1,
+          "source_detection_index": 0,
+          "distance": 0.13599812984466553,
+          "competitor_index": null,
+          "competitor_distance": null,
+          "distance_gap": null,
+          "min_margin": 0.05,
+          "passed": true,
+          "reason": "single_candidate"
+        }
+      },
+      "assignment": {
+        "uid": 0,
+        "mapped_uid": 1,
+        "reason": "mapped_weak_observed",
+        "bbox_quality_ok": false,
+        "bbox_quality_tier": "weak",
+        "bbox_quality_reason": "edge_touch>2",
+        "template_recent_evidence": {
+          "count": 8,
+          "distance": 0.1359981894493103,
+          "query_coverage": "top1_bottom1_side1",
+          "winner_coverage": "top0_bottom1_side0",
+          "comparable_count": 0,
+          "comparable_distance": null,
+          "winner_cap": 219,
+          "winner_age_sec": 1.1615088329999708,
+          "winner_crop_shape_consistent": null
+        },
+        "reacquire_partial_state": "unknown",
+        "search_excluded": false
+      }
+    }
+  ]
+}

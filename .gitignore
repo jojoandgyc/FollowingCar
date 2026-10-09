@@ -3,6 +3,7 @@
 logs/
 *.log
 *.rc
+.follow_session.lock
 .cache/
 run_request_0428_modular_logs/
 sh_logs/
@@ -29,6 +30,8 @@ yolov8-track/official_reid_diag/sample_vi_object_tracking_reid_diag
 
 # Generated/downloaded model artifacts.
 models/*.rknn
+!models/yolo11n_int8_person_val2017.rknn
+!models/osnet_x0_25_msmt17_b1.rknn
 models/source/*.onnx
 models/source/*.pt
 models/source/*.pth
@@ -42,10 +45,10 @@ third_party/rknpu2/packages/
 # Local reference snapshots copied from the RK3588 board or external examples.
 third_party/followme_reference/
 
-# Board-local runtime libraries are installed separately and are not source.
-librknnrt.so
+# The active board runtime library is included in this deployment branch.
 
 # Local maintenance backups and temporary synchronization directories.
+.reconstruction/
 .codex_backups/
 .codex_backup_*/
 .sync_backups/

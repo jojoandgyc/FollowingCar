@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from .follow_bbox_policy import lower_compact_bbox_reason
 from dataclasses import dataclass, replace
 from typing import Any, List, Optional, Sequence, Tuple
 
@@ -225,6 +226,7 @@ class RKNNVisionConfig:
     identity_max_features: int = 20
     identity_template_memory_enable: bool = False
     identity_template_crosscheck_enable: bool = False
+    identity_appearance_region_safety_enable: bool = False
     identity_template_recent_sec: float = 30.0
     identity_template_archive_sec: float = 120.0
     identity_max_weak_features: int = 8
@@ -291,6 +293,7 @@ class RKNNVisionConfig:
     identity_preferred_search_soft_min_confidence: float = 0.80
     identity_partial_appearance_enable: bool = True
     identity_partial_match_threshold: float = 0.34
+    identity_partial_confirm_threshold: float = 0.34
     identity_partial_max_features: int = 8
     identity_partial_update_threshold: float = 0.30
     identity_preferred_search_reacquire_side_ratio: float = 0.05
@@ -385,6 +388,7 @@ class RKNNVisionConfig:
             identity_max_features=max(1, int(os.environ.get("Y8_IDENTITY_MAX_FEATURES", "20"))),
             identity_template_memory_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_MEMORY_ENABLE", "0").strip() == "1",
             identity_template_crosscheck_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_CROSSCHECK_ENABLE", "0").strip() == "1",
+            identity_appearance_region_safety_enable=os.environ.get("Y8_IDENTITY_APPEARANCE_REGION_SAFETY_ENABLE", "0").strip() == "1",
             identity_template_recent_sec=max(1.0, float(os.environ.get("Y8_IDENTITY_TEMPLATE_RECENT_SEC", "30"))),
             identity_template_archive_sec=max(1.0, float(os.environ.get("Y8_IDENTITY_TEMPLATE_ARCHIVE_SEC", "120"))),
             identity_max_weak_features=max(0, int(os.environ.get("Y8_IDENTITY_MAX_WEAK_FEATURES", "8"))),
@@ -614,6 +618,9 @@ class RKNNVisionConfig:
             identity_partial_match_threshold=float(
                 os.environ.get("Y8_IDENTITY_PARTIAL_MATCH_THRESHOLD", "0.34")
             ),
+            identity_partial_confirm_threshold=float(
+                os.environ.get("Y8_IDENTITY_PARTIAL_CONFIRM_THRESHOLD", "0.34")
+            ),
             identity_partial_max_features=max(
                 1, int(os.environ.get("Y8_IDENTITY_PARTIAL_MAX_FEATURES", "8"))
             ),
@@ -724,6 +731,7 @@ class RKNNVisionPipeline:
                 identity_max_features=self.config.identity_max_features,
                 identity_template_memory_enable=self.config.identity_template_memory_enable,
                 identity_template_crosscheck_enable=self.config.identity_template_crosscheck_enable,
+                identity_appearance_region_safety_enable=self.config.identity_appearance_region_safety_enable,
                 identity_template_recent_sec=self.config.identity_template_recent_sec,
                 identity_template_archive_sec=self.config.identity_template_archive_sec,
                 identity_max_weak_features=self.config.identity_max_weak_features,
@@ -797,6 +805,7 @@ class RKNNVisionPipeline:
                 identity_preferred_search_reacquire_side_ratio=self.config.identity_preferred_search_reacquire_side_ratio,
                 identity_partial_appearance_enable=self.config.identity_partial_appearance_enable,
                 identity_partial_match_threshold=self.config.identity_partial_match_threshold,
+                identity_partial_confirm_threshold=self.config.identity_partial_confirm_threshold,
                 identity_partial_max_features=self.config.identity_partial_max_features,
                 identity_partial_update_threshold=self.config.identity_partial_update_threshold,
                 identity_duplicate_box_suppression_enable=self.config.identity_duplicate_box_suppression_enable,
@@ -860,6 +869,12 @@ class RKNNVisionPipeline:
                 ("area", area, float(getattr(self.config, "identity_min_area", 0.0))),
             )
             reasons = [f"{name}<{limit:g}" for name, value, limit in limits if value < limit]
+            shape_reason = lower_compact_bbox_reason(
+                detection.bbox, getattr(self, "last_frame_width", None),
+                getattr(self, "last_frame_height", None),
+            )
+            if shape_reason:
+                reasons.append(shape_reason)
             if not reasons:
                 accepted.append(detection)
                 continue
@@ -924,6 +939,7 @@ class RKNNVisionPipeline:
         else:
             probe_persons = raw_probe_persons
             cluster_diagnostics = ()
+        probe_persons = tuple(self._follow_size_candidates(probe_persons, source="probe_cluster"))
         self.last_search_probe_clusters = list(probe_persons)
         self.last_search_probe_cluster_diagnostics = tuple(cluster_diagnostics)
         self.last_search_candidate_evidence = SearchCandidateEvidence(
@@ -1009,7 +1025,13 @@ class RKNNVisionPipeline:
         )
         if len(partial_feature_sources) != len(persons):
             partial_feature_sources = [None for _ in persons]
+        color_features = getattr(self.reid, "last_color_features", None)
+        if color_features is not None and len(color_features) != len(persons):
+            color_features = None
         reid_end = time.perf_counter()
+        # Legacy extractors have no independent color evidence. Omitting the
+        # optional argument also preserves older tracker adapters in that case.
+        color_kwargs = {} if color_features is None else {"color_features": color_features}
         records = self.tracker.update(
             persons,
             features,
@@ -1017,6 +1039,7 @@ class RKNNVisionPipeline:
             partial_feature_sources=partial_feature_sources,
             image_width=width, image_height=height,
             frame_context=self._frame_context,
+            **color_kwargs,
         )
         tracker_end = time.perf_counter()
         yolo_timing = self.detector.last_timing_ms

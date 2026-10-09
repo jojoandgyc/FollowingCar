@@ -1,13 +1,12 @@
 # RKNN model files
 
-Put RK3588 `.rknn` models here:
+The default follow runtime uses these included RK3588 models:
 
-- `yolo11s.rknn`: person detector, converted for target `rk3588`.
-- `deepsort.rknn`: person ReID embedding model from the working RK3588
-  DeepSORT reference project.
+- `yolo11n_int8_person_val2017.rknn`: person detector.
+- `osnet_x0_25_msmt17_b1.rknn`: person ReID embedding model.
 
-The runtime code does not open a camera.  It accepts external BGR/RGB frames and
-runs YOLO11 + optional ReID embedding + tracking.
+The main follow runtime opens the camera and runs YOLO11 + ReID + tracking.
+The vision pipeline can also process frames supplied by another caller.
 
 Source ONNX/PT files are downloaded to `models/source/` and ignored by Git:
 
@@ -20,8 +19,9 @@ Source ONNX/PT files are downloaded to `models/source/` and ignored by Git:
 
 YOLO11n uses the URL from Rockchip `rknn_model_zoo/examples/yolo11`; the same
 example is present in the local `rknn_model_zoo-v2.3.2-2025-04-09.tgz` package.
-For the default YOLO11s model, download/export an ONNX from Ultralytics weights
-and convert it with RKNN-Toolkit2.
+To experiment with a YOLO11s model, download/export an ONNX from Ultralytics
+weights and convert it with RKNN-Toolkit2. This does not replace the default
+YOLO11n model.
 
 ```powershell
 .\scripts\download_yolo11_pt.ps1 -Variant s
@@ -29,9 +29,8 @@ and convert it with RKNN-Toolkit2.
 .\scripts\convert_yolo11_rknn.ps1 -Variant s -DType fp
 ```
 
-The legacy OSNet download script is kept only as a fallback. For this RK3588
-runtime, prefer the board-provided `deepsort.rknn` ReID model unless we decide
-to retrain or reconvert a different embedding network.
+The OSNet download and conversion scripts below are optional experiments; the
+checked-in OSNet x0_25 RKNN file is the default ReID model for this branch.
 
 To test the public OSNet x0_25 MSMT17 ONNX fallback:
 

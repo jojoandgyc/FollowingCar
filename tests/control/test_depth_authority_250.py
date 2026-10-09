@@ -27,10 +27,16 @@ def authority(setup, owner, monkeypatch):
     owner._follow_controller = controller
     owner._lateral_yaw_revision = 1
     controller._live_longitudinal_authority_reader = owner._fresh_depth_linear_snapshot
-    return SimpleNamespace(clock=clock, controller=controller, frame=frame, owner=owner)
+    a = SimpleNamespace(clock=clock, controller=controller, frame=frame, owner=owner,
+                        feedback=None)
+    owner._action_runtime = SimpleNamespace(get_steering_feedback=lambda: a.feedback)
+    return a
 
 
 def decide_commit(a, current, *, fresh=True):
+    # The real feedback worker publishes independently of Depth. Keep a
+    # separate cache instead of treating feedback inside an old frame as live.
+    a.feedback = current.steering_feedback
     decision = a.controller.decide(10, current, longitudinal_only=True)
     actions, accepted = a.owner._commit_depth_linear_decision(
         decision, current, a.controller.active_target_id, is_fresh_depth=fresh,
@@ -43,6 +49,11 @@ def advance(a, now):
     # The extension does not relax visual freshness: RGB continues to report
     # the same visible identity while physical Depth is delayed.
     a.owner._last_vision_control_ts = now - .01
+    # Simulate one NEW encoder report at the same speed while Depth is delayed.
+    # An explicitly absent cache remains absent; tests can also advance only
+    # clock.now to exercise stale feedback without this fresh-report helper.
+    if a.feedback is not None:
+        a.feedback = replace(a.feedback, timestamp=now)
 
 
 def seed(a, *, distance=2.5, rpm=40.0):
@@ -225,6 +236,24 @@ def test_extended_depth_grant_does_not_extend_visual_freshness(authority):
     assert a.owner._depth30_linear_timing.depth_expires_at == pytest.approx(stamp + .25)
 
 
+def test_extension_still_requires_current_encoder_cache(authority):
+    a = authority
+    stamp, _ = seed(a)
+    a.feedback = None
+    advance(a, stamp + .210)
+    assert a.feedback is None
+    assert a.owner._fresh_depth_linear_snapshot(1) is None
+
+
+def test_original_frame_feedback_is_not_a_current_encoder_report(authority):
+    a = authority
+    stamp, _ = seed(a)
+    a.clock.now = stamp + .210
+    a.owner._last_vision_control_ts = a.clock.now - .01
+    assert a.feedback.timestamp == stamp
+    assert a.owner._fresh_depth_linear_snapshot(1) is None
+
+
 def test_reverse_authority_still_expires_at_180ms(authority, setup):
     a = authority
     _, a.controller, _ = configured(
@@ -276,6 +305,10 @@ def test_aged_decision_can_reduce_but_not_accelerate_old_grant(authority):
 class FakeBackend:
     def __init__(self):
         self.pairs = []
+        self.normal_zero_hold = False
+
+    def prepare_speed_mode(self):
+        pass  # No hardware mode or parking current in this timing-only fake.
 
     def wheel_raw_state_to_target(self, wheel, rpm, state):
         return rpm if wheel == "left" else -rpm
@@ -299,6 +332,7 @@ def writer(a):
         hard_stop_check=lambda _: False,
     )
     action.get_steering_feedback = lambda: a.frame(2.5, rpm=40).steering_feedback
+    a.owner._action_runtime = action
     return action, backend
 
 

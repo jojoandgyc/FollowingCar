@@ -28,8 +28,13 @@ Convert the default YOLO11s model with the RKNN-Toolkit2 2.3.2 Docker image:
 
 ## Syntax and logic checks
 
+The default pytest suite is hardware-free, including the reviewed legacy scripts
+through an explicit subprocess allowlist. It does not run the launcher or live
+motor/IIO utilities. `pytest.ini` restricts default discovery to `tests/`.
+
 ```bash
-python3 -m compileall rk_vision request_0428_modular.py car_control_modular tools tests
+python3 -m pytest -q
+python3 -m compileall rk_vision request_0513_modular.py car_control_modular tools tests
 python3 tests/config/test_rk3588_runtime_config.py car_control_modular/config/reid_runtime.ini
 python3 tests/control/test_controller_logic.py
 python3 tests/vision/test_deepsort_tracker.py
@@ -52,7 +57,7 @@ python3 tools/rknn_image_smoke.py test.jpg \
 
 ```python
 import cv2
-from request_0428_modular import PersonTracker
+from request_0513_modular import PersonTracker
 
 tracker = PersonTracker()
 frame = cv2.imread("test.jpg")  # BGR HxWx3 uint8

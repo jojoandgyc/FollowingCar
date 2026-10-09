@@ -279,7 +279,7 @@ def test_runtime_allows_requested_profile_correction_not_legacy_twenty(monkeypat
     assert cap(45)==40
 
 
-def test_config_wires_profile_with_shared_grant_ttl_and_unchanged_target(monkeypatch):
+def test_config_wires_profile_with_shared_grant_ttl_and_current_target(monkeypatch):
     env={};monkeypatch.setattr(os,'environ',env)
     config=Path(__file__).resolve().parents[2]/'car_control_modular/config/reid_runtime.ini'
     load_config_to_env(str(config))
@@ -288,5 +288,5 @@ def test_config_wires_profile_with_shared_grant_ttl_and_unchanged_target(monkeyp
     assert float(env['DISTANCE_APPROACH_DECELERATION_M_S2'])==.4
     assert float(env['DISTANCE_APPROACH_MAX_CATCHUP_M_S'])==.6
     assert float(env['DISTANCE_APPROACH_RESPONSE_DELAY_SEC'])==.2
-    assert float(env['TARGET_DISTANCE'])==1.5
+    assert float(env['TARGET_DISTANCE'])==1.4
     assert float(env['ASTRA_DEPTH_LONGITUDINAL_SAMPLE_MAX_AGE_SEC'])==.25

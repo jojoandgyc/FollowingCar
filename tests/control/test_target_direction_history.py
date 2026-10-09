@@ -133,7 +133,8 @@ def test_visible_exit_trace_survives_delayed_search_service() -> None:
     assert decision.missing_frames == 60
 
 
-def test_low_quality_geometry_still_establishes_exit_direction() -> None:
+def test_low_quality_geometry_still_establishes_exit_direction(monkeypatch) -> None:
+    _sync_capture_clock(monkeypatch)
     controller = FollowSafetyController(
         FollowPolicyConfig(
             direction_history_enable=True,
@@ -176,7 +177,21 @@ def _frame(capture_id: int, person: PersonTarget | None) -> SensorFrame:
     )
 
 
-def test_controller_freezes_search_direction_from_capture_timeline() -> None:
+def _sync_capture_clock(monkeypatch) -> None:
+    """Replay processing time in the same timebase as synthetic captures."""
+    clock = [0.01]
+    original = _frame
+
+    def timed_frame(capture_id, person):
+        clock[0] = float(capture_id) / 15.0 + 0.01
+        return original(capture_id, person)
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setitem(globals(), "_frame", timed_frame)
+
+
+def test_controller_freezes_search_direction_from_capture_timeline(monkeypatch) -> None:
+    _sync_capture_clock(monkeypatch)
     controller = FollowSafetyController(
         FollowPolicyConfig(
             direction_history_enable=True,
@@ -205,7 +220,8 @@ def test_controller_freezes_search_direction_from_capture_timeline() -> None:
     assert controller.search_status().hint_source == "capture_timeline_exit_side"
 
 
-def test_unverified_direction_classifier_cannot_replace_last_target_side() -> None:
+def test_unverified_direction_classifier_cannot_replace_last_target_side(monkeypatch) -> None:
+    _sync_capture_clock(monkeypatch)
     controller = FollowSafetyController(
         FollowPolicyConfig(
             direction_history_enable=True,
@@ -239,7 +255,8 @@ def test_unverified_direction_classifier_cannot_replace_last_target_side() -> No
     assert controller.search_direction == "left"
 
 
-def test_controller_searches_side_after_reversed_edge_history() -> None:
+def test_controller_searches_side_after_reversed_edge_history(monkeypatch) -> None:
+    _sync_capture_clock(monkeypatch)
     controller = FollowSafetyController(
         FollowPolicyConfig(
             direction_history_enable=True,
@@ -263,7 +280,8 @@ def test_controller_searches_side_after_reversed_edge_history() -> None:
     assert controller.search_status().hint_source == "capture_timeline_exit_side"
 
 
-def test_stale_gap_promotes_strong_capture_history_after_fresh_missing_confirm() -> None:
+def test_stale_gap_promotes_strong_capture_history_after_fresh_missing_confirm(monkeypatch) -> None:
+    _sync_capture_clock(monkeypatch)
     controller = FollowSafetyController(
         FollowPolicyConfig(
             direction_history_enable=True,

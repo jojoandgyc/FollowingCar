@@ -35,6 +35,10 @@ from .steering_pid import (
     VisualSteeringPidResult,
 )
 from .target_direction_history import TargetDirectionHistory
+from .visual_steering_evidence import CaptureSteeringEvidence
+from .steering_limits import effective_correction_limit
+from .predictive_turn_brake import qualified_countersteer, MAX_PULSE_SEC
+from .outward_trajectory import make_outward_lead, apply_outward_lead
 from .longitudinal_approach import (
     ApproachConfig, RawDepthClosingWindow, closure_rotation_bound, bounded_encoder_fallback,
 )
@@ -323,6 +327,8 @@ class FollowPolicyConfig:
     # instead of entering the lost-target rotation/search state machine.
     exit_on_target_loss: bool = False
     initial_target_confirm_frames: int = 1
+    # A startup lock uses current visual evidence, never a delayed/replayed UID.
+    initial_target_max_age_sec: float = 0.25
     release_target_on_lost: bool = True
     side_ir_blocks_rotation: bool = True
     search_rotate_front_block_enable: bool = True
@@ -348,6 +354,7 @@ class FollowPolicyConfig:
     distance_pi_memory_sec: float = 0.35
     distance_pi_motion_memory_sec: float = 0.0
     distance_pi_launch_request_rpm: float = 0.0
+    distance_pi_launch_full_error_m: float = 0.0
     # Forward authority only; measurement/PI/velocity updates stay at180ms.
     depth_longitudinal_sample_max_age_sec: float = 0.18
     distance_approach_enable: bool = False
@@ -391,6 +398,14 @@ class FollowPolicyConfig:
     visible_motion_strong_ratio: float = 0.05
     visible_steering_pid_enable: bool = False
     visible_steering_pid_forward_tracking_enable: bool = False
+    visible_steering_pid_image_error_only: bool = False
+    visible_steering_pid_execution_response_trial_sec: float = 0.0
+    visible_steering_pid_image_brake_assist: bool = False
+    visible_steering_pid_image_capture_motion: bool = False
+    visible_steering_pid_image_motion_response_sec: float = 0.18
+    visible_steering_pid_image_slow_brake_continuity_sec: float = 0.0
+    visible_steering_pid_outward_lead_enable: bool = False
+    visible_steering_pid_image_center_release_margin_deg: float = 1.8
     visible_steering_pid_camera_hfov_deg: float = 90.0
     visible_steering_pid_camera_latency_sec: float = 0.13
     visible_steering_pid_deadband_deg: float = 1.2
@@ -422,6 +437,10 @@ class FollowPolicyConfig:
     visible_steering_pid_predictive_brake_decel_dps2: float = 0.0
     visible_steering_pid_predictive_brake_margin_deg: float = 0.0
     visible_steering_pid_predictive_brake_response_sec: float = 0.0
+    visible_steering_pid_predictive_countersteer_max_correction_rpm: float = 0.0
+    visible_steering_pid_predictive_countersteer_min_correction_rpm: float = 0.0
+    visible_steering_pid_predictive_countersteer_gain_rpm_per_dps: float = 0.10
+    visible_steering_pid_predictive_countersteer_min_yaw_rate_dps: float = 8.0
     visible_steering_pid_min_effective_error_deg: float = 0.0
     visible_steering_pid_min_effective_correction_rpm: float = 0.0
     visible_steering_pid_mechanical_tier2_error_deg: float = 0.0
@@ -513,6 +532,8 @@ class FollowSafetyController:
         self._candidate_center_missing_frames = 0
         self._initial_candidate_id: Optional[int] = None
         self._initial_candidate_frames = 0
+        self._initial_candidate_capture: Optional[Tuple[int, float]] = None
+        self._initial_candidate_frame_index: Optional[int] = None
         self._last_target_distance_m: Optional[float] = None
         self._last_target_distance_at: Optional[float] = None
         self._last_mmwave_motion_speed_percent: Optional[int] = None
@@ -548,6 +569,7 @@ class FollowSafetyController:
                     retain_integral_sec=cfg.distance_pi_memory_sec,
                     motion_memory_sec=cfg.distance_pi_motion_memory_sec,
                     launch_request_rpm=cfg.distance_pi_launch_request_rpm,
+                    launch_full_error_m=cfg.distance_pi_launch_full_error_m,
                     physical_ttl_sec=cfg.depth_longitudinal_sample_max_age_sec,
                     wheel_circumference_m=cfg.distance_feedforward_wheel_circumference_m,
                     deceleration_m_s2=cfg.distance_approach_deceleration_m_s2,
@@ -561,12 +583,14 @@ class FollowSafetyController:
                 "distance_control_mode mode=distance_pi kp_per_sec=%.3f ki_per_sec2=%.3f "
                 "integral_max_m_s=%.3f memory_ms=%.0f matching_output=False "
                 "matching_diagnostics=True depth_ttl_ms=%.0f fresh_update_ms=180 recovery_policy=unified "
-                "deceleration_assumed=True launch_request_rpm=%.1f motion_memory_ms=%.0f",
+                "deceleration_assumed=True launch_request_rpm=%.1f motion_memory_ms=%.0f "
+                "launch_full_error_m=%.3f",
                 cfg.distance_pi_kp_per_sec, cfg.distance_pi_ki_per_sec2,
                 cfg.distance_pi_integral_max_m_s, 1000 * cfg.distance_pi_memory_sec,
                 1000 * cfg.depth_longitudinal_sample_max_age_sec,
                 cfg.distance_pi_launch_request_rpm,
                 cfg.distance_pi_motion_memory_sec*1000.,
+                cfg.distance_pi_launch_full_error_m,
             )
         elif cfg.distance_approach_enable:
             logger.info(
@@ -599,6 +623,8 @@ class FollowSafetyController:
         self._distance_pi_feedback_timestamp = None
         self._distance_pi_pause_key = None
         self._live_longitudinal_authority_reader = None
+        self._longitudinal_execution_reader = None
+        self._distance_pi_execution_anchor_proof = None
         self._distance_pid_last_sample_timestamp: Optional[float] = None
         self._distance_pid_last_forward_control = True
         self._longitudinal_motion_uid: Optional[int] = None
@@ -697,6 +723,13 @@ class FollowSafetyController:
         self._depth_recovery_pending_gap = False
         steering_pid_config = VisualSteeringPidConfig(
                 enabled=bool(cfg.visible_steering_pid_enable),
+                image_error_only=bool(cfg.visible_steering_pid_image_error_only),
+                image_brake_assist=bool(cfg.visible_steering_pid_image_brake_assist),
+                image_capture_motion=bool(cfg.visible_steering_pid_image_capture_motion),
+                image_motion_response_sec=float(cfg.visible_steering_pid_image_motion_response_sec),
+                execution_response_trial_sec=float(cfg.visible_steering_pid_execution_response_trial_sec),
+                image_slow_brake_continuity_sec=float(cfg.visible_steering_pid_image_slow_brake_continuity_sec),
+                image_center_release_margin_deg=float(cfg.visible_steering_pid_image_center_release_margin_deg),
                 camera_hfov_deg=float(cfg.visible_steering_pid_camera_hfov_deg),
                 camera_latency_sec=float(cfg.visible_steering_pid_camera_latency_sec),
                 deadband_deg=float(cfg.visible_steering_pid_deadband_deg),
@@ -760,6 +793,18 @@ class FollowSafetyController:
                 predictive_brake_response_sec=float(
                     cfg.visible_steering_pid_predictive_brake_response_sec
                 ),
+                predictive_countersteer_max_correction_rpm=float(
+                    cfg.visible_steering_pid_predictive_countersteer_max_correction_rpm
+                ),
+                predictive_countersteer_min_correction_rpm=float(
+                    cfg.visible_steering_pid_predictive_countersteer_min_correction_rpm
+                ),
+                predictive_countersteer_gain_rpm_per_dps=float(
+                    cfg.visible_steering_pid_predictive_countersteer_gain_rpm_per_dps
+                ),
+                predictive_countersteer_min_yaw_rate_dps=float(
+                    cfg.visible_steering_pid_predictive_countersteer_min_yaw_rate_dps
+                ),
                 min_effective_error_deg=float(
                     cfg.visible_steering_pid_min_effective_error_deg
                 ),
@@ -818,7 +863,37 @@ class FollowSafetyController:
                 ),
         )
         self._visual_steering_pid = VisualSteeringPid(steering_pid_config)
-        self._parked_recenter_pid = VisualSteeringPid(steering_pid_config)
+        # Pivot-only trial: include command dispatch/current-mode transition
+        # and residual stopping response; normal forward steering is unchanged.
+        self._parked_recenter_pid = VisualSteeringPid(replace(steering_pid_config,
+            predictive_brake_response_sec=max(.10, steering_pid_config.predictive_brake_response_sec),
+            image_motion_response_sec=max(.25, steering_pid_config.image_motion_response_sec),
+            predictive_countersteer_response_sec=(MAX_PULSE_SEC
+                if steering_pid_config.predictive_countersteer_max_correction_rpm > 0 else 0.0),
+            image_brake_latency_max_sec=.5) if steering_pid_config.image_brake_assist else steering_pid_config)
+        logger.info("pivot_braking_config max_rpm=%.1f response_ms=%.1f image_response_ms=%.1f latency_cap_ms=%.1f",
+            cfg.near_distance_rotation_only_max_rpm,
+            self._parked_recenter_pid.config.predictive_brake_response_sec*1000,
+            self._parked_recenter_pid.config.image_motion_response_sec*1000,
+            self._parked_recenter_pid.config.image_brake_latency_max_sec*1000)
+        logger.info(
+            "steering_control_config mode=%s deadband_deg=%.2f small_error_deg=%.2f "
+            "large_error_deg=%.2f small_correction_rpm=%.1f max_correction_rpm=%.1f "
+            "wheel_reversal_guard=independent depth_safety=unchanged image_brake_assist=%s center_release_margin_deg=%.2f "
+            "image_capture_motion=%s image_motion_response_ms=%.1f "
+            "camera_hfov_deg=%.1f slow_brake_continuity_ms=%.1f "
+            "correction_units=per_wheel max_wheel_diff_rpm=%.1f",
+            "image_error_only" if steering_pid_config.image_error_only else "yaw_cascade",
+            steering_pid_config.deadband_deg, steering_pid_config.dynamic_small_error_deg,
+            steering_pid_config.dynamic_large_error_deg,
+            steering_pid_config.dynamic_small_max_correction_rpm,
+            steering_pid_config.max_correction_rpm,
+            steering_pid_config.image_brake_assist, steering_pid_config.image_center_release_margin_deg,
+            steering_pid_config.image_capture_motion, steering_pid_config.image_motion_response_sec*1000,
+            steering_pid_config.camera_hfov_deg,
+            steering_pid_config.image_slow_brake_continuity_sec*1000,
+            2 * steering_pid_config.max_correction_rpm,
+        )
         self.last_steering_pid_result: Optional[VisualSteeringPidResult] = None
 
     def set_last_dispatched(self, action_kind: Optional[str]) -> None:
@@ -853,6 +928,8 @@ class FollowSafetyController:
         if self._direction_latest_visible_capture_id >= int(hint.get("last_capture_frame_id", 0)):
             return "newer_target_visible"
         stamp = float(hint.get("evidence_timestamp", 0.0))
+        if stamp <= self._target_direction_history.not_before_timestamp:
+            return "before_search_brake"
         age = time.monotonic() - stamp
         if (
             not math.isfinite(age) or stamp <= 0.0
@@ -1042,6 +1119,27 @@ class FollowSafetyController:
         self.invalidate_pre_brake_steering()
         return True
 
+    def retire_pre_search_brake_direction(self, sent_at: float) -> None:
+        """Retire old motion provenance, without granting identity or movement."""
+        self._target_direction_history.discard_through(sent_at)
+        self.clear_historical_direction_hint("search_brake_completed")
+        self.invalidate_pre_brake_steering()
+        self.search_state, self.search_direction = "none", None
+        self._lost_exit_direction = None
+        self._lost_hint_source, self._lost_hint_confidence = "post_search_brake", 0.0
+        self._lost_started_at = None
+        self.lost_confirm_frames = 0
+        self._direction_loss_capture_id = None
+        self._reset_search_timeout()
+        self._reset_stale_direction_recovery("post_search_brake")
+        visible = self._target_direction_history.latest_visible_evidence()
+        self.last_person_center_x = None
+        if visible is not None and visible.bbox is not None:
+            self.last_person_center_x = (visible.bbox[0] + visible.bbox[2]) / 2
+        logger.info("search_brake_direction_retired stop_sent_ts=%.6f latest_post_stop_cap=%s "
+                    "identity_claim=False motion_authorized=False", sent_at,
+                    None if visible is None else visible.capture_frame_id)
+
     def _record_target_direction_evidence(
         self,
         frame: SensorFrame,
@@ -1049,7 +1147,8 @@ class FollowSafetyController:
         *,
         reliable: bool,
     ) -> None:
-        if not self.cfg.direction_history_enable or int(frame.capture_frame_id) <= 0:
+        if (not self.cfg.direction_history_enable or int(frame.capture_frame_id) <= 0
+                or frame.capture_timestamp <= self._target_direction_history.not_before_timestamp):
             return
         if target is not None:
             # Only main-path, target-owned observations reach this method;
@@ -1595,6 +1694,9 @@ class FollowSafetyController:
 
     def clear_active_target(self, reason: str = "manual") -> None:
         old_target_id = self.active_target_id
+        self.clear_post_park_recenter("active_target_cleared")
+        self._capture_steering_evidence = None
+        self.last_capture_steering_observation = None
         self.active_target_id = None
         self.last_selected_target = None
         self._has_seen_person = False
@@ -1648,6 +1750,8 @@ class FollowSafetyController:
     def _reset_initial_target_confirm(self) -> None:
         self._initial_candidate_id = None
         self._initial_candidate_frames = 0
+        self._initial_candidate_capture = None
+        self._initial_candidate_frame_index = None
 
     def _reset_reverse_control(self, reason: str, *, keep_last_distance: bool = False) -> None:
         was_active = bool(self._reverse_active)
@@ -1704,6 +1808,8 @@ class FollowSafetyController:
         return self.distance_pi_enabled or self.cfg.distance_approach_enable
 
     def _reset_longitudinal_motion(self) -> None:
+        self._closure_rotation_gap = None
+        self._distance_pi_memory_rotation_bound = .25
         if self.distance_pi_enabled:
             self._reset_distance_pid()
             self._distance_pi_ego_forward_rpm = None
@@ -1837,13 +1943,23 @@ class FollowSafetyController:
     def _observe_distance_closure(self, frame, target, uid, stamp, now, trusted):
         """Distance/braking evidence independent of target-speed eligibility."""
         w, fb = self._raw_closing_window, frame.steering_feedback
-        def reject_geometry(reason):
-            key = (uid, stamp, reason)
+        def reject_geometry(reason, *, detail=None, geometry_age=None, bearing=None,
+                            yaw=None, projected_bearing=None, rotation_uncertainty=None):
+            self._closure_rotation_gap = None
+            self._distance_pi_memory_rotation_bound = .25
+            key = (uid, stamp, reason, detail)
             if key != self._closure_reject_log_key:
                 logger.info(
                     'distance_closure_rejected capture_frame_id=%s uid=%s sample_ts=%s '
-                    'reason=%s prior_samples=%s fallback=encoder_bound deadline_renewed=False',
-                    frame.capture_frame_id, uid, stamp, reason, len(w.samples))
+                    'reason=%s detail=%s prior_samples=%s retained_sample_ts=%s '
+                    'geometry_age_ms=%s bearing_deg=%s yaw_bound_dps=%s '
+                    'projected_bearing_deg=%s rotation_uncertainty_m_s=%s '
+                    'rotation_uncertainty_limit_m_s=0.25 memory_cleared=True '
+                    'sample_inserted=False fallback=encoder_bound deadline_renewed=False',
+                    frame.capture_frame_id, uid, stamp, reason, detail, len(w.samples),
+                    w.samples[-1][0] if w.samples else None,
+                    None if geometry_age is None else geometry_age*1000., bearing, yaw,
+                    projected_bearing, rotation_uncertainty)
                 self._closure_reject_log_key = key
             w.reset()
             self._distance_pid.invalidate_motion_memory()
@@ -1898,12 +2014,86 @@ class FollowSafetyController:
             depth=raw,bearing_deg=bearing,yaw_dps=yaw,geometry_age=age,
             max_yaw_dps=max_closure_yaw, turning_geometry_max_age_sec=geometry_max_age)
         if bound is None:
-            reject_geometry('rotation_bound_or_geometry_age')
+            # A marginally old ROI is unavailable evidence, not a measured
+            # motion contradiction. Keep the OLD window/PI memory briefly;
+            # do not insert this sample or relabel its closure as fresh.
+            soft_age_gap = bool(
+                self.distance_pi_enabled and .25 < age <= .30
+                and w.uid == uid and w.samples and w.rate is not None
+                and 0 < stamp-w.samples[-1][0] <= .18
+                and 0 <= now-w.samples[-1][0] <= .18
+                and raw is not None and closure_rotation_bound(
+                    depth=raw, bearing_deg=bearing, yaw_dps=yaw, geometry_age=.25,
+                    max_yaw_dps=max_closure_yaw,
+                    turning_geometry_max_age_sec=geometry_max_age) is not None)
+            if soft_age_gap:
+                self._distance_pi_motion_memory_allowed = True
+                logger.info('distance_closure_skipped capture_frame_id=%s uid=%s '
+                            'sample_ts=%s reason=geometry_age_gap geometry_age_ms=%.1f '
+                            'retained_sample_ts=%s memory_remaining_ms=%.1f '
+                            'sample_inserted=False memory_only=True deadline_renewed=False',
+                            frame.capture_frame_id, uid, stamp, age*1000, w.samples[-1][0],
+                            max(0., .18-(now-w.samples[-1][0]))*1000.)
+                return
+            # Keep the existing rejection policy, but distinguish missing/late
+            # evidence from an excessive spatial uncertainty budget. In
+            # particular CAP1192's off-axis rotation is NOT just an ROI age
+            # boundary: retaining its raw endpoints would difference across
+            # an uncompensated turn. These diagnostics never grant motion.
+            projected = abs(bearing)+abs(yaw)*abs(age)
+            uncertainty = (abs(math.radians(yaw))*raw*math.tan(math.radians(projected))
+                           if raw is not None and math.isfinite(raw) and raw > 0
+                           and math.isfinite(projected) and projected < 90 else None)
+            if raw is None or not math.isfinite(raw) or raw <= 0:
+                detail = 'invalid_raw_depth'
+            elif not math.isfinite(age):
+                detail = 'invalid_geometry_timestamp'
+            elif not math.isfinite(bearing):
+                detail = 'invalid_geometry_bearing'
+            elif abs(yaw) > max_closure_yaw:
+                detail = 'yaw_limit'
+            elif not -.02 <= age <= (.25 if abs(yaw) <= 5 else geometry_max_age):
+                detail = 'geometry_age_limit'
+            elif projected > 45:
+                detail = 'projected_bearing_limit'
+            else:
+                detail = 'rotation_uncertainty_limit'
+            # Marginal uncertainty is missing velocity evidence, not proof
+            # that the person stopped. Break the regression (never difference
+            # across this turn), retaining ONLY decaying PI memory for 180ms.
+            # This uses a larger conservative uncertainty penalty and cannot
+            # accelerate, refresh its origin or renew a physical depth grant.
+            origin = (w.samples[-1][0] if w.uid == uid and w.samples and w.rate is not None
+                      else None)
+            held_gap = getattr(self, '_closure_rotation_gap', None)
+            if origin is None and held_gap is not None and held_gap[0] == uid:
+                origin = held_gap[1]
+            if (self.distance_pi_enabled and detail == 'rotation_uncertainty_limit'
+                    and uncertainty is not None and .25 < uncertainty <= .35
+                    and origin is not None and 0 < stamp-origin <= .18
+                    and 0 <= now-origin <= .18):
+                self._closure_rotation_gap = (uid, origin)
+                self._distance_pi_motion_memory_allowed = True
+                self._distance_pi_memory_rotation_bound = .35
+                w.reset()
+                logger.info('distance_closure_skipped capture_frame_id=%s uid=%s '
+                            'sample_ts=%s reason=rotation_uncertainty_gap '
+                            'rotation_uncertainty_m_s=%.4f retained_sample_ts=%s '
+                            'memory_remaining_ms=%.1f window_reset=True memory_cleared=False '
+                            'sample_inserted=False acceleration_allowed=False deadline_renewed=False',
+                            frame.capture_frame_id, uid, stamp, uncertainty, origin,
+                            max(0., .18-(now-origin))*1000.)
+                return
+            reject_geometry('rotation_bound_or_geometry_age', detail=detail,
+                            geometry_age=age, bearing=bearing, yaw=yaw,
+                            projected_bearing=projected, rotation_uncertainty=uncertainty)
             return
         self._closure_reject_log_key = None
         is_new = not w.samples or stamp > w.samples[-1][0]
         rate = w.update(uid=uid,stamp=stamp,raw=raw,rotation=bound)
         if w.samples and w.samples[-1][0] == stamp and rate is not None:
+            self._closure_rotation_gap = None
+            self._distance_pi_memory_rotation_bound = .25
             # Subtract a positive rotation upper bound: conservative closure,
             # not a claim about target world speed or a new identity.
             self._braking_range_rate = rate
@@ -2258,6 +2448,70 @@ class FollowSafetyController:
             logger.info("distance_pi_admission_rejected sample_ts=%s reason=%s deadline_renewed=False",
                         sample_timestamp, reason)
 
+    def set_normal_parking(self, active: bool, uid: int) -> None:
+        """Separate an ordinary parked preview from an executed PI request."""
+        if active:
+            if uid != self.active_target_id:
+                return
+            self._normal_parking_uid = uid
+            self._post_park_recenter_uid = uid
+            self._post_park_recenter_released_at = None
+        elif getattr(self, "_normal_parking_uid", None) == uid:
+            self._normal_parking_uid = None
+            self._post_park_recenter_released_at = time.monotonic()
+        if self.distance_pi_enabled:
+            self._distance_pid.set_normal_parking(
+                getattr(self, "_normal_parking_uid", None) == self.active_target_id
+                and self.active_target_id is not None)
+        logger.info("distance_pi_parking uid=%s active=%s old_authority_restored=False", uid, active)
+
+    def parked_forward_resume_demand_rpm(self, frame: SensorFrame, uid: int) -> float:
+        """Read-only restart intent, NOT a forward grant or acceleration credit.
+
+        A parked tapered PI intentionally has no execution clock, so its
+        slew-limited output can stay zero while its brake-limited demand is
+        positive. Waiting for that output to release parking is a deadlock.
+        Only the exact fresh sample behind this preview may request release;
+        normal motor admission and a new post-release ramp remain separate.
+        """
+        result = self.last_distance_pid_result
+        state = frame.distance_state
+        stamp = state.sample_timestamp
+        if (not self.distance_pi_enabled or uid != self.active_target_id
+                or uid != getattr(self, "_normal_parking_uid", None)
+                or self.search_state != "none" or result is None
+                or result.pi_status != "parked_preview" or result.output_rpm != 0
+                or stamp != self._distance_pid_last_sample_timestamp
+                or not self._distance_pi_frame_qualified(frame, time.monotonic())
+                or state.target_latched
+                or not all(v is not None and math.isfinite(v)
+                           and v > self.cfg.target_distance_m+self.cfg.distance_pid_deadband_m
+                           for v in (frame.distance_m, state.raw_distance_m))):
+            return 0.0
+        # unslewed_output is already bounded by the current braking envelope,
+        # not the raw P/launch demand. Never round a sub-quantum demand upward.
+        limits = (result.unslewed_output_rpm, result.approach_cap_rpm)
+        if not all(v is not None and math.isfinite(v) for v in limits):
+            return 0.0
+        demand = max(0.0, min(limits))
+        return demand if self._forward_percent_for_rpm(int(demand), allow_below_min=True) > 0 else 0.0
+
+    def post_park_recenter_limit(self, uid):
+        """Read-only ceiling, not authority. Also used at the final wheel writer."""
+        if (self.cfg.visible_steering_pid_image_error_only and uid is not None
+                and uid == self.active_target_id
+                and uid == getattr(self, "_post_park_recenter_uid", None)
+                and self.search_state == "none"):
+            return 4.0
+        return None
+
+    def clear_post_park_recenter(self, reason):
+        if getattr(self, "_post_park_recenter_uid", None) is not None:
+            logger.info("post_park_recenter_end uid=%s reason=%s",
+                        self._post_park_recenter_uid, reason)
+        self._post_park_recenter_uid = None
+        self._post_park_recenter_released_at = None
+
     def suspend_longitudinal_authority(self, now: float, reason: str) -> None:
         """An actually revoked grant cannot remain the next acceleration anchor.
 
@@ -2337,6 +2591,8 @@ class FollowSafetyController:
                     or not self._distance_pi_frame_qualified(frame, time.monotonic())
                     or result.measurement_jump_clamped):
                 return None
+            if not self.longitudinal_execution_proof_valid(sample_timestamp, time.monotonic()):
+                return None
             return self._forward_percent_for_rpm(max(0, result.output_rpm), allow_below_min=True)
         if (not self.cfg.distance_pid_enable or result is None
                 or self._distance_pid_last_sample_timestamp != sample_timestamp
@@ -2358,6 +2614,28 @@ class FollowSafetyController:
                         else round(fallback_rpm))
         rpm = max(0, min(result.output_rpm, int(fallback_rpm)))
         return self._forward_percent_for_rpm(rpm, allow_below_min=True)
+
+    def longitudinal_execution_proof_valid(self, sample_timestamp, now):
+        """Recheck continuity provenance at admission, not only calculation."""
+        proof = self._distance_pi_execution_anchor_proof
+        if proof is None or proof[0] != sample_timestamp:
+            return True  # This sample did not borrow a completed-command anchor.
+        anchor = proof[1]
+        reader = self._longitudinal_execution_reader
+        if (callable(reader) and reader(self.active_target_id, anchor.sample_timestamp,
+                                       now) is anchor):
+            return True
+        self.reject_longitudinal_sample(sample_timestamp, "execution_packet_changed_before_admission")
+        logger.info("distance_pi_execution_continuity_veto uid=%s sample_ts=%s "
+                    "reason=packet_changed_before_admission motion_authorized=False",
+                    self.active_target_id, sample_timestamp)
+        return False
+
+    def consume_longitudinal_execution_proof(self, sample_timestamp):
+        """Called only after a new positive grant has actually been admitted."""
+        proof = self._distance_pi_execution_anchor_proof
+        if proof is not None and proof[0] == sample_timestamp:
+            self._distance_pi_execution_anchor_proof = None
 
     def fresh_distance_recovery_percent(self, frame: SensorFrame, sample_timestamp: float,
                                         now: float) -> int:
@@ -2451,6 +2729,10 @@ class FollowSafetyController:
     def _update_distance_pid(self, distance_m: float, *, now: Optional[float] = None,
                              forward_control: bool = True) -> DistancePidResult:
         sample_now = time.monotonic() if now is None else float(now)
+        if self.distance_pi_enabled:
+            self._distance_pid.set_normal_parking(
+                getattr(self, "_normal_parking_uid", None) == self.active_target_id
+                and self.active_target_id is not None)
         physical_stamp = self._distance_pid_sample_timestamp
         if ((self._uses_range_controller and not self._distance_approach_sample_trusted)
                 or (physical_stamp is not None and not 0.0 <= sample_now - physical_stamp <= (
@@ -2493,6 +2775,8 @@ class FollowSafetyController:
             and sample_now - float(self._distance_pid_last_update_at) < 0.005
         ):
             return self.last_distance_pid_result
+        execution_anchor = None
+        self._distance_pi_execution_anchor_proof = None
         if (self.distance_pi_enabled and forward_control
                 and self.last_distance_pid_result is not None
                 and self.last_distance_pid_result.output_rpm > 0
@@ -2503,9 +2787,24 @@ class FollowSafetyController:
             if (live is None or live[0] != "forward" or live[1] <= 0
                     or live[2] != self.active_target_id
                     or live[3] != self._distance_pid_last_sample_timestamp):
-                # Read-time braking/identity vetoes need not have mutated the
-                # canonical tuple. Never continue a ramp solely on its clock.
-                self.suspend_longitudinal_authority(sample_now, "no_live_grant_before_pi")
+                # An OLD lease's 180..250ms continuation veto does not prove
+                # that the executor stopped. Only a recent completed positive
+                # packet can preserve continuity for this NEW fresh sample.
+                # Real revocations/zeros/STOPs and expiry keep the old recovery.
+                reader = self._longitudinal_execution_reader
+                candidate = (reader(self.active_target_id,
+                                    self._distance_pid_last_sample_timestamp, sample_now)
+                             if callable(reader) else None)
+                if (candidate is not None and self._distance_pid.retain_execution_anchor(
+                        candidate.sample_timestamp, candidate.rpm, candidate.sent_at, sample_now)):
+                    execution_anchor = candidate
+                    logger.info("distance_pi_execution_continuity uid=%s old_sample_ts=%s "
+                                "new_sample_ts=%s sent_rpm=%.1f sent_age_ms=%.1f "
+                                "old_authority_restored=False new_measurement_required=True",
+                                self.active_target_id, candidate.sample_timestamp, physical_stamp,
+                                candidate.rpm, (sample_now-candidate.sent_at)*1000.)
+                else:
+                    self.suspend_longitudinal_authority(sample_now, "no_live_grant_before_pi")
         previous_pi_result = self.last_distance_pid_result
         result = self._distance_pid.update(
             float(distance_m),
@@ -2516,6 +2815,7 @@ class FollowSafetyController:
             braking_range_rate_m_s=self._braking_range_rate if self._uses_range_controller else None,
             raw_closure_valid=self._braking_rate_source == "raw_depth_window",
             allow_motion_memory=self._distance_pi_motion_memory_allowed,
+            motion_memory_rotation_bound=getattr(self, '_distance_pi_memory_rotation_bound', .25),
             braking_raw_distance_m=self._distance_pi_raw_distance_m,
             ego_forward_rpm=(self._distance_pi_ego_forward_rpm
                 if self._distance_pi_feedback_timestamp is not None
@@ -2523,6 +2823,20 @@ class FollowSafetyController:
             execution_now=sample_now,
             forward_control=forward_control,
         )
+        if (execution_anchor is not None
+                and self._longitudinal_execution_reader(
+                    self.active_target_id, execution_anchor.sample_timestamp,
+                    time.monotonic()) is not execution_anchor):
+            # STOP/zero or an unrelated write during calculation invalidated
+            # the proof. Do not commit a request based on that obsolete packet.
+            self._distance_pid.reject_output(physical_stamp)
+            self._distance_pid.accept_output_limit(physical_stamp, 0.)
+            result = self._distance_pid.last_result
+            logger.info("distance_pi_execution_continuity_veto uid=%s sample_ts=%s "
+                        "reason=packet_changed_during_pi motion_authorized=False",
+                        self.active_target_id, physical_stamp)
+        elif execution_anchor is not None:
+            self._distance_pi_execution_anchor_proof = (physical_stamp, execution_anchor)
         if (not self.cfg.distance_approach_enable
                 and self._longitudinal_bridge_output_cap is not None and result.tracking_base_rpm > 0):
             cap = max(0, int(self._longitudinal_bridge_output_cap))
@@ -2545,7 +2859,12 @@ class FollowSafetyController:
                 "feedback_ts=%s depth_feedback_skew_ms=%s kp_per_sec=%.3f "
                 "launch_masks_pi=%s brake_limit_loss_rpm=%.2f motion_origin_ts=%s "
                 "motion_uncertainty_m_s=%.3f brake_recovery_limited=%s "
-                "brake_recovery_anchor_rpm=%.2f deadline_renewed=False",
+                "brake_recovery_anchor_rpm=%.2f memory_time_penalty_m_s=%.4f "
+                "memory_rotation_penalty_m_s=%.4f memory_retained_rate_m_s=%s "
+                "memory_endpoint_rate_m_s=%s effective_range_rate_m_s=%.4f "
+                "target_velocity_bound_m_s=%.4f launch_full_error_m=%.3f "
+                "braking_distance_input_m=%.4f brake_settling_limited=%s "
+                "brake_settling_anchor_rpm=%.2f deadline_renewed=False",
                 self.active_target_id, physical_stamp, result.error_m, result.p_rpm,
                 result.i_rpm, result.output_rpm, result.unslewed_output_rpm,
                 result.approach_cap_rpm, result.pi_status, self._braking_rate_source,
@@ -2563,6 +2882,12 @@ class FollowSafetyController:
                 max(0., result.pi_total_demand_rpm-result.approach_cap_rpm),
                 result.pi_motion_origin_ts, result.pi_motion_uncertainty_m_s,
                 result.pi_brake_recovery_limited, result.pi_brake_recovery_anchor_rpm,
+                result.pi_memory_time_penalty_m_s, result.pi_memory_rotation_penalty_m_s,
+                result.pi_memory_retained_rate_m_s, result.pi_memory_endpoint_rate_m_s,
+                result.pi_effective_range_rate_m_s, result.pi_target_velocity_bound_m_s,
+                self.cfg.distance_pi_launch_full_error_m,
+                result.pi_braking_distance_input_m, result.pi_brake_settling_limited,
+                result.pi_brake_settling_anchor_rpm,
             )
             if (previous_pi_result is not None and previous_pi_result.approach_mode == 'distance_pi'
                     and (previous_pi_result.pi_brake_source != result.pi_brake_source
@@ -2627,6 +2952,7 @@ class FollowSafetyController:
 
     def _reset_distance_pid(self) -> None:
         self._distance_pid.reset()
+        self._distance_pi_execution_anchor_proof = None
         self.last_distance_pid_result = None
         self._distance_pid_last_input_m = None
         self._distance_pid_last_update_at = None
@@ -3568,6 +3894,10 @@ class FollowSafetyController:
             )
             if motion_dt_sec <= 0.0:
                 target_image_rate_dps = None
+        # Observation collection must continue even when the motor is parked.
+        # Previously the settling branch skipped the only capture-rate sampler.
+        capture_observation = self._capture_steering_observation(target, frame, now)
+        outward_lead = self._outward_trajectory_lead(capture_observation, now) if target_steerable else None
         settling = self._near_settle_hold_active(
             target,
             frame,
@@ -3575,6 +3905,9 @@ class FollowSafetyController:
             motion_dx_ratio=motion_dx_ratio,
             target_image_rate_dps=target_image_rate_dps,
         )
+        if outward_lead is not None:
+            settling = False  # Runtime still owns actual NORMAL release.
+            self._near_settle_until = 0.0
         soft_zero_hold = False
         near_yaw_park_requested = False
         park_reason = "none"
@@ -3604,6 +3937,7 @@ class FollowSafetyController:
                     else 0.0
                 ),
                 near_distance_mode=True,
+                allow_outward_lead=target_steerable,
             )
         # A zero PID result is an intentional coast/brake decision when the
         # measured yaw rate is already sufficient. Do not replace it with the
@@ -4321,14 +4655,86 @@ class FollowSafetyController:
             reason="search_revolution_complete",
         )
 
-    def _confirm_initial_target(self, target: PersonTarget, frame_index: int) -> bool:
+    def _initial_capture_is_fresh(self, frame: SensorFrame, now: float) -> bool:
+        cap = getattr(frame, "capture_frame_id", 0)
+        stamp = getattr(frame, "capture_timestamp", 0.0)
+        # Legacy in-process callers without capture provenance can confirm by
+        # distinct control-frame indexes. A partially supplied capture is not
+        # that legacy interface and must not silently fall back to it.
+        if cap == 0 and stamp == 0.0:
+            return True
+        return bool(
+            isinstance(cap, int) and not isinstance(cap, bool) and cap > 0
+            and isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            and math.isfinite(stamp) and stamp > 0.0
+            and 0.0 <= now - stamp <= max(0.0, self.cfg.initial_target_max_age_sec)
+        )
+
+    def _initial_stopped_hold(self, reason: str) -> ControlDecision:
+        """No identity yet: clear every motion path without releasing candidate."""
+        self.lost_confirm_frames = 0
+        self.search_state = "none"
+        self.search_direction = None
+        self._lost_started_at = None
+        self._lost_exit_direction = None
+        self._reset_search_timeout()
+        self._reset_longitudinal_motion()
+        self._reset_visible_steer_memory()
+        self._visual_steering_pid.reset()
+        self._parked_recenter_pid.reset()
+        self._reset_distance_pid()
+        self.last_steering_pid_result = None
+        return ControlDecision(
+            actions=[ControlAction.stop(reason, brake_hold=False)],
+            soft_stop_requested=True,
+            clear_action_queue=True,
+            stop_action_execution=True,
+            waiting_lost_confirm=self._initial_candidate_id is not None,
+            reason=reason,
+        )
+
+    def _confirm_initial_target(
+        self, target: PersonTarget, frame_index: int, frame: SensorFrame
+    ) -> bool:
         confirm_frames = max(1, int(self.cfg.initial_target_confirm_frames))
         target_id = int(target.track_id)
-        if self._initial_candidate_id == target_id:
-            self._initial_candidate_frames += 1
-        else:
+        if self._initial_candidate_id is None:
             self._initial_candidate_id = target_id
-            self._initial_candidate_frames = 1
+        elif self._initial_candidate_id != target_id:
+            return False
+
+        cap, stamp = frame.capture_frame_id, frame.capture_timestamp
+        if cap > 0 and stamp > 0.0:
+            previous = self._initial_candidate_capture
+            if previous is not None:
+                if cap <= previous[0] or stamp <= previous[1]:
+                    return False
+                if stamp - previous[1] > 0.35:
+                    self._initial_candidate_frames = 0
+            self._initial_candidate_capture = (cap, stamp)
+        else:
+            if (
+                self._initial_candidate_frame_index is not None
+                and frame_index <= self._initial_candidate_frame_index
+            ):
+                return False
+            if self._initial_candidate_capture is not None:
+                return False
+        self._initial_candidate_frame_index = frame_index
+
+        # Vision has already done the unique first-candidate enrollment using
+        # new captures, appearance, and geometry. Do not repeat that delay here.
+        if bool(getattr(target, "initial_identity_confirmed", False)):
+            if not (cap > 0 and stamp > 0.0):
+                return False
+            logger.info(
+                "initial_target_confirmed frame=%d capture=%d candidate=%d source=identity_enrollment",
+                frame_index, cap, target_id,
+            )
+            self._reset_initial_target_confirm()
+            return True
+
+        self._initial_candidate_frames += 1
 
         if self._initial_candidate_frames < confirm_frames:
             logger.info(
@@ -5700,6 +6106,8 @@ class FollowSafetyController:
         only the distance-driven longitudinal branch is blocked.
         """
         state = frame.distance_state
+        if str(getattr(state, "source", "")) == "cropped_depth_observation":
+            return True
         if str(getattr(state, "source", "")) != "vision_depth":
             return False
         detail = str(getattr(state, "source_detail", "")).lower()
@@ -6456,11 +6864,22 @@ class FollowSafetyController:
             return ControlAction.steer_left(base_speed, inner_ratio, outer_ratio, reason)
         return ControlAction.steer_right(base_speed, inner_ratio, outer_ratio, reason)
 
+    def _forward_brake_result(self, result, feedback):
+        """Certificate for bounded forward differential braking, not a pivot."""
+        if (self.cfg.visible_steering_pid_execution_response_trial_sec > 0
+                and self.cfg.visible_steering_pid_image_error_only
+                and result.base_rpm > abs(result.correction_rpm)
+                and feedback is not None and feedback.trustworthy
+                and min(feedback.left_forward_rpm, feedback.right_forward_rpm) >= 0):
+            return result
+        return None
+
     def _pid_direction_guard_reason(
         self,
         current_x_ratio: float,
         motion_dx_ratio: float,
         correction_rpm: int,
+        *, braking_result=None,
     ) -> Optional[str]:
         """Block powered yaw away from the target's current visual side."""
         correction = int(correction_rpm)
@@ -6471,6 +6890,11 @@ class FollowSafetyController:
         correction_side = 1 if correction > 0 else -1
         if target_side == correction_side:
             return None
+
+        if qualified_countersteer(
+                braking_result, current_x_ratio,
+                self.cfg.visible_steering_pid_predictive_countersteer_max_correction_rpm):
+            return None  # Only parked callers supply certified brake evidence.
 
         return "target_still_outside_center"
 
@@ -6505,11 +6929,21 @@ class FollowSafetyController:
         near_distance_mode: bool = False,
         hold_zero: bool = False,
         allow_forward_tracking: bool = True,
+        braking_image_rate_dps: Optional[float] = None,
+        outward_continuity_rate_dps: Optional[float] = None,
     ) -> VisualSteeringPidResult:
         """Apply the same yaw constraints on camera and encoder refresh ticks."""
         disable_rate_feedforward = bool(
             near_distance_mode and self.cfg.near_distance_disable_rate_feedforward
         )
+        max_correction_rpm = effective_correction_limit(
+            self.cfg, base_rpm, near_distance=near_distance_mode,
+            policy_limit=max_correction_rpm)
+        recenter_limit = (self.post_park_recenter_limit(self.active_target_id)
+                          if pid is self._parked_recenter_pid else None)
+        if recenter_limit is not None:
+            max_correction_rpm = min(recenter_limit, max_correction_rpm
+                                     if max_correction_rpm is not None else recenter_limit)
         result = pid.update(
             max(0.0, min(1.0, float(x_ratio))),
             max(0, int(base_rpm)),
@@ -6518,6 +6952,10 @@ class FollowSafetyController:
             target_image_rate_dps=target_image_rate_dps,
             max_correction_override_rpm=0.0 if hold_zero else max_correction_rpm,
             visual_age_sec=visual_age_sec,
+            braking_image_rate_dps=(braking_image_rate_dps
+                                    if pid is self._parked_recenter_pid else None),
+            outward_continuity_rate_dps=(outward_continuity_rate_dps
+                                        if pid is self._parked_recenter_pid else None),
             target_rate_feedforward_max_dps_override=(
                 0.0 if disable_rate_feedforward or hold_zero else None
             ),
@@ -6530,6 +6968,10 @@ class FollowSafetyController:
                 and not hold_zero and not near_distance_mode
             ),
         )
+        if recenter_limit is not None:
+            result = replace(result, post_park_recenter=True,
+                             forward_phase="post_park_recenter:" + result.forward_phase)
+            pid.last_result = result
         near_center_zero = bool(
             disable_rate_feedforward
             and abs(result.visual_error_deg) <= max(0.0, float(pid.config.deadband_deg))
@@ -6540,7 +6982,9 @@ class FollowSafetyController:
             # mode an outward bbox rate can select a side inside the deadband
             # even though feedforward is disabled and desired yaw is zero.
             # Preserve that zero and rearm only for a future tracking sample.
+            image_center_held = pid._image_center_held
             pid.reset()
+            pid._image_center_held = image_center_held
             result = replace(
                 result,
                 correction_rpm=0,
@@ -6591,6 +7035,7 @@ class FollowSafetyController:
         visual_age_sec: Optional[float] = None,
         hold_zero: bool = False,
         allow_forward_tracking: bool = True,
+        outward_lead=None,
     ) -> VisualSteeringPidResult:
         """Refresh the existing visible-target PID between detector results.
 
@@ -6598,6 +7043,8 @@ class FollowSafetyController:
         safety gates. This method only advances the same PID used by the vision
         decision path, keeping the controller state single-owned.
         """
+        lead = self._qualified_forward_lead(outward_lead, x_ratio, now) if (
+            allow_forward_tracking and not hold_zero) else None
         result = self._update_lateral_pid(
             self._visual_steering_pid,
             x_ratio=x_ratio,
@@ -6607,13 +7054,15 @@ class FollowSafetyController:
             target_image_rate_dps=target_image_rate_dps,
             max_correction_rpm=max_correction_rpm,
             visual_age_sec=visual_age_sec,
-            hold_zero=hold_zero or self._visible_pid_center_hold(x_ratio),
+            hold_zero=hold_zero or (lead is None and self._visible_pid_center_hold(x_ratio)),
             allow_forward_tracking=allow_forward_tracking,
         )
+        result = apply_outward_lead(result, lead, x_ratio, now)
         guard_reason = self._pid_direction_guard_reason(
             float(x_ratio),
             float(motion_dx_ratio),
             int(result.correction_rpm),
+            braking_result=self._forward_brake_result(result, feedback) if allow_forward_tracking else None,
         )
         if guard_reason is not None:
             result = replace(result, correction_rpm=0)
@@ -6633,6 +7082,9 @@ class FollowSafetyController:
         visual_age_sec: Optional[float] = None,
         near_distance_mode: bool = False,
         hold_zero: bool = False,
+        outward_lead=None,
+        braking_image_rate_dps: Optional[float] = None,
+        outward_continuity_rate_dps: Optional[float] = None,
     ) -> VisualSteeringPidResult:
         """Refresh the in-place yaw PID between detector results."""
         result = self._update_lateral_pid(
@@ -6646,17 +7098,68 @@ class FollowSafetyController:
             visual_age_sec=visual_age_sec,
             near_distance_mode=near_distance_mode,
             hold_zero=hold_zero,
+            braking_image_rate_dps=braking_image_rate_dps,
+            outward_continuity_rate_dps=outward_continuity_rate_dps,
         )
+        if not hold_zero and near_distance_mode and self.cfg.visible_steering_pid_outward_lead_enable:
+            result = apply_outward_lead(result, outward_lead, x_ratio, now)
         guard_reason = self._pid_direction_guard_reason(
             float(x_ratio),
             float(motion_dx_ratio),
             int(result.correction_rpm),
+            braking_result=result,
         )
         if guard_reason is not None:
             result = replace(result, correction_rpm=0)
         result = self._parked_startup_floor(result, x_ratio)
         self.last_steering_pid_result = result
         return result
+
+    def _outward_trajectory_lead(self, observation, now):
+        return make_outward_lead(observation, now,
+            hfov=self.cfg.visible_steering_pid_camera_hfov_deg,
+            deadband=self.cfg.visible_steering_pid_deadband_deg,
+            release_margin=self.cfg.visible_steering_pid_image_center_release_margin_deg,
+            enabled=self.cfg.visible_steering_pid_outward_lead_enable)
+
+    def _qualified_forward_lead(self, lead, x, now):
+        if (self.cfg.visible_steering_pid_outward_lead_enable and lead is not None
+                and lead.matches(self.active_target_id, lead.capture_id, lead.capture_timestamp, now)
+                and abs(x-lead.x) <= 1e-6):
+            return lead
+        return None
+
+    def _capture_steering_observation(self, target, frame, now):
+        if not (self.cfg.visible_steering_pid_image_error_only
+                and self.cfg.visible_steering_pid_image_brake_assist
+                and self.cfg.visible_steering_pid_image_capture_motion):
+            return None
+        evidence = getattr(self, "_capture_steering_evidence", None)
+        if evidence is None:
+            evidence = self._capture_steering_evidence = CaptureSteeringEvidence()
+        previous = getattr(self, "last_capture_steering_observation", None)
+        obs = evidence.observe(target, frame, now, self.cfg.visible_steering_pid_camera_hfov_deg)
+        if getattr(self, "_post_park_recenter_uid", None) != self.active_target_id:
+            self.clear_post_park_recenter("target_changed")
+        released = getattr(self, "_post_park_recenter_released_at", None)
+        if (released is not None and obs.target_id == self.active_target_id
+                and obs.reason == "capture_rate_valid" and obs.outward_consistent
+                and obs.first_timestamp > released and .08 <= obs.span_sec <= .35
+                and 0 <= now-obs.capture_timestamp <= .25 and obs.rate_dps is not None
+                and 8 <= abs(obs.rate_dps) <= 60 and obs.rate_dps*(obs.control_x-.5) > 0
+                and abs(obs.control_x-.5)*self.cfg.visible_steering_pid_camera_hfov_deg >= 15):
+            self.clear_post_park_recenter("fresh_sustained_outward")
+        self.last_capture_steering_observation = obs
+        if obs != previous:
+            logger.info("steering_capture_observation uid=%d cap=%d capture_ts=%.6f age_ms=%.1f "
+                "tracker_x=%.4f detector_x=%s control_x=%.4f image_rate_dps=%s span_ms=%.1f reason=%s "
+                "turnaround_brake_dps=%s crop_outward_dps=%s",
+                obs.target_id, obs.capture_frame_id, obs.capture_timestamp,
+                (now-obs.capture_timestamp)*1000, obs.tracker_x,
+                "none" if obs.detector_x is None else "%.4f" % obs.detector_x, obs.control_x,
+                "none" if obs.rate_dps is None else "%.2f" % obs.rate_dps, obs.span_sec*1000, obs.reason,
+                obs.inward_turnaround_rate_dps, obs.outward_continuity_rate_dps)
+        return obs
 
     def _pid_action_for_visible_target(
         self,
@@ -6714,10 +7217,16 @@ class FollowSafetyController:
             )
         cx, _cy = target.center
         current_x_ratio = float(cx) / float(max(1, frame.width))
+        capture_observation = self._capture_steering_observation(target, frame, now)
+        if capture_observation is not None:
+            current_x_ratio = capture_observation.control_x
+            target_image_rate_dps = capture_observation.rate_dps
         # Position error and target velocity are separate inputs. The old path
         # added a multi-frame displacement directly to x, which changed gain
         # whenever detector cadence changed and duplicated the PID derivative.
         pid_x_ratio = current_x_ratio
+        outward_lead = self._qualified_forward_lead(
+            self._outward_trajectory_lead(capture_observation, now), pid_x_ratio, now)
         correction_override = (
             float(self.cfg.visible_steering_pid_fallback_max_correction_rpm)
             if distance_fallback
@@ -6739,8 +7248,9 @@ class FollowSafetyController:
             target_image_rate_dps=target_image_rate_dps,
             max_correction_rpm=correction_override,
             visual_age_sec=self._visual_age_sec(frame, now),
-            hold_zero=self._visible_pid_center_hold(current_x_ratio),
+            hold_zero=outward_lead is None and self._visible_pid_center_hold(current_x_ratio),
         )
+        result = apply_outward_lead(result, outward_lead, pid_x_ratio, now)
         self.last_steering_pid_result = result
         if target_image_rate_dps is not None and abs(target_image_rate_dps) >= 1.0:
             logger.info(
@@ -6761,6 +7271,7 @@ class FollowSafetyController:
             current_x_ratio,
             motion_dx_ratio,
             correction,
+            braking_result=self._forward_brake_result(result, frame.steering_feedback),
         )
         if direction_guard_reason is not None:
             result = replace(result, correction_rpm=0)
@@ -6800,7 +7311,7 @@ class FollowSafetyController:
         )
         # Keep the configured edges available for the normal PID hysteresis;
         # only the interior of the band is an unconditional center hold.
-        if self._visible_pid_center_hold(current_x_ratio):
+        if self._visible_pid_center_hold(current_x_ratio) and result.outward_lead is None:
             suppressed_correction = int(result.correction_rpm)
             if int(result.correction_rpm) != 0 or result.output_floor_reason != "center_hold":
                 result = replace(
@@ -6822,6 +7333,12 @@ class FollowSafetyController:
             return ControlAction.forward(base_speed, "visual_pid_center_hold")
 
         if correction == 0:
+            if (self._visual_steering_pid.config.image_error_only
+                    and self._visual_steering_pid.config.image_brake_assist):
+                # An intentional taper/center zero owns this cycle. Do not
+                # fall through to a legacy edge action and rebuild wheel delta.
+                # Depth still exclusively owns the forward component.
+                return ControlAction.forward(base_speed, "visual_pid_image_yaw_zero")
             correction = self._pid_zero_guard_correction(
                 result,
                 current_x_ratio=current_x_ratio,
@@ -6888,6 +7405,8 @@ class FollowSafetyController:
             "visual_direction_guard",
             "center_hold",
             "yaw_damping_coast",
+            "image_center_hold",
+            "image_error_only",
         }:
             return 0
 
@@ -7015,7 +7534,10 @@ class FollowSafetyController:
             base_rpm,
             frame.steering_feedback,
             now=now,
-            target_image_rate_dps=target_image_rate_dps,
+            # Reverse is outside capture-motion assist; its old processing-
+            # time rate must not masquerade as the new qualified observation.
+            target_image_rate_dps=(None if self.cfg.visible_steering_pid_image_capture_motion
+                                   else target_image_rate_dps),
             max_correction_override_rpm=reverse_correction_limit,
             visual_age_sec=self._visual_age_sec(frame, now),
         )
@@ -7055,6 +7577,7 @@ class FollowSafetyController:
         target_image_rate_dps: Optional[float] = None,
         max_correction_rpm: Optional[float] = None,
         near_distance_mode: bool = False,
+        allow_outward_lead: bool = False,
     ) -> Optional[ControlAction]:
         """Use the camera/encoder loop for low-speed in-place recentering."""
         initial_fallback = self._rotate_action_for_edge(edge)
@@ -7070,6 +7593,12 @@ class FollowSafetyController:
         x_ratio = float(cx) / float(max(1, frame.width))
         pid_x_ratio = x_ratio
         pid_edge = edge
+        capture_observation = self._capture_steering_observation(target, frame, now)
+        if capture_observation is not None:
+            x_ratio = pid_x_ratio = capture_observation.control_x
+            target_image_rate_dps = capture_observation.rate_dps
+        outward_lead = (self._outward_trajectory_lead(capture_observation, now)
+                        if near_distance_mode and allow_outward_lead else None)
         motion_led = False
         if pid_edge not in ("left", "right") and projected_x_ratio is not None:
             pid_edge = self._visible_motion_edge_type(
@@ -7167,7 +7696,16 @@ class FollowSafetyController:
             max_correction_rpm=float(dynamic_max_rpm),
             visual_age_sec=self._visual_age_sec(frame, now),
             near_distance_mode=near_distance_mode,
+            braking_image_rate_dps=getattr(capture_observation, "inward_turnaround_rate_dps", None),
+            outward_continuity_rate_dps=getattr(capture_observation, "outward_continuity_rate_dps", None),
         )
+        result = apply_outward_lead(result, outward_lead, pid_x_ratio, now)
+        if result.outward_lead is not None:
+            logger.info("outward_trajectory_lead cap=%s uid=%s x=%.4f rate=%+.2f "
+                        "yaw_rpm=%s wheel_diff_rpm=%s span_ms=%.1f",
+                        frame.capture_frame_id, target.track_id, pid_x_ratio,
+                        outward_lead.rate_dps, result.correction_rpm,
+                        2*abs(result.correction_rpm), capture_observation.span_sec*1000)
         if target_image_rate_dps is not None and abs(target_image_rate_dps) >= 1.0:
             logger.info(
                 "parked_pid_target_rate current_x=%.3f dx=%+.3f image_rate=%+.2fdps "
@@ -7190,6 +7728,7 @@ class FollowSafetyController:
             x_ratio,
             motion_dx_ratio,
             correction,
+            braking_result=result,
         )
         if guard_reason is not None:
             result = replace(result, correction_rpm=0)
@@ -7291,6 +7830,18 @@ class FollowSafetyController:
     def _select_person(self, frame: SensorFrame) -> Optional[PersonTarget]:
         if not frame.persons:
             return None
+        if not self._has_seen_person:
+            qualified = [p for p in frame.persons if int(p.track_id) > 0]
+            if self._initial_candidate_id is not None:
+                matches = [p for p in qualified if int(p.track_id) == self._initial_candidate_id]
+                return max(matches, key=lambda p: p.area) if matches else None
+            enrolled = [p for p in qualified if bool(getattr(p, "initial_identity_confirmed", False))]
+            enrolled_ids = {int(p.track_id) for p in enrolled}
+            if len(enrolled_ids) == 1:
+                return max(enrolled, key=lambda p: p.area)
+            if len({int(p.track_id) for p in qualified}) != 1:
+                return None
+            return max(qualified, key=lambda p: p.area)
         if self.active_target_id == GEOMETRY_FALLBACK_TARGET_ID:
             geometry_matches = [
                 p for p in frame.persons
@@ -7506,6 +8057,55 @@ class FollowSafetyController:
                 reason=ir_reason,
             )
 
+        # One startup gate precedes ALL motion branches, including depth-only,
+        # reverse, low-quality yaw, and lost-target search. The old optional
+        # pre-lock scan/centering cannot move a car that has never locked a UID.
+        if not self._has_seen_person:
+            startup_target = self._select_person(frame)
+            self.last_selected_target = startup_target
+            if longitudinal_only:
+                return self._initial_stopped_hold("initial_wait_visual_lock")
+            if startup_target is None:
+                if self._initial_candidate_id is not None:
+                    reason = "initial_wait_reserved_target"
+                elif len({int(p.track_id) for p in frame.persons if int(p.track_id) > 0}) > 1:
+                    reason = "initial_wait_unique_target"
+                else:
+                    reason = "wait_first_person"
+                return self._initial_stopped_hold(reason)
+            if low_quality_visible or (
+                not target_steerable
+                and not bool(getattr(startup_target, "initial_identity_confirmed", False))
+            ):
+                return self._initial_stopped_hold("initial_wait_qualified_target")
+            if not self._initial_capture_is_fresh(frame, now):
+                return self._initial_stopped_hold("initial_wait_fresh_capture")
+            if not self._confirm_initial_target(startup_target, frame_index, frame):
+                return self._initial_stopped_hold("initial_candidate_confirmation_hold")
+            self.active_target_id = int(startup_target.track_id)
+            self._has_seen_person = True
+            self.lost_confirm_frames = 0
+            self.search_state = "none"
+            self.search_direction = None
+            self._lost_started_at = None
+            self._lost_exit_direction = None
+            self._reset_search_timeout()
+            self._visual_steering_pid.reset()
+            self._parked_recenter_pid.reset()
+            self._reset_distance_pid()
+            self._forward_active = False
+            self.last_steering_pid_result = None
+            if not target_steerable:
+                # Identity enrollment and immediate steering eligibility are
+                # separate. Keep the proven UID, but do not use this first
+                # unsuitable bbox for yaw, forward, or reverse motion.
+                return ControlDecision(
+                    explicit_stop_requested=True,
+                    clear_action_queue=True,
+                    stop_action_execution=True,
+                    reason="target_visible_unsteerable_hold",
+                )
+
         # A mapped crop can keep supplying bounded yaw geometry without being
         # trusted for identity updates, Depth, or longitudinal motion. Fragments
         # and crops inside the center corridor still use the stopped hold path.
@@ -7691,8 +8291,6 @@ class FollowSafetyController:
                 reason="search_candidate_aimline_brake",
                 evidence_capture_frame_id=int(candidate.capture_frame_id),
             )
-        initial_target_confirmed_now = False
-
         if target is not None and self._stale_direction_recovery_active:
             self._reset_stale_direction_recovery("target_reacquired")
             self.search_direction = None
@@ -7885,194 +8483,76 @@ class FollowSafetyController:
                     stop_action_execution=True,
                     reason="unconfirmed_target_wait",
                 )
-            if not self._has_seen_person:
-                self._reset_initial_target_confirm()
-                if not cfg.search_before_first_seen:
-                    self.lost_confirm_frames = 0
-                    self.search_state = "none"
-                    self.search_direction = None
-                    self._lost_started_at = None
-                    return ControlDecision(reason="wait_first_person")
-                elapsed = now - self._startup_search_started_at
-                if cfg.startup_search_delay_sec > 0 and elapsed < cfg.startup_search_delay_sec:
-                    self.lost_confirm_frames = 0
-                    self.search_state = "none"
-                    self.search_direction = None
-                    self._lost_started_at = None
-                    return ControlDecision(reason="startup_wait_before_search")
+            self.lost_confirm_frames += 1
+            first_lost_frame = self._lost_started_at is None
+            if first_lost_frame:
+                self._lost_started_at = now
+                self._capture_lost_exit_direction(frame)
+                self._begin_search_rotation_measurement(frame)
+
+            # A detector dropout invalidates longitudinal target distance
+            # immediately. Do not carry forward/steer wheel speed into the
+            # confirmation window; only `_lost_confirm_wait_decision` may
+            # retain bounded in-place yaw from the last reliable side.
+
+            lost_confirmed = False
+            lost_elapsed_sec = now - self._lost_started_at
+            if float(cfg.lost_confirm_sec) > 0.0:
+                if lost_elapsed_sec < float(cfg.lost_confirm_sec):
+                    return self._lost_confirm_wait_decision(first_lost_frame, frame)
+                lost_confirmed = True
             else:
-                self.lost_confirm_frames += 1
-                first_lost_frame = self._lost_started_at is None
-                if first_lost_frame:
-                    self._lost_started_at = now
-                    self._capture_lost_exit_direction(frame)
-                    self._begin_search_rotation_measurement(frame)
+                if self.lost_confirm_frames < cfg.lost_confirm_frames:
+                    return self._lost_confirm_wait_decision(first_lost_frame, frame)
+                lost_confirmed = True
 
-                # A detector dropout invalidates longitudinal target distance
-                # immediately. Do not carry forward/steer wheel speed into the
-                # confirmation window; only `_lost_confirm_wait_decision` may
-                # retain bounded in-place yaw from the last reliable side.
-
-                lost_confirmed = False
-                lost_elapsed_sec = now - self._lost_started_at
-                if float(cfg.lost_confirm_sec) > 0.0:
-                    if lost_elapsed_sec < float(cfg.lost_confirm_sec):
-                        return self._lost_confirm_wait_decision(first_lost_frame, frame)
-                    lost_confirmed = True
-                else:
-                    if self.lost_confirm_frames < cfg.lost_confirm_frames:
-                        return self._lost_confirm_wait_decision(first_lost_frame, frame)
-                    lost_confirmed = True
-
-                if lost_confirmed:
-                    if cfg.exit_on_target_loss:
-                        # The target was previously locked and has now passed
-                        # the loss-confirmation window. Stop and terminate the
-                        # runtime; do not enter search rotation.
-                        self.search_state = "timed_out"
-                        self.search_direction = None
-                        self._reset_search_timeout()
-                        return ControlDecision(
-                            explicit_stop_requested=True,
-                            clear_action_queue=True,
-                            stop_action_execution=True,
-                            shutdown_requested=True,
-                            reason="target_lost_exit",
+            if lost_confirmed:
+                if cfg.exit_on_target_loss:
+                    # The target was previously locked and has now passed
+                    # the loss-confirmation window. Stop and terminate the
+                    # runtime; do not enter search rotation.
+                    self.search_state = "timed_out"
+                    self.search_direction = None
+                    self._reset_search_timeout()
+                    return ControlDecision(
+                        explicit_stop_requested=True,
+                        clear_action_queue=True,
+                        stop_action_execution=True,
+                        shutdown_requested=True,
+                        reason="target_lost_exit",
+                    )
+                self._ensure_search_state(frame)
+                if self.active_target_id is not None:
+                    old_target_id = int(self.active_target_id)
+                    if cfg.release_target_on_lost and current_lateral_candidate is None:
+                        self.active_target_id = None
+                        logger.info(
+                            "free_search_enter frame=%d cleared_target=%d lost_frames=%d lost_sec=%.2f threshold_frames=%d threshold_sec=%.2f",
+                            int(frame_index),
+                            old_target_id,
+                            int(self.lost_confirm_frames),
+                            float(lost_elapsed_sec),
+                            int(cfg.lost_confirm_frames),
+                            float(cfg.lost_confirm_sec),
                         )
-                    self._ensure_search_state(frame)
-                    if self.active_target_id is not None:
-                        old_target_id = int(self.active_target_id)
-                        if cfg.release_target_on_lost and current_lateral_candidate is None:
-                            self.active_target_id = None
-                            logger.info(
-                                "free_search_enter frame=%d cleared_target=%d lost_frames=%d lost_sec=%.2f threshold_frames=%d threshold_sec=%.2f",
-                                int(frame_index),
-                                old_target_id,
-                                int(self.lost_confirm_frames),
-                                float(lost_elapsed_sec),
-                                int(cfg.lost_confirm_frames),
-                                float(cfg.lost_confirm_sec),
-                            )
-                            target = self._select_person(frame)
-                            self.last_selected_target = target
-                        else:
-                            logger.info(
-                                "locked_search_enter frame=%d kept_target=%d lost_frames=%d lost_sec=%.2f threshold_frames=%d threshold_sec=%.2f",
-                                int(frame_index),
-                                old_target_id,
-                                int(self.lost_confirm_frames),
-                                float(lost_elapsed_sec),
-                                int(cfg.lost_confirm_frames),
-                                float(cfg.lost_confirm_sec),
-                            )
-                    # Search motion is generated below in this same control
-                    # decision.  The motor layer performs a bounded transition
-                    # only when the requested yaw direction actually reverses.
+                        target = self._select_person(frame)
+                        self.last_selected_target = target
+                    else:
+                        logger.info(
+                            "locked_search_enter frame=%d kept_target=%d lost_frames=%d lost_sec=%.2f threshold_frames=%d threshold_sec=%.2f",
+                            int(frame_index),
+                            old_target_id,
+                            int(self.lost_confirm_frames),
+                            float(lost_elapsed_sec),
+                            int(cfg.lost_confirm_frames),
+                            float(cfg.lost_confirm_sec),
+                        )
+                # Search motion is generated below in this same control
+                # decision.  The motor layer performs a bounded transition
+                # only when the requested yaw direction actually reverses.
 
             if target is None:
                 self._ensure_search_state(frame)
-
-        if target is not None and not self._has_seen_person:
-            self.lost_confirm_frames = 0
-            self.search_state = "none"
-            self.search_direction = None
-            self._lost_started_at = None
-            self._lost_exit_direction = None
-            self.last_person_center_x = self._center(target)[0]
-            if not self._confirm_initial_target(target, frame_index):
-                # Initial identity confirmation must not create a visual blind
-                # spot.  Keep the vehicle stationary longitudinally, but use
-                # the same camera/encoder yaw PID as parked recentering so a
-                # candidate at the edge is kept in view while ReID confirms it.
-                self._visual_steering_pid.reset()
-                self.last_steering_pid_result = None
-                motion_dx_ratio = 0.0
-                projected_x_ratio = None
-                target_image_rate_dps = None
-                if record_target_motion:
-                    (
-                        motion_dx_ratio,
-                        projected_x_ratio,
-                        target_image_rate_dps,
-                        motion_dt_sec,
-                    ) = self._record_visible_motion(
-                        frame_index,
-                        target,
-                        frame.width,
-                        now,
-                    )
-                    if motion_dt_sec <= 0.0:
-                        target_image_rate_dps = None
-                candidate_edge = self._edge_type(target.center[0], frame.width)
-                candidate_action = self._pid_action_for_parked_target(
-                    target,
-                    frame,
-                    now,
-                    candidate_edge,
-                    motion_dx_ratio=motion_dx_ratio,
-                    projected_x_ratio=projected_x_ratio,
-                    target_image_rate_dps=target_image_rate_dps,
-                    max_correction_rpm=float(
-                        self.cfg.near_distance_rotation_only_max_rpm
-                    ),
-                )
-                if candidate_action is not None and candidate_action.kind in (
-                    "rotate_left",
-                    "rotate_right",
-                ):
-                    candidate_reason = "initial_candidate_centering_%s" % (
-                        candidate_action.kind.removeprefix("rotate_")
-                    )
-                    candidate_action = self._retag_action(
-                        candidate_action,
-                        candidate_reason,
-                    )
-                    logger.info(
-                        "initial candidate yaw preview: control_frame_id=%d "
-                        "capture_frame_id=%d track_id=%d center_x=%.3f edge=%s "
-                        "action=%s correction=%sRPM identity_confirm=%d/%d",
-                        int(frame_index),
-                        int(getattr(frame, "capture_frame_id", -1)),
-                        int(target.track_id),
-                        float(target.center[0]) / float(max(1, frame.width)),
-                        candidate_edge,
-                        candidate_action.kind,
-                        "none"
-                        if self.last_steering_pid_result is None
-                        else int(self.last_steering_pid_result.correction_rpm),
-                        int(self._initial_candidate_frames),
-                        int(self.cfg.initial_target_confirm_frames),
-                    )
-                    return ControlDecision(
-                        actions=[candidate_action],
-                        current_forward_percent=0,
-                        clear_action_queue=True,
-                        waiting_lost_confirm=True,
-                        reason=candidate_reason,
-                    )
-
-                # A centered candidate needs no yaw command. Preserve the
-                # enrollment hold semantics for that case; a PID guard is
-                # still represented as a soft zero-yaw update so residual
-                # motion is damped without entering a new brake hold.
-                if candidate_action is None:
-                    return ControlDecision(
-                        actions=[ControlAction.stop(
-                            "initial_candidate_confirmation_hold",
-                            brake_hold=False,
-                        )],
-                        waiting_lost_confirm=True,
-                        soft_stop_requested=True,
-                        reason="initial_candidate_confirmation_hold",
-                    )
-                hold_reason = "initial_candidate_yaw_guard_hold"
-                return ControlDecision(
-                    actions=[ControlAction.stop(hold_reason, brake_hold=False)],
-                    waiting_lost_confirm=True,
-                    soft_stop_requested=True,
-                    reason=hold_reason,
-                )
-            initial_target_confirmed_now = True
 
         if target is not None:
             target_cx, target_cy = self._center(target)
@@ -8254,12 +8734,8 @@ class FollowSafetyController:
         if target_id_changed:
             # ReID 交接后不能把旧目标的视觉误差、D 项和积分带给新目标，
             # 否则新目标出现的第一帧可能仍沿旧目标方向修正。
-            # Initial two-frame enrollment is different: its first frame has
-            # already used this same bbox chain for temporary centering, so
-            # keep that encoder-loop state and avoid a duplicate startup kick.
-            if not initial_target_confirmed_now:
-                self._visual_steering_pid.reset()
-                self._parked_recenter_pid.reset()
+            self._visual_steering_pid.reset()
+            self._parked_recenter_pid.reset()
             self._reset_distance_pid()
             self._forward_active = False
             self.last_steering_pid_result = None

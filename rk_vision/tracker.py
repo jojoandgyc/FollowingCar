@@ -1,6 +1,8 @@
 from __future__ import annotations
+from .follow_bbox_policy import lower_compact_bbox_reason
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Set, Tuple
 
@@ -8,6 +10,7 @@ from .deepsort import DeepSort, DeepSortConfig
 from .deepsort.track import TrackState
 from .identity_bank import IdentityBank, IdentityBankConfig
 from .candidate_competition import competition_evidence
+from .competition_eligibility import anchored_competitor_exclusions
 from .yolo11 import Detection
 from .stage_timing import StageTiming
 
@@ -61,6 +64,7 @@ class DeepSortTrackerConfig:
     identity_max_features: int = 20
     identity_template_memory_enable: bool = False
     identity_template_crosscheck_enable: bool = False
+    identity_appearance_region_safety_enable: bool = False
     identity_template_recent_sec: float = 30.0
     identity_template_archive_sec: float = 120.0
     identity_max_weak_features: int = 8
@@ -132,6 +136,7 @@ class DeepSortTrackerConfig:
     identity_preferred_search_soft_min_confidence: float = 0.80
     identity_partial_appearance_enable: bool = True
     identity_partial_match_threshold: float = 0.34
+    identity_partial_confirm_threshold: float = 0.34
     identity_partial_max_features: int = 8
     identity_partial_update_threshold: float = 0.30
     identity_preferred_search_reacquire_side_ratio: float = 0.05
@@ -174,6 +179,7 @@ class DeepSortTracker:
                 max_features=config.identity_max_features,
                 template_memory_enable=config.identity_template_memory_enable,
                 template_crosscheck_enable=config.identity_template_crosscheck_enable,
+                appearance_region_safety_enable=config.identity_appearance_region_safety_enable,
                 template_recent_sec=config.identity_template_recent_sec,
                 template_archive_sec=config.identity_template_archive_sec,
                 max_weak_features=config.identity_max_weak_features,
@@ -228,6 +234,7 @@ class DeepSortTracker:
                 preferred_search_soft_min_confidence=config.identity_preferred_search_soft_min_confidence,
                 partial_appearance_enable=config.identity_partial_appearance_enable,
                 partial_match_threshold=config.identity_partial_match_threshold,
+                partial_confirm_threshold=config.identity_partial_confirm_threshold,
                 partial_max_features=config.identity_partial_max_features,
                 partial_update_threshold=config.identity_partial_update_threshold,
                 camera_hfov_deg=config.hfov_deg,
@@ -258,6 +265,7 @@ class DeepSortTracker:
         *,
         partial_features: Optional[Sequence[Optional[Any]]] = None,
         partial_feature_sources: Optional[Sequence[Optional[str]]] = None,
+        color_features: Optional[Sequence[Optional[Any]]] = None,
         image_width: int,
         image_height: Optional[int] = None,
         frame_context: Optional[dict] = None,
@@ -274,6 +282,9 @@ class DeepSortTracker:
             partial_feature_sources = [None for _ in detections]
         if len(partial_feature_sources) != len(detections):
             raise ValueError("partial_feature_sources length must match detections length")
+        # Optional startup evidence cannot be guessed or shifted between boxes.
+        if color_features is None or len(color_features) != len(detections):
+            color_features = ()
         self._frame_index += 1
         self._frame_context = dict(frame_context or {})
         self._current_detections = tuple(detections)
@@ -333,6 +344,7 @@ class DeepSortTracker:
         timer.mark("geometry")
         self._identity_competition = self._frame_identity_competition(
             detections, features, suppressed_indices=suppressed_indices,
+            outputs=outputs, image_width=image_width, image_height=image_height,
         )
         timer.mark("competition")
         self._observe_identity_frame_evidence(
@@ -353,6 +365,7 @@ class DeepSortTracker:
                 ),
                 partial_features=partial_features,
                 partial_feature_sources=partial_feature_sources,
+                color_features=color_features,
                 duplicate_identity_box=int(out.track_id) in suppressed_track_ids,
                 identity_swap_track=int(out.track_id) in identity_swap_track_ids,
             )
@@ -374,7 +387,8 @@ class DeepSortTracker:
         self.last_timing_ms = timer.finish()
         return records
 
-    def _frame_identity_competition(self, detections, features, *, suppressed_indices=()):
+    def _frame_identity_competition(self, detections, features, *, suppressed_indices=(),
+                                    outputs=(), image_width=None, image_height=None):
         uid = self._search_reacquire_uid
         if uid <= 0:
             claims = set(self.identity_bank.track_to_uid.values()) | set(
@@ -388,10 +402,61 @@ class DeepSortTracker:
             for i, det in enumerate(detections)
             if int(det.class_id) == 0 and i not in suppressed_indices
         }
-        return competition_evidence(
+        # Snapshot BEFORE this frame's assignments or template updates. Never
+        # let the best appearance score nominate its own geometry reference.
+        entry = self.identity_bank.identities.get(uid)
+        reference = None if entry is None else entry.last_strong_observation
+        suspect = self.identity_bank._reacquire_control_suspects.get(uid)
+        gap_recovery = bool(
+            suspect and suspect.get('reason') == 'evidence_gap' and reference
+            and suspect.get('track_id') == reference.get('track_id')
+        )
+        reference_kind = 'accepted_identity'
+        if gap_recovery:
+            reference_kind = 'gap_identity_reference'
+            local = suspect.get('local_observation')
+            # Only IdentityBank can establish a qualified first recovery
+            # observation. Do not synthesize one from the current best ReID.
+            if (suspect.get('streak', 0) > 0 and local
+                    and local.get('track_id') == suspect.get('track_id')):
+                reference = local
+                reference_kind = 'qualified_gap_observation'
+        mapped_indices = {
+            o.source_detection_index for o in outputs
+            if getattr(o, 'time_since_update', 1) == 0
+            and getattr(o, 'source_detection_index', None) in distances
+            and (self.identity_bank.track_to_uid.get(o.track_id) == uid
+                 or (gap_recovery and suspect.get('track_id') == o.track_id
+                     and self.identity_bank.track_to_uid.get(o.track_id, 0) == 0))
+            and reference and reference.get('track_id') == o.track_id
+            and o.track_id not in getattr(self.identity_bank, '_mapped_geometry_conflicts', {})
+            and uid not in getattr(self.identity_bank, '_geometry_revoked_uids', {})
+            and (suspect is None or gap_recovery)
+        }
+        exclusions, anchor_index = anchored_competitor_exclusions(
+            detections, distances, reference=reference, context=self._frame_context,
+            mapped_indices=mapped_indices, width=image_width, height=image_height,
+            confidence_floor=max(self.config.min_confidence, self.config.identity_min_confidence),
+            track_confidence_floor=self.config.min_confidence,
+            appearance_limit=min(.30, self.identity_bank.config.mapped_verify_threshold),
+            weak_only=gap_recovery)
+        if exclusions:
+            logger.info('identity_competition_eligibility capture_frame_id=%s uid=%s '
+                        'reference_cap=%s anchor_detection=%s excluded=%s raw_count=%s '
+                        'qualified_count=%s reference_kind=%s detections_retained=True',
+                        self._frame_context.get('capture_frame_id'), uid,
+                        reference.get('capture_frame_id'), anchor_index, exclusions,
+                        len(distances), len(distances)-len(exclusions), reference_kind)
+        proof = competition_evidence(
             distances, uid=uid, frame_index=self._frame_index,
             min_margin=self.identity_bank.config.preferred_search_candidate_min_margin,
+            exclusions=exclusions,
+            eligibility_reference_cap=reference.get('capture_frame_id') if reference else None,
         )
+        if exclusions:
+            for item in proof.values():
+                item['eligibility_reference_kind'] = reference_kind
+        return proof
 
     def _identity_match_allowed(self, track_id, source_index, width, height):
         """Pure pre-association guard: rejected pairs cannot train DeepSORT."""
@@ -562,6 +627,7 @@ class DeepSortTracker:
         candidate_count: int,
         partial_features: Sequence[Optional[Any]],
         partial_feature_sources: Sequence[Optional[str]] = (),
+        color_features: Sequence[Optional[Any]] = (),
         candidate_score_gap: Optional[float] = None,
         duplicate_identity_box: bool = False,
         identity_swap_track: bool = False,
@@ -664,6 +730,9 @@ class DeepSortTracker:
             is_fresh=output_is_fresh,
         )
         sample_metadata.update(self._frame_context)
+        # These fields may only come from this call's detector association.
+        sample_metadata.pop("initial_color_feature", None)
+        sample_metadata.pop("initial_color_source", None)
         sample_metadata["is_fresh"] = output_is_fresh
         sample_metadata["quality_bbox_source"] = (
             "detector" if detector_bbox is not None else "track"
@@ -720,6 +789,19 @@ class DeepSortTracker:
                 )
             )
             sample_metadata["source_detection_index"] = int(source_index)
+            if (not self.identity_bank.identities
+                    and 0 <= int(source_index) < len(color_features)):
+                try:
+                    color = [float(v) for v in color_features[int(source_index)]]
+                    color_norm = math.sqrt(sum(v * v for v in color))
+                    # The fallback six-dimensional BGR statistics are not an
+                    # HSV histogram and must not carry this versioned source.
+                    if (len(color) == 16 and all(math.isfinite(v) and v >= 0. for v in color)
+                            and math.isfinite(color_norm) and color_norm > 1e-12):
+                        sample_metadata["initial_color_feature"] = color
+                        sample_metadata["initial_color_source"] = "hsv_crop_v1_bgr"
+                except (TypeError, ValueError, OverflowError):
+                    pass
             sample_metadata["partial_observation"] = bool(
                 partial_feature is not None
                 and _partial_bbox_observation(
@@ -897,6 +979,7 @@ class DeepSortTracker:
             or box_height < float(self.config.identity_min_height_px)
             or area < float(self.config.identity_min_area)
             or area_ratio > float(self.config.identity_max_area_ratio)
+            or lower_compact_bbox_reason(bbox, image_width, image_height)
         ):
             self._search_probe_bbox = None
             self._search_probe_frame = -1
@@ -956,6 +1039,16 @@ class DeepSortTracker:
                 self.config.identity_edge_margin_ratio,
             )
         )
+        # Same quality contract as formal track records. A detector-only
+        # probe has no filtered display box; report the actual crop result,
+        # never promote a weak/rejected crop to a passing one.
+        sample_metadata.update(
+            quality_bbox_source="detector", quality_bbox=list(bbox),
+            quality_bbox_ok=bool(probe_quality_ok),
+            quality_bbox_reason=str(probe_quality_reason or ""),
+            display_bbox_quality_ok=bool(probe_quality_ok),
+            display_bbox_quality_reason=str(probe_quality_reason or ""),
+        )
         sample_metadata["is_fresh"] = True
         sample_metadata["source_detection_index"] = detection_index
         sample_metadata["identity_competition"] = probe_competition.get(detection_index, {})
@@ -963,7 +1056,11 @@ class DeepSortTracker:
             source = partial_feature_sources[detection_index]
             if source:
                 sample_metadata["partial_feature_source"] = str(source)
-        sample_metadata["candidate_count"] = int(len(person_indices))
+        # Probe eligibility selects one useful crop, but competition still
+        # includes every person in the current detector frame. Keep the count
+        # bound to those detections, not to a proof's self-reported value.
+        candidate_count = sum(int(item.class_id) == 0 for item in detections)
+        sample_metadata["candidate_count"] = candidate_count
         sample_metadata["candidate_score_gap"] = float(detection.score)
         # Detector-only probes are part of the active preferred-UID search
         # path. Mark that context explicitly so IdentityBank can apply the
@@ -1013,7 +1110,7 @@ class DeepSortTracker:
             confidence=float(detection.score),
             area=float(area),
             frame_index=int(self._frame_index),
-            candidate_count=1,
+            candidate_count=candidate_count,
             bbox_quality_ok=probe_quality_ok,
             bbox_quality_tier=probe_quality_tier,
             bbox_quality_reason=probe_quality_reason or "search_detector_probe",
@@ -1072,6 +1169,8 @@ class DeepSortTracker:
             edge_touch_count += int(y1 <= margin_y) + int(float(image_height) - y2 <= margin_y)
         return {
             "detector_bbox": [x1, y1, x2, y2],
+            "image_width": image_width,
+            "image_height": image_height,
             "detector_center_x_ratio": (x1 + x2) * 0.5 / max(1.0, float(image_width)),
             "detector_area_ratio": max(0.0, x2 - x1) * max(0.0, y2 - y1)
             / max(1.0, float(image_width * (image_height or 1))),
@@ -1222,6 +1321,9 @@ class DeepSortTracker:
         aspect = width / max(1.0, height)
 
         reasons: List[str] = []
+        shape_reason = lower_compact_bbox_reason(bbox, image_width, image_height)
+        if shape_reason:
+            reasons.append(shape_reason)
         if area_ratio > float(self.config.identity_max_area_ratio):
             reasons.append(f"area_ratio>{float(self.config.identity_max_area_ratio):.2f}")
         if width * height < max(0.0, float(self.config.identity_min_area)):

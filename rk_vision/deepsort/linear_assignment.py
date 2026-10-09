@@ -116,6 +116,13 @@ def gate_cost_matrix(
 
 
 def _linear_sum_assignment(cost_matrix):
+    if getattr(cost_matrix, "shape", None) == (1, 1):
+        np = _np()
+        if cost_matrix.dtype.kind in "biuf" and np.isfinite(cost_matrix[0, 0]):
+            # A sole finite pair has no assignment choice. Avoid importing
+            # scipy on the first one-person match; min_cost_matching still
+            # rejects costs above its threshold, including gated pairs.
+            return np.zeros(1, dtype=int), np.zeros(1, dtype=int)
     try:
         from scipy.optimize import linear_sum_assignment
 

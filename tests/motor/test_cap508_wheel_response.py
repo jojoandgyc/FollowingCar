@@ -24,11 +24,12 @@ def test_flags_sustained_small_response_once_per_feedback(side):
     probe = WheelDifferentialResponse()
     pair = (90 + side*8, 90 - side*8)
     previous = 0
-    for t in [10, 10.08, 10.16, 10.24]:
+    for t in [10, 10.08, 10.16, 10.24, 10.32, 10.40, 10.48, 10.56]:
         result = probe.observe_and_note(1, pair, t, previous, feedback(t-.01, 20+side, 20))
         previous = t
-    assert result['lagging'] and result['sustained_ms'] == pytest.approx(230)
-    duplicate = probe.observe_and_note(1, pair, 10.25, 10.24, feedback(10.23, 20+side, 20))
+        if t < 10.5: assert not result['lagging']
+    assert result['lagging'] and result['sustained_ms'] == pytest.approx(550)
+    duplicate = probe.observe_and_note(1, pair, 10.57, 10.56, feedback(10.55, 20+side, 20))
     assert not duplicate['new_feedback'] and not duplicate['lagging']
 
 

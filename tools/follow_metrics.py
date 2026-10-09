@@ -166,6 +166,8 @@ def analyze(run, cap_start=None, cap_end=None, target_distance=None, tolerance=.
     wheel_dispatch_reasons = Counter()
     wheel_dispatch_losses = []
     wheel_positive_to_zero = 0
+    cross_brake_records, cross_completed_ms, cross_timeout_episodes = Counter(), {}, set()
+    wheel_held_without_write = 0
     motor_zero_reasons = {}
     last_motor = None
     boundary_continuity_samples = set()
@@ -222,6 +224,18 @@ def analyze(run, cap_start=None, cap_end=None, target_distance=None, tolerance=.
                         motor_zero_reasons[last_motor[0]] = reason
                     if start <= stamp <= end:
                         wheel_dispatch_reasons[reason] += 1
+                        brake = field(line, "cross_brake")
+                        if brake is not None:
+                            cross_brake_records[brake] += 1
+                        wheel_held_without_write += field(line, "packet_written") == "False"
+                        episode = number(field(line, "cross_episode_ts"))
+                        wait_ms = number(field(line, "cross_wait_ms"))
+                        if episode is not None:
+                            key = (field(line, "uid"), episode)
+                            if reason == "cross_timeout_zero":
+                                cross_timeout_episodes.add(key)
+                            if field(line, "cross_finished") == "True" and wait_ms is not None:
+                                cross_completed_ms[key] = wait_ms
                         if req > 0:
                             wheel_dispatch_losses.append(max(0.,req-app))
                             wheel_positive_to_zero += pair == (0.,0.)
@@ -815,8 +829,20 @@ def analyze(run, cap_start=None, cap_end=None, target_distance=None, tolerance=.
                       "zero_command_sec_by_reason": dict(zero_reason_dwell),
                       "cross_wait_zero_percent": ratio(zero_reason_dwell['cross_wait_zero']+
                                                        zero_reason_dwell['cross_timeout_zero'], covered),
+                      "forward_loss_zero_percent": ratio(
+                          zero_reason_dwell['forward_loss_decelerating']+
+                          zero_reason_dwell['forward_loss_feedback_wait'], covered),
+                      "transition_zero_percent": ratio(
+                          zero_reason_dwell['cross_wait_zero']+
+                          zero_reason_dwell['cross_timeout_zero']+
+                          zero_reason_dwell['forward_loss_decelerating']+
+                          zero_reason_dwell['forward_loss_feedback_wait'], covered),
                       "wheel_dispatch_reasons": dict(wheel_dispatch_reasons),
                       "positive_requested_but_zero_dispatch_records": wheel_positive_to_zero,
+                      "cross_brake_records": dict(cross_brake_records),
+                      "cross_completed_wait_ms": distribution(list(cross_completed_ms.values())),
+                      "cross_timeout_distinct_episodes": len(cross_timeout_episodes),
+                      "held_without_motor_write_records": wheel_held_without_write,
                       "requested_to_dispatched_loss_rpm": distribution(wheel_dispatch_losses),
                       "direct_stop_records": direct_stop_records,
                       "follow_tick_reasons": dict(follow_ticks),
@@ -861,6 +887,8 @@ def comparison(current, previous):
         ("control", "pid_to_approved_loss_rpm_distinct_samples", "mean"),
         ("execution", "zero_command_percent"), ("execution", "time_weighted_command_base_rpm"),
         ("execution", "cross_wait_zero_percent"),
+        ("execution", "forward_loss_zero_percent"),
+        ("execution", "transition_zero_percent"),
         ("execution", "requested_to_dispatched_loss_rpm", "mean"),
     )
     result = {}

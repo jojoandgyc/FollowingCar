@@ -514,7 +514,9 @@ def main() -> int:
         len(unsteerable_hold.actions) != 1
         or unsteerable_hold.actions[0].kind != "backward"
         or unsteerable_hold.explicit_stop_requested
-        or unsteerable_hold.reason != "visual_near_guard_reverse"
+        # The unified startup gate locks before the first safety evaluation;
+        # the visual near guard is therefore already active from frame 1.
+        or unsteerable_hold.reason != "reverse_distance_missing_hold"
         or unsteerable_hold_controller.search_state != "none"
         or unsteerable_hold_controller._lost_started_at is not None
     ):
@@ -759,7 +761,9 @@ def main() -> int:
             width=640,
             height=480,
             persons=[PersonTarget((312, 120, 392, 430), track_id=19, confidence=0.9, area=24800)],
-            distance_m=1.75,
+            # Start outside the near-distance latch, then enter it while the
+            # target is moving outward. Startup itself now runs safety checks.
+            distance_m=2.0,
             steering_feedback=SteeringFeedback(
                 timestamp=time.monotonic(),
                 yaw_rate_right_dps=0.0,
@@ -1248,7 +1252,14 @@ def main() -> int:
         near_rotation_frame,
         longitudinal_only=True,
     )
-    if depth_near_hold.actions or depth_near_hold.reason != "longitudinal_near_rotation_hold":
+    # An explicit longitudinal zero withdraws forward authority; it does not
+    # replace the independently published visual yaw with a STOP action.
+    if (len(depth_near_hold.actions) != 1
+            or depth_near_hold.actions[0].kind != "forward"
+            or depth_near_hold.actions[0].speed_percent != 0
+            or depth_near_hold.actions[0].steer_correction_rpm != 0
+            or depth_near_hold.explicit_stop_requested
+            or depth_near_hold.reason != "longitudinal_near_rotation_hold"):
         raise AssertionError(
             "Depth30 near-distance update must preserve the visual yaw command: "
             f"{depth_near_hold}"
@@ -2004,8 +2015,14 @@ def main() -> int:
     startup_controller = FollowSafetyController(startup_cfg)
     d_start_empty = startup_controller.decide(1, SensorFrame(width=640, height=480, persons=[]))
     print("startup_wait:", d_start_empty.actions, d_start_empty.reason)
-    if d_start_empty.actions or d_start_empty.explicit_stop_requested or d_start_empty.reason != "wait_first_person":
-        raise AssertionError(f"startup with no person should idle in place, got {d_start_empty}")
+    if (
+        not d_start_empty.soft_stop_requested
+        or not d_start_empty.clear_action_queue
+        or not d_start_empty.stop_action_execution
+        or any(a.kind != "stop" for a in d_start_empty.actions)
+        or d_start_empty.reason != "wait_first_person"
+    ):
+        raise AssertionError(f"startup with no person must cancel motion and wait, got {d_start_empty}")
     d_start_confirm_1 = startup_controller.decide(2, normal)
     print("startup_confirm_1:", d_start_confirm_1.actions, d_start_confirm_1.reason, startup_controller.active_target_id)
     if (
@@ -2068,20 +2085,20 @@ def main() -> int:
         1,
         SensorFrame(width=640, height=480, persons=[geometry_person], distance_m=2.0),
     )
-    if geometry_startup_controller.active_target_id != -2:
+    if geometry_startup_controller.active_target_id is not None:
         raise AssertionError(
-            "geometry fallback should be represented as the unconfirmed -2 target"
+            "geometry fallback must not create an initial identity lock"
         )
     d_geometry_lost = geometry_startup_controller.decide(
         2,
         SensorFrame(width=640, height=480, persons=[], distance_m=2.0),
     )
     if (
-        not d_geometry_lost.explicit_stop_requested
+        not d_geometry_lost.soft_stop_requested
         or not d_geometry_lost.clear_action_queue
         or not d_geometry_lost.stop_action_execution
-        or d_geometry_lost.actions
-        or d_geometry_lost.reason != "unconfirmed_target_wait"
+        or any(a.kind != "stop" for a in d_geometry_lost.actions)
+        or d_geometry_lost.reason != "wait_first_person"
         or geometry_startup_controller.search_state != "none"
     ):
         raise AssertionError(
@@ -2092,7 +2109,10 @@ def main() -> int:
         3,
         SensorFrame(width=640, height=480, persons=[], distance_m=2.0),
     )
-    if d_geometry_lost_again.reason != "unconfirmed_target_wait" or d_geometry_lost_again.actions:
+    if (
+        d_geometry_lost_again.reason != "wait_first_person"
+        or any(a.kind != "stop" for a in d_geometry_lost_again.actions)
+    ):
         raise AssertionError(
             "repeated geometry-only loss must remain stopped, "
             f"got {d_geometry_lost_again}"
@@ -2639,6 +2659,11 @@ def main() -> int:
         search_rotate_distance_block_enable=True,
     )
     blocked_search_controller = FollowSafetyController(blocked_search_cfg)
+    # Search safety is exercised only after an actual identity lock. The
+    # historical pre-first-person search switch no longer starts rotation.
+    blocked_search_controller.active_target_id = 1
+    blocked_search_controller._has_seen_person = True
+    blocked_search_controller.lost_confirm_frames = blocked_search_cfg.lost_confirm_frames
     near_empty = SensorFrame(
         width=640,
         height=480,
@@ -4003,13 +4028,14 @@ def main() -> int:
     candidate_decision = candidate_controller.decide(200, candidate_frame)
     if (
         not candidate_decision.actions
-        or candidate_decision.actions[0].kind != "rotate_right"
+        or candidate_decision.actions[0].kind != "stop"
         or candidate_decision.explicit_stop_requested
         or candidate_decision.is_forwarding
-        or candidate_decision.reason != "initial_candidate_centering_right"
+        or not candidate_decision.soft_stop_requested
+        or candidate_decision.reason != "initial_candidate_confirmation_hold"
     ):
         raise AssertionError(
-            f"unconfirmed off-center candidate must yaw-center without forward motion: {candidate_decision}"
+            f"unconfirmed off-center candidate must remain stopped: {candidate_decision}"
         )
     if not candidate_decision.clear_action_queue:
         raise AssertionError("the first candidate frame must clear stale queued motion")

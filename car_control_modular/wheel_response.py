@@ -9,7 +9,8 @@ class WheelDifferentialResponse:
         self.uid = None
         self.feedback_ts = 0.0
 
-    def observe_and_note(self, uid, pair, sent_at, previous_sent, feedback):
+    def observe_and_note(self, uid, pair, sent_at, previous_sent, feedback,
+                         *, packet_written=True):
         # A writer/guard reset or another motion mode invalidates our history.
         if (uid != self.uid or not self.history
                 or abs(self.history[-1][0] - previous_sent) > 1e-6
@@ -34,7 +35,9 @@ class WheelDifferentialResponse:
                 reference = eligible[-1]
                 measured = feedback.left_forward_rpm - feedback.right_forward_rpm
                 elapsed = max(0.0, feedback.timestamp - reference[2])
-                lagging = bool(abs(reference[1]) >= 6 and elapsed >= .20
+                # Commissioning observation: motors may need at least 500ms
+                # to build speed. Earlier samples are ramp diagnostics only.
+                lagging = bool(abs(reference[1]) >= 6 and elapsed >= .50
                                and measured * (1 if reference[1] > 0 else -1) < .5 * abs(reference[1]))
         diff = pair[0] - pair[1]
         since = sent_at
@@ -42,7 +45,8 @@ class WheelDifferentialResponse:
             last = self.history[-1]
             if diff * last[1] > 0 and abs(diff - last[1]) <= 2:
                 since = last[2]
-        self.history.append((sent_at, diff, since))
+        if packet_written:
+            self.history.append((sent_at, diff, since))
         return {
             "reference_diff": None if reference is None else reference[1],
             "reference_sent": None if reference is None else reference[0],

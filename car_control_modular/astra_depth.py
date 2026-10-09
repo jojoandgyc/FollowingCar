@@ -17,6 +17,7 @@ from .depth_orientation import configure_orientation, read_orientation
 from .depth_torso_selection import allow_sparse_torso_continuation, select_torso_candidate_group
 from .depth_torso_recovery import assess_torso_recovery, torso_evidence_continuous
 from .depth_temporal_filter import append_depth_sample, reset_depth_window
+from .depth_roi_policy import BoundedDepthSelection
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,7 @@ class AstraDepthMeasurement:
     filter_expired_count: int = 0
     filter_reset_count: int = 0
     filter_window_count: int = 0
+    bounded_roi_selection: Optional[BoundedDepthSelection] = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,8 @@ class _DepthClusterCandidate:
 
 class AstraDepthRuntime:
     """Own synchronized OpenNI RGB/depth streams and target ROI ranging."""
+
+    supports_bounded_depth_roi = True
 
     def __init__(
         self,
@@ -354,6 +358,7 @@ class AstraDepthRuntime:
         *,
         reference_timestamp: Optional[float] = None,
         use_latest_depth: bool = False,
+        bounded_roi_capture_timestamp: Optional[float] = None,
     ):
         """Return the Depth frame closest to the RGB capture time.
 
@@ -362,6 +367,22 @@ class AstraDepthRuntime:
         real RGB capture timestamp is available, it is authoritative; the
         configured delay is only a fallback for older callers.
         """
+        if bounded_roi_capture_timestamp is not None:
+            from .depth_roi_policy import bounded_depth_sample_allowed
+            # Admission must use the time the camera lock was obtained, not
+            # an earlier pre-lock snapshot. Waiting cannot admit an old ROI.
+            now = time.monotonic()
+            # Selection and the latest/history snapshot share the camera lock.
+            # Never fall back to a newer frame outside the ROI's 180ms window.
+            candidates = tuple(self._depth_history) + ((self._latest_depth_ts, self._latest_depth),)
+            eligible = [(stamp, frame) for stamp, frame in candidates
+                        if frame is not None and bounded_depth_sample_allowed(
+                            bounded_roi_capture_timestamp, stamp, now, self.config.max_frame_age_sec)]
+            if not eligible:
+                return None, 0.0, 0.0
+            sample_ts, depth = max(eligible, key=lambda item: item[0])
+            self._measurement_bounded_selected_at = now
+            return depth, float(sample_ts), float(sample_ts)-bounded_roi_capture_timestamp
         if use_latest_depth:
             return (
                 self._latest_depth,
@@ -996,12 +1017,15 @@ class AstraDepthRuntime:
         steering_feedback=None,
         reference_timestamp: Optional[float] = None,
         evidence_capture_frame_id: Optional[int] = None,
+        bounded_roi_capture_timestamp: Optional[float] = None,
     ) -> AstraDepthMeasurement:
         # Search reacquisition can also measure outside the main control
         # mutex. Keep sample deduplication, filtering and confirmation atomic.
         with self._measurement_lock:
             started = time.monotonic()
             self._measurement_sample_ts = None
+            self._measurement_bounded_selection = None
+            self._measurement_bounded_selected_at = None
             self._measurement_temporal_status = "no_sample"
             self._last_torso_selection = None
             self._measurement_regions = []
@@ -1011,10 +1035,15 @@ class AstraDepthRuntime:
             self._measurement_torso_recovery_status = "not_evaluated"
             self._measurement_filter_expired_count = 0
             self._measurement_filter_reset_count = 0
+            bounded_kwargs = ({} if bounded_roi_capture_timestamp is None else {
+                "bounded_roi_capture_timestamp": bounded_roi_capture_timestamp,
+                "evidence_capture_frame_id": evidence_capture_frame_id,
+            })
             result = self._measure_target_locked(
                 bbox, frame_width, frame_height, target_id=target_id,
                 use_latest_depth=use_latest_depth, steering_feedback=steering_feedback,
                 reference_timestamp=reference_timestamp,
+                **bounded_kwargs,
             )
             # Only a genuinely new failed observation breaks the accepted
             # torso shortcut. Old/duplicate reads cannot revoke newer evidence.
@@ -1024,7 +1053,23 @@ class AstraDepthRuntime:
                 or (use_latest_depth and self._measurement_temporal_status == "no_sample")
             ):
                 self._last_torso_recovery_evidence = None
-            source = "latest" if use_latest_depth else "rgb_aligned"
+            source = ("roi_bounded_history" if bounded_roi_capture_timestamp is not None
+                      else "latest" if use_latest_depth else "rgb_aligned")
+            if bounded_roi_capture_timestamp is not None:
+                selection = self._measurement_bounded_selection
+                self.logger.info(
+                    "Depth ROI bounded history: capture=%s roi_capture_ts=%s sample_ts=%s "
+                    "skew_ms=%s latest_ts=%s selected_ts=%s selection_roi_age_ms=%s "
+                    "completion_roi_age_ms=%.1f physical_deadline_unchanged=True",
+                    evidence_capture_frame_id, bounded_roi_capture_timestamp, self._measurement_sample_ts,
+                    None if self._measurement_sample_ts is None else
+                    (self._measurement_sample_ts-bounded_roi_capture_timestamp)*1000.,
+                    self._latest_depth_ts,
+                    None if selection is None else selection.selected_timestamp,
+                    None if selection is None else
+                    (selection.selected_timestamp-bounded_roi_capture_timestamp)*1000.,
+                    (time.monotonic()-bounded_roi_capture_timestamp)*1000.,
+                )
             result = replace(
                 result, observation_sample_timestamp=self._measurement_sample_ts,
                 observation_source=source, temporal_status=self._measurement_temporal_status,
@@ -1035,6 +1080,7 @@ class AstraDepthRuntime:
                 filter_expired_count=self._measurement_filter_expired_count,
                 filter_reset_count=self._measurement_filter_reset_count,
                 filter_window_count=len(self._distance_history),
+                bounded_roi_selection=self._measurement_bounded_selection,
             )
             finished = time.monotonic()
             if (result.sample_timestamp is not None and result.raw_distance_m is not None
@@ -1124,6 +1170,8 @@ class AstraDepthRuntime:
         use_latest_depth: bool = False,
         steering_feedback=None,
         reference_timestamp: Optional[float] = None,
+        bounded_roi_capture_timestamp: Optional[float] = None,
+        evidence_capture_frame_id: Optional[int] = None,
     ) -> AstraDepthMeasurement:
         now = time.monotonic()
         current_target_id = None if target_id is None else int(target_id)
@@ -1147,12 +1195,36 @@ class AstraDepthRuntime:
                 now,
                 reference_timestamp=reference_timestamp,
                 use_latest_depth=bool(use_latest_depth),
+                **({} if bounded_roi_capture_timestamp is None else
+                   {"bounded_roi_capture_timestamp": bounded_roi_capture_timestamp}),
             )
+        if bounded_roi_capture_timestamp is not None:
+            # The camera lock may have blocked while a new frame arrived.
+            # All following age/hold checks must use post-selection time,
+            # never the earlier function-entry time (which can predate it).
+            now = time.monotonic()
         if depth is None or not math.isfinite(float(sample_ts)) or sample_ts <= 0.0:
             if use_latest_depth:
                 self._reset_pending_jump()
-            return self._held_measurement(now, "no_depth_frame")
+            return self._held_measurement(now, "no_bounded_roi_depth_frame"
+                                          if bounded_roi_capture_timestamp is not None else "no_depth_frame")
         self._measurement_sample_ts = float(sample_ts)
+        if bounded_roi_capture_timestamp is not None:
+            self._measurement_bounded_selection = BoundedDepthSelection(
+                capture_timestamp=bounded_roi_capture_timestamp,
+                sample_timestamp=float(sample_ts),
+                selected_timestamp=getattr(self, "_measurement_bounded_selected_at", None),
+                target_id=current_target_id, capture_frame_id=evidence_capture_frame_id,
+                bbox=tuple(bbox),
+            )
+            if not self._measurement_bounded_selection.valid_for(
+                capture_timestamp=bounded_roi_capture_timestamp, sample_timestamp=sample_ts,
+                now=now, target_id=current_target_id, capture_frame_id=evidence_capture_frame_id,
+                bbox=bbox, max_sample_age=self.config.max_frame_age_sec,
+            ):
+                self._measurement_temporal_status = "bounded_selection_invalid"
+                self._measurement_bounded_selection = None
+                return self._held_measurement(now, "invalid_bounded_roi_selection")
         previous_attempt_ts = self._last_processed_depth_ts
         sample_age = now - sample_ts
         if sample_age < 0.0 or sample_age > max(0.01, float(self.config.max_frame_age_sec)):
@@ -1476,7 +1548,17 @@ class AstraDepthRuntime:
                     region_count=region_count,
                 )
         sampled_now = time.monotonic()
-        if not 0.0 <= sampled_now - sample_ts <= max(0.01, float(self.config.max_frame_age_sec)):
+        bounded_sample_valid = True
+        if bounded_roi_capture_timestamp is not None:
+            selection = self._measurement_bounded_selection
+            bounded_sample_valid = isinstance(selection, BoundedDepthSelection) and selection.valid_for(
+                capture_timestamp=bounded_roi_capture_timestamp, sample_timestamp=sample_ts,
+                now=sampled_now, target_id=current_target_id,
+                capture_frame_id=evidence_capture_frame_id, bbox=bbox,
+                max_sample_age=self.config.max_frame_age_sec,
+            )
+        if (not bounded_sample_valid or
+                not 0.0 <= sampled_now - sample_ts <= max(0.01, float(self.config.max_frame_age_sec))):
             self._measurement_temporal_status = "expired_during_sampling"
             if is_new_depth and not out_of_order:
                 self._reset_pending_jump()

@@ -56,6 +56,7 @@ class OSNetRKNNExtractor:
         }
         self.last_partial_features: List[Optional[Any]] = []
         self.last_partial_feature_sources: List[Optional[str]] = []
+        self.last_color_features: List[Optional[Any]] = []
         if config.enabled and config.model_path:
             self.session = RKNNInferenceSession(
                 config.model_path,
@@ -72,6 +73,9 @@ class OSNetRKNNExtractor:
         *,
         compute_partial: bool = True,
     ) -> List[Optional[Any]]:
+        # Clear auxiliary evidence before any conversion/inference can fail;
+        # a failed capture must never expose the previous capture's colors.
+        self.last_color_features = [None for _ in detections]
         if not self.config.enabled or self.session is None or not detections:
             self._set_empty_timing(len(detections))
             return [None for _ in detections]
@@ -87,6 +91,7 @@ class OSNetRKNNExtractor:
         features: List[Optional[Any]] = []
         partial_features: List[Optional[Any]] = []
         partial_sources: List[Optional[str]] = []
+        color_features: List[Optional[Any]] = []
         for det in detections:
             prep_start = time.perf_counter()
             crop = self._crop(arr, det.bbox)
@@ -95,6 +100,7 @@ class OSNetRKNNExtractor:
                 features.append(None)
                 partial_features.append(None)
                 partial_sources.append(None)
+                color_features.append(None)
                 continue
             tensor = self._prepare_crop(crop, fmt)
             infer_start = time.perf_counter()
@@ -107,14 +113,18 @@ class OSNetRKNNExtractor:
                 features.append(None)
                 partial_features.append(None)
                 partial_sources.append(None)
+                color_features.append(None)
                 continue
             # Keep the raw normalized OSNet vector while the full-body feature
             # optionally receives an appended color cue.
             osnet_feat = _normalize_embedding(outputs[0])
             feat = osnet_feat.copy()
+            color = None
             if self.config.color_fusion_enable:
                 color_start = time.perf_counter()
-                color = _color_signature(crop)
+                # The histogram's color space is BGR regardless of the
+                # model's input format. Reuse this same existing color pass.
+                color = _color_signature(crop[:, :, ::-1] if fmt == "RGB" else crop)
                 if color is not None:
                     feat = _fuse_appearance_features(
                         feat,
@@ -156,6 +166,7 @@ class OSNetRKNNExtractor:
             features.append(feat)
             partial_features.append(partial_feature)
             partial_sources.append(partial_source)
+            color_features.append(color)
         end = time.perf_counter()
         self.last_timing_ms = {
             "preprocess": preprocess_ms,
@@ -170,6 +181,7 @@ class OSNetRKNNExtractor:
         }
         self.last_partial_features = partial_features
         self.last_partial_feature_sources = partial_sources
+        self.last_color_features = color_features
         return features
 
     def release(self) -> None:
@@ -194,6 +206,7 @@ class OSNetRKNNExtractor:
         }
         self.last_partial_features = [None for _ in range(max(0, int(detections)))]
         self.last_partial_feature_sources = [None for _ in range(max(0, int(detections)))]
+        self.last_color_features = [None for _ in range(max(0, int(detections)))]
 
     def _crop(self, arr: Any, bbox):
         x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]

@@ -51,7 +51,7 @@ if not records:
 metrics = (
     "cycle_ms", "capture_ms", "detect_ms", "detect_preprocess_ms",
     "detect_inference_ms", "detect_decode_ms", "detect_nms_ms", "select_ms",
-    "ir_ms", "depth_ms", "decision_ms", "dispatch_ms", "total_ms",
+    "ir_ms", "depth_ms", "decision_ms", "search_policy_ms", "dispatch_ms", "total_ms",
 )
 
 def percentile(values, fraction):

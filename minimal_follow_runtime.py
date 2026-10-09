@@ -109,6 +109,7 @@ class RuntimeConfig:
     reid_full_match_threshold: float
     reid_torso_match_threshold: float
     reid_confirm_hits: int
+    motor_target_min_interval_sec: float
     motor_enabled: bool
     front_ir_enabled: bool
 
@@ -146,6 +147,10 @@ class RuntimeConfig:
             reid_full_match_threshold=_float_env("MINIMAL_REID_FULL_THRESHOLD", 0.70),
             reid_torso_match_threshold=_float_env("MINIMAL_REID_TORSO_THRESHOLD", 0.76),
             reid_confirm_hits=max(1, _int_env("MINIMAL_REID_CONFIRM_HITS", 2)),
+            motor_target_min_interval_sec=max(0.02, _float_env(
+                "MINIMAL_MOTOR_TARGET_MIN_INTERVAL_SEC",
+                _float_env("MOTOR_RS485_TARGET_MIN_INTERVAL_SEC", 0.05),
+            )),
             motor_enabled=bool(motor_enabled),
             front_ir_enabled=_bool_env("MINIMAL_FRONT_IR_ENABLE", True),
         )
@@ -155,11 +160,13 @@ class MinimalFollowRuntime:
     def __init__(self, config: RuntimeConfig) -> None:
         self.config = config
         self.running = True
+        self.fatal_motor_fault: Optional[str] = None
         self.camera = None
         self.next_camera_retry_at = 0.0
         self.last_camera_warning_at = 0.0
         self.last_command_key = None
         self.last_stop_at = 0.0
+        self.last_motion_target_at = 0.0
         self.frame_index = 0
         self.previous_frame_started_at: Optional[float] = None
         self.motor: Optional[MssdMotorBackend] = None
@@ -243,12 +250,12 @@ class MinimalFollowRuntime:
             self.motor = self._make_motor()
         LOG.info(
             "minimal follow ready motor_enabled=%s target=%.2fm deadband=%.2fm camera=%s %dx%d@%.1f "
-            "search(enabled=%s steer_memory=%.2fs target_memory=%.2fs fallback=%s directed=%.2fs sweep=%.2fs timeout=%.2fs turn=%d%%)",
+            "search(enabled=%s steer_memory=%.2fs target_memory=%.2fs fallback=%s directed=%.2fs sweep=%.2fs timeout=%.2fs turn=%d%%) motor_target_min_interval=%.3fs",
             config.motor_enabled, config.target_distance_m, config.distance_deadband_m,
             config.camera_device, config.camera_width, config.camera_height, config.camera_fps,
             config.search_enabled, config.search_turn_memory_sec, config.search_target_memory_sec,
             config.search_fallback_direction, config.search_directed_sec, config.search_sweep_half_cycle_sec,
-            config.search_timeout_sec, config.search_turn_percent,
+            config.search_timeout_sec, config.search_turn_percent, config.motor_target_min_interval_sec,
         )
 
     def _make_reid_policy(self) -> ReidPolicy:
@@ -409,13 +416,40 @@ class MinimalFollowRuntime:
             # Every new STOP reason must be sent immediately. Repeated held
             # stops are rate-limited only to avoid needless RS485 traffic.
             if changed or now - self.last_stop_at >= 1.0:
-                self.motor.send_stop("minimal_" + command.reason, mode="emergency")
+                try:
+                    self.motor.send_stop("minimal_" + command.reason, mode="emergency")
+                except Exception as exc:
+                    return self._handle_motor_link_fault(command.reason, exc)
                 self.last_stop_at = now
+            return True
+        if not changed and now - self.last_motion_target_at < self.config.motor_target_min_interval_sec:
             return True
         left = self.motor.wheel_state_to_target("left", command.left_percent, command.left_state)
         right = self.motor.wheel_state_to_target("right", command.right_percent, command.right_state)
-        self.motor.send_targets(left, right, "minimal_" + command.reason)
+        try:
+            self.motor.send_targets(left, right, "minimal_" + command.reason)
+        except Exception as exc:
+            return self._handle_motor_link_fault(command.reason, exc)
+        self.last_motion_target_at = now
         return True
+
+    def _handle_motor_link_fault(self, command_reason: str, exc: Exception) -> bool:
+        """Stop this runtime after a latched/uncertain RS485 transaction fault.
+
+        ``MssdMotorBackend`` already performs its bounded zero-and-emergency-
+        stop rollback before it re-raises this exception. Sending more motor
+        writes from here could further corrupt an uncertain RTU stream, so the
+        safe action is to revoke control and require a manual restart.
+        """
+        LOG.critical(
+            "minimal motor link fault reason=%s error=%s; motor backend attempted emergency rollback; "
+            "physical stillness is unverified, check vehicle before restart",
+            command_reason, exc,
+        )
+        self.fatal_motor_fault = f"{type(exc).__name__}: {exc}"
+        self.running = False
+        self.last_command_key = None
+        return False
 
     def _log_frame_timing(
         self,
@@ -617,7 +651,10 @@ class MinimalFollowRuntime:
                 self.motor.send_stop("minimal_shutdown", mode="emergency")
             except Exception:
                 LOG.exception("minimal shutdown stop failed")
-            self.motor.close()
+            try:
+                self.motor.close()
+            except Exception:
+                LOG.exception("minimal motor close failed")
             self.motor = None
         if self.camera is not None:
             self.camera.release()
@@ -655,7 +692,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
     try:
         runtime.run()
-        return 0
+        return 1 if runtime.fatal_motor_fault else 0
     finally:
         runtime.close()
 

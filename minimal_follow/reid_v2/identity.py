@@ -48,6 +48,8 @@ class ReidDecision:
     worker_timing_ms: Optional[dict]
     full_templates: int = 0
     torso_templates: int = 0
+    probe_candidates: int = 0
+    probe_attempts: int = 0
 
 
 class ReidPolicy:
@@ -61,8 +63,12 @@ class ReidPolicy:
         self._last_bbox: Optional[BBox] = None
         self._stable_frames = 0
         self._latest_match: Optional[tuple[ReidResult, Match, float]] = None
-        self._confirmations: list[bool] = []
         self._last_worker_timing: Optional[dict] = None
+        self._probe_bbox: Optional[BBox] = None
+        self._probe_cursor = 0
+        self._probe_attempts = 0
+        self._probe_hits = 0
+        self._probe_candidates = 0
 
     @staticmethod
     def _view_bin(bbox: BBox, frame_width: int) -> int:
@@ -141,6 +147,7 @@ class ReidPolicy:
             None if match is None else match.score,
             None if match is None else match.source,
             age_ms, self._last_worker_timing, self.profile.full_count, self.profile.torso_count,
+            self._probe_candidates, self._probe_attempts,
         )
 
     def _same_result_candidate(self, evidence_bbox: BBox, candidate: ReidCandidate, frame_width: int) -> bool:
@@ -149,6 +156,66 @@ class ReidPolicy:
         ax = (evidence_bbox[0] + evidence_bbox[2]) * 0.5
         bx = (candidate.bbox[0] + candidate.bbox[2]) * 0.5
         return abs(ax - bx) <= max(16.0, float(frame_width) * 0.18)
+
+    def _reset_probe(self, *, advance: bool = False) -> None:
+        if advance:
+            self._probe_cursor += 1
+        self._probe_bbox = None
+        self._probe_attempts = 0
+        self._probe_hits = 0
+
+    @staticmethod
+    def _ordered_candidates(candidates: list[ReidCandidate]) -> list[ReidCandidate]:
+        # Stable left-to-right ordering makes round-robin evidence clear in
+        # logs and guarantees a large bystander cannot starve other people.
+        return sorted(candidates, key=lambda item: ((item.bbox[0] + item.bbox[2]) * 0.5, -item.score))
+
+    def _probe_candidate(self, candidates: list[ReidCandidate], frame_width: int) -> Optional[ReidCandidate]:
+        ordered = self._ordered_candidates(candidates)
+        self._probe_candidates = len(ordered)
+        if not ordered:
+            return None
+        if self._probe_bbox is not None:
+            for candidate in ordered:
+                if self._same_result_candidate(self._probe_bbox, candidate, frame_width):
+                    return candidate
+            self._reset_probe(advance=True)
+        return ordered[self._probe_cursor % len(ordered)]
+
+    def _candidate_for_evidence(
+        self, evidence_bbox: BBox, candidates: list[ReidCandidate], frame_width: int,
+    ) -> Optional[ReidCandidate]:
+        for candidate in self._ordered_candidates(candidates):
+            if self._same_result_candidate(evidence_bbox, candidate, frame_width):
+                return candidate
+        return None
+
+    def _consume_reacquire_result(
+        self, candidates: list[ReidCandidate], frame_width: int,
+    ) -> tuple[Optional[ReidCandidate], Optional[Match], Optional[float], Optional[str]]:
+        if self._latest_match is None:
+            return None, None, None, None
+        evidence, match, age_ms = self._latest_match
+        self._latest_match = None
+        candidate = self._candidate_for_evidence(evidence.bbox, candidates, frame_width)
+        same_probe = candidate is not None and self._probe_bbox is not None and self._same_result_candidate(
+            self._probe_bbox, candidate, frame_width,
+        )
+        if not same_probe:
+            self._reset_probe(advance=True)
+            return None, match, age_ms, "reid_candidate_left"
+        self._probe_attempts += 1
+        threshold = self.config.full_threshold if match.source == "full" else self.config.torso_threshold
+        hit = bool(match.score is not None and match.score >= threshold)
+        if hit:
+            self._probe_hits += 1
+            if self._probe_hits >= max(1, self.config.confirm_hits):
+                self._reset_probe()
+                return candidate, match, age_ms, "reid_confirmed"
+        if self._probe_attempts >= max(1, self.config.confirm_window):
+            self._reset_probe(advance=True)
+            return None, match, age_ms, "reid_mismatch"
+        return None, match, age_ms, "reid_confirming" if hit else "reid_probe_retry"
 
     def observe(self, *, frame, candidates: list[ReidCandidate], frame_id: int, now: float,
                 frame_width: int, frame_height: int) -> ReidDecision:
@@ -185,27 +252,23 @@ class ReidPolicy:
                          frame_width=frame_width, frame_height=frame_height)
             return self._decision(True, associated, state="LOCKED", reason="geometry_associated")
 
-        # No continuous target: do not hand control to any new detection until
-        # its ReID result is fresh and repeatedly confirmed.
+        # No continuous target: probe every detected person in turn. A large
+        # bystander gets at most one confirmation window before the next
+        # candidate is sampled, while the normal control loop stays nonblocking.
+        if self.state != "SEARCHING":
+            self._reset_probe()
         self.state = "SEARCHING"
-        candidate = associated or associate(candidates, None, frame_width=frame_width, frame_height=frame_height,
-                                             min_iou=self.config.min_iou, max_center_distance_ratio=self.config.max_center_distance_ratio)
-        if candidate is None:
-            self._confirmations.clear()
-            return self._decision(False, None, state="SEARCHING", reason="no_candidate")
-        self._submit(frame=frame, candidate=candidate, frame_id=frame_id, now=now, purpose="reacquire",
-                     frame_width=frame_width, frame_height=frame_height)
-        if self._latest_match is None:
-            return self._decision(False, None, state="SEARCHING", reason="reid_pending")
-        evidence, match, age_ms = self._latest_match
-        self._latest_match = None
-        threshold = self.config.full_threshold if match.source == "full" else self.config.torso_threshold
-        hit = bool(match.score is not None and match.score >= threshold and self._same_result_candidate(evidence.bbox, candidate, frame_width))
-        self._confirmations.append(hit)
-        del self._confirmations[:-max(1, self.config.confirm_window)]
-        if sum(self._confirmations) >= max(1, self.config.confirm_hits):
+        confirmed, match, age_ms, result_reason = self._consume_reacquire_result(candidates, frame_width)
+        if confirmed is not None:
             self.state = "LOCKED"
-            self._last_bbox = candidate.bbox
-            self._confirmations.clear()
-            return self._decision(True, candidate, state="LOCKED", reason="reid_confirmed", match=match, age_ms=age_ms)
-        return self._decision(False, None, state="SEARCHING", reason="reid_mismatch" if not hit else "reid_confirming", match=match, age_ms=age_ms)
+            self._last_bbox = confirmed.bbox
+            return self._decision(True, confirmed, state="LOCKED", reason="reid_confirmed", match=match, age_ms=age_ms)
+        candidate = self._probe_candidate(candidates, frame_width)
+        if candidate is None:
+            self._reset_probe()
+            return self._decision(False, None, state="SEARCHING", reason=result_reason or "no_candidate", match=match, age_ms=age_ms)
+        submitted = self._submit(frame=frame, candidate=candidate, frame_id=frame_id, now=now, purpose="reacquire",
+                                 frame_width=frame_width, frame_height=frame_height)
+        if submitted:
+            self._probe_bbox = candidate.bbox
+        return self._decision(False, None, state="SEARCHING", reason=result_reason or ("reid_pending" if submitted else "reid_rate_limited"), match=match, age_ms=age_ms)

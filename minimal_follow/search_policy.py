@@ -22,6 +22,8 @@ class LostPersonSearchConfig:
     target_direction_memory_sec: float = 3.0
     target_side_deadband_ratio: float = 0.03
     fallback_direction: str = "left"
+    directed_search_sec: float = 2.0
+    sweep_half_cycle_sec: float = 3.0
     timeout_sec: float = 1.5
     turn_percent: int = 8
 
@@ -103,12 +105,29 @@ class LostPersonSearchPolicy:
             elapsed_ms = max(0.0, now - self._search_started_at) * 1000.0
         return LostPersonSearchStatus(self._state, direction, self._lost_frames, elapsed_ms)
 
+    @staticmethod
+    def _opposite(direction: str) -> str:
+        return "right" if direction == "left" else "left"
+
+    def _search_direction_for_elapsed(self, now: float, initial_direction: str) -> tuple[str, str]:
+        """First look where the target left, then repeatedly scan both sides."""
+        if self._search_started_at is None:
+            return initial_direction, "directed"
+        elapsed = max(0.0, now - self._search_started_at)
+        directed = max(0.0, float(self.config.directed_search_sec))
+        if elapsed < directed:
+            return initial_direction, "directed"
+        half_cycle = max(0.1, float(self.config.sweep_half_cycle_sec))
+        phase = int((elapsed - directed) / half_cycle)
+        direction = self._opposite(initial_direction) if phase % 2 == 0 else initial_direction
+        return direction, f"sweep_{phase + 1}"
+
     def visible(self, now: float) -> LostPersonSearchStatus:
         if not self._valid_now(now):
             raise ValueError("now must be a finite monotonic timestamp")
         # Search uses one reversed wheel. Stop once before normal forward or
         # differential-follow commands can reverse that wheel again.
-        was_rotating = self._state == "searching"
+        was_rotating = self._state.startswith("searching")
         self._lost_frames = 0
         self._search_started_at = None
         self._search_direction = None
@@ -121,34 +140,35 @@ class LostPersonSearchPolicy:
         if not self._valid_now(now):
             raise ValueError("now must be a finite monotonic timestamp")
         now = float(now)
-        direction = self._search_direction or self._fresh_direction(now)
+        initial_direction = self._search_direction or self._fresh_direction(now)
         self._lost_frames += 1
 
         if front_obstacle:
             self._search_started_at = None
             self._search_direction = None
             self._state = "front_ir"
-            return MinimalFollowCommand.stop("front_ir"), self._status(now, direction)
+            return MinimalFollowCommand.stop("front_ir"), self._status(now, initial_direction)
         if not self.config.enabled:
             self._search_started_at = None
             self._search_direction = None
             self._state = "disabled"
-            return MinimalFollowCommand.stop("person_missing"), self._status(now, direction)
+            return MinimalFollowCommand.stop("person_missing"), self._status(now, initial_direction)
         if self._lost_frames < max(1, int(self.config.lost_confirm_frames)):
             self._search_started_at = None
             self._search_direction = None
             self._state = "lost_confirming"
-            return MinimalFollowCommand.stop("person_missing_confirming"), self._status(now, direction)
+            return MinimalFollowCommand.stop("person_missing_confirming"), self._status(now, initial_direction)
         if self._search_started_at is None:
             self._search_started_at = now
-            self._search_direction = direction
+            self._search_direction = initial_direction
             self._state = "search_transition_stop"
-            return MinimalFollowCommand.stop("search_transition_stop"), self._status(now, direction)
+            return MinimalFollowCommand.stop("search_transition_stop"), self._status(now, initial_direction)
         if now - self._search_started_at + 1e-9 >= max(0.0, float(self.config.timeout_sec)):
             self._state = "search_timeout"
-            return MinimalFollowCommand.stop("search_timeout"), self._status(now, direction)
+            return MinimalFollowCommand.stop("search_timeout"), self._status(now, self._search_direction)
 
-        self._state = "searching"
+        direction, phase = self._search_direction_for_elapsed(now, self._search_direction or initial_direction)
+        self._state = "searching_" + phase
         if direction == "left":
             command = MinimalFollowCommand.rotate_left(self.config.turn_percent)
         else:

@@ -68,9 +68,36 @@ def test_reacquire_requires_repeated_fresh_reid_evidence():
     missing = policy.observe(frame=frame, candidates=[], frame_id=3, now=2.0, frame_width=640, frame_height=480)
     assert not missing.accepted and missing.state == "SEARCHING"
 
+    pending = policy.observe(frame=frame, candidates=[candidate], frame_id=4, now=2.01, frame_width=640, frame_height=480)
+    assert not pending.accepted and pending.reason == "reid_pending"
     worker.results.append(ReidResult(4, 2.01, 2.02, "reacquire", candidate.bbox, .9, (1.0, 0.0), None, {}))
-    confirming = policy.observe(frame=frame, candidates=[candidate], frame_id=4, now=2.03, frame_width=640, frame_height=480)
+    confirming = policy.observe(frame=frame, candidates=[candidate], frame_id=5, now=2.03, frame_width=640, frame_height=480)
     assert not confirming.accepted and confirming.reason == "reid_confirming"
     worker.results.append(ReidResult(5, 2.04, 2.05, "reacquire", candidate.bbox, .9, (1.0, 0.0), None, {}))
-    confirmed = policy.observe(frame=frame, candidates=[candidate], frame_id=5, now=2.06, frame_width=640, frame_height=480)
+    confirmed = policy.observe(frame=frame, candidates=[candidate], frame_id=6, now=2.06, frame_width=640, frame_height=480)
     assert confirmed.accepted and confirmed.reason == "reid_confirmed"
+
+
+def test_search_round_robins_after_one_candidate_uses_its_confirmation_window():
+    worker = _Worker()
+    policy = ReidPolicy(ReidConfig(
+        stable_frames=1, min_full_templates=1, min_torso_templates=1,
+        full_threshold=.70, confirm_hits=2, confirm_window=2,
+    ), worker)
+    frame = _Frame()
+    target = _candidate()
+    left = _candidate(10.0, 80.0, 170.0, 400.0)
+    right = _candidate(400.0, 80.0, 560.0, 400.0)
+
+    policy.observe(frame=frame, candidates=[target], frame_id=1, now=1.0, frame_width=640, frame_height=480)
+    worker.results.append(ReidResult(1, 1.0, 1.01, "enroll", target.bbox, .9, (1.0, 0.0), None, {}))
+    policy.observe(frame=frame, candidates=[target], frame_id=2, now=1.1, frame_width=640, frame_height=480)
+    policy.observe(frame=frame, candidates=[], frame_id=3, now=2.0, frame_width=640, frame_height=480)
+
+    policy.observe(frame=frame, candidates=[left, right], frame_id=4, now=2.01, frame_width=640, frame_height=480)
+    assert worker.requests[-1].bbox == left.bbox
+    worker.results.append(ReidResult(4, 2.01, 2.02, "reacquire", left.bbox, .9, (0.0, 1.0), None, {}))
+    policy.observe(frame=frame, candidates=[left, right], frame_id=5, now=2.03, frame_width=640, frame_height=480)
+    worker.results.append(ReidResult(5, 2.03, 2.04, "reacquire", left.bbox, .9, (0.0, 1.0), None, {}))
+    policy.observe(frame=frame, candidates=[left, right], frame_id=6, now=2.05, frame_width=640, frame_height=480)
+    assert worker.requests[-1].bbox == right.bbox

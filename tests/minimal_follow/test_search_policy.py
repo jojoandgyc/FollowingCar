@@ -56,7 +56,7 @@ def test_stale_steering_uses_the_configured_fallback_direction():
     assert status.direction == "left"
     command, status = policy.target_missing(now=30.26, front_obstacle=False)
     assert command.reason == "search_rotate_left"
-    assert status.state == "searching"
+    assert status.state == "searching_directed"
 
 
 def test_visual_target_side_is_used_when_there_was_no_steering_command():
@@ -67,3 +67,18 @@ def test_visual_target_side_is_used_when_there_was_no_steering_command():
     command, status = policy.target_missing(now=40.15, front_obstacle=False)
     assert command.reason == "search_rotate_left"
     assert status.direction == "left"
+
+
+def test_search_reverses_after_directed_phase_and_then_sweeps():
+    policy = _policy(directed_search_sec=0.2, sweep_half_cycle_sec=0.3)
+    policy.record_executed_follow_command(MinimalFollowCommand(6, 10, reason="steer_left"), 50.0)
+    policy.target_missing(now=50.01, front_obstacle=False)
+    command, status = policy.target_missing(now=50.10, front_obstacle=False)
+    assert command.reason == "search_rotate_left"
+    assert status.state == "searching_directed"
+    command, status = policy.target_missing(now=50.25, front_obstacle=False)
+    assert command.reason == "search_rotate_right"
+    assert status.state == "searching_sweep_1"
+    command, status = policy.target_missing(now=50.56, front_obstacle=False)
+    assert command.reason == "search_rotate_left"
+    assert status.state == "searching_sweep_2"

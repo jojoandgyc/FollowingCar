@@ -97,6 +97,8 @@ class RuntimeConfig:
     search_turn_memory_sec: float
     search_target_memory_sec: float
     search_fallback_direction: str
+    search_directed_sec: float
+    search_sweep_half_cycle_sec: float
     search_timeout_sec: float
     search_turn_percent: int
     reid_enabled: bool
@@ -132,6 +134,8 @@ class RuntimeConfig:
             search_turn_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TURN_MEMORY_SEC", 1.0)),
             search_target_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TARGET_MEMORY_SEC", 3.0)),
             search_fallback_direction=os.environ.get("MINIMAL_SEARCH_FALLBACK_DIRECTION", "left").strip().lower(),
+            search_directed_sec=max(0.0, _float_env("MINIMAL_SEARCH_DIRECTED_SEC", 2.0)),
+            search_sweep_half_cycle_sec=max(0.1, _float_env("MINIMAL_SEARCH_SWEEP_HALF_CYCLE_SEC", 3.0)),
             search_timeout_sec=max(0.0, _float_env("MINIMAL_SEARCH_TIMEOUT_SEC", 1.5)),
             search_turn_percent=max(0, _int_env("MINIMAL_SEARCH_TURN_PERCENT", 8)),
             reid_enabled=_bool_env("MINIMAL_REID_ENABLE", True),
@@ -228,6 +232,8 @@ class MinimalFollowRuntime:
                 turn_memory_sec=config.search_turn_memory_sec,
                 target_direction_memory_sec=config.search_target_memory_sec,
                 fallback_direction=config.search_fallback_direction,
+                directed_search_sec=config.search_directed_sec,
+                sweep_half_cycle_sec=config.search_sweep_half_cycle_sec,
                 timeout_sec=config.search_timeout_sec,
                 turn_percent=config.search_turn_percent,
             )
@@ -237,11 +243,11 @@ class MinimalFollowRuntime:
             self.motor = self._make_motor()
         LOG.info(
             "minimal follow ready motor_enabled=%s target=%.2fm deadband=%.2fm camera=%s %dx%d@%.1f "
-            "search(enabled=%s steer_memory=%.2fs target_memory=%.2fs fallback=%s timeout=%.2fs turn=%d%%)",
+            "search(enabled=%s steer_memory=%.2fs target_memory=%.2fs fallback=%s directed=%.2fs sweep=%.2fs timeout=%.2fs turn=%d%%)",
             config.motor_enabled, config.target_distance_m, config.distance_deadband_m,
             config.camera_device, config.camera_width, config.camera_height, config.camera_fps,
             config.search_enabled, config.search_turn_memory_sec, config.search_target_memory_sec,
-            config.search_fallback_direction,
+            config.search_fallback_direction, config.search_directed_sec, config.search_sweep_half_cycle_sec,
             config.search_timeout_sec, config.search_turn_percent,
         )
 
@@ -494,6 +500,8 @@ class MinimalFollowRuntime:
             "reid_result_age_ms": appearance_decision.result_age_ms,
             "reid_full_templates": appearance_decision.full_templates,
             "reid_torso_templates": appearance_decision.torso_templates,
+            "reid_probe_candidates": appearance_decision.probe_candidates,
+            "reid_probe_attempts": appearance_decision.probe_attempts,
             "reid_worker_preprocess_ms": _appearance_timing_value("preprocess"),
             "reid_worker_inference_ms": _appearance_timing_value("inference"),
             "reid_worker_partial_inference_ms": _appearance_timing_value("partial_inference"),

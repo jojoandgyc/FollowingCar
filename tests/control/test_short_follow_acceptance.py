@@ -528,3 +528,4 @@ def test_real_writer_hardware_ceiling_prevents_integral_windup_without_zero(monk
     # actual write feeds saturation back so it cannot accumulate each frame.
     assert plans[1].i_rpm > 0
     assert all(plan.i_rpm == pytest.approx(plans[1].i_rpm) for plan in plans[1:])
+

@@ -478,3 +478,4 @@ def test_disabled_or_subinteger_pivot_budget_is_not_rounded_up_to_motion(setting
 def test_pivot_eligibility_shared_with_settled_search_handoff(distance, center, allowed):
     cfg = ShortFollowConfig(enabled=True)
     assert cfg.pivot_allowed(distance, center) is allowed
+

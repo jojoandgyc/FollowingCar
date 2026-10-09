@@ -11493,23 +11493,6 @@ class PersonTracker:
                     getattr(self, "_active_capture_frame_id", 0), reason, confirmed)
         return True
 
-    def _publish_search_candidate_task_evidence(self, bbox=None, **evidence) -> bool:
-        """Keep candidate task changes out of a physical search-brake hold.
-
-        The normal brake-observation consumer still records current trusted
-        positions. The release barrier, not this preliminary gate, chooses
-        their effect on search direction after the chassis has settled.
-        """
-        runtime = getattr(self, "_action_runtime", None)
-        if getattr(runtime, "_search_reacquire_brake_request", None) is not None:
-            return False
-        controller = getattr(self, "_follow_controller", None)
-        method = getattr(controller, "note_search_candidate_missing" if bbox is None
-                         else "note_search_candidate_evidence", None)
-        if not callable(method):
-            return False
-        return bool(method() if bbox is None else method(bbox, **evidence))
-
     def _publish_search_reacquire_direction_hold(self, reason: str) -> bool:
         """Keep a bounded search yaw while a candidate waits for fresh Depth.
 
@@ -11519,19 +11502,13 @@ class PersonTracker:
         The search direction is already frozen by the loss controller, so a
         low raw RPM turn is safe to refresh until the depth gate resolves.
         """
-        reader = getattr(getattr(self, "_action_runtime", None), "get_steering_feedback", None)
-        feedback = reader() if callable(reader) else None
-        now = time.monotonic()
         status_getter = getattr(self._follow_controller, "search_status", None)
-        status = status_getter(now) if callable(status_getter) else None
+        status = status_getter(time.monotonic()) if callable(status_getter) else None
         direction = getattr(status, "direction", None) if status is not None else None
         if direction not in ("left", "right"):
             direction = getattr(self._follow_controller, "search_direction", None)
         if direction not in ("left", "right"):
             direction = getattr(self, "search_direction", None)
-        budget_check = getattr(self._follow_controller, "search_wait_direction", None)
-        if callable(budget_check):
-            direction = budget_check(now, feedback)
         if direction not in ("left", "right"):
             logger.warning(
                 "confirmed_search_reacquire_direction_hold unavailable: reason=%s",
@@ -15215,8 +15192,11 @@ class PersonTracker:
             "observation_timeout_unsettled", "observation_candidate_lost_or_changed",
             DEFERRED_EDGE_COVERAGE,
         })
-        note_candidate = lambda bbox, **evidence: PersonTracker._publish_search_candidate_task_evidence(
-            self, bbox, **evidence)
+        note_candidate = getattr(
+            self._follow_controller,
+            "note_search_candidate_evidence",
+            None,
+        )
         if (
             not stale_result_discarded
             and not search_settling_pending
@@ -15248,7 +15228,11 @@ class PersonTracker:
             self._search_last_noted_candidate_track_id = (
                 None if noted_binding is None else int(noted_binding["raw_track_id"])
             )
-        note_candidate_missing = lambda: PersonTracker._publish_search_candidate_task_evidence(self)
+        note_candidate_missing = getattr(
+            self._follow_controller,
+            "note_search_candidate_missing",
+            None,
+        )
         candidate_missing_hold = bool(
             not stale_result_discarded
             and not search_settling_pending

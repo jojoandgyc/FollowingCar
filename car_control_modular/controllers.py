@@ -1220,49 +1220,6 @@ class FollowSafetyController:
             self._lost_hint_source, self._lost_hint_confidence,
         )
 
-    def search_wait_direction(self, now: float, steering_feedback: Optional[object] = None) -> Optional[str]:
-        """Check the finite search budget for direct depth-wait yaw publishers.
-
-        This path does not call ``decide``. It still owns the same loss timer
-        and angular coverage as ordinary search, not a new budget per frame.
-        No previous wheel command or identity/depth authority is restored.
-        """
-        if (not self._has_seen_person or type(self.active_target_id) is not int
-                or self.active_target_id <= 0 or self.search_state != "searching"
-                or self.search_direction not in ("left", "right")):
-            return None
-        try:
-            fresh_feedback = bool(steering_feedback is not None
-                and getattr(steering_feedback, "trustworthy", False)
-                and not getattr(steering_feedback, "left_error", 0)
-                and not getattr(steering_feedback, "right_error", 0)
-                and 0 <= now - float(steering_feedback.timestamp)
-                    <= max(.10, float(self.cfg.search_revolution_feedback_stale_sec))
-                and math.isfinite(float(steering_feedback.integrated_yaw_right_deg)))
-        except (AttributeError, TypeError, ValueError):
-            fresh_feedback = False
-        feedback = steering_feedback if fresh_feedback else None
-        frame = SensorFrame(width=1, height=1, steering_feedback=feedback)
-        if fresh_feedback and self._search_rotation_origin_integrated_yaw_deg is None:
-            self._begin_search_rotation_measurement(frame)
-        if self._search_rotation_started_at is None:
-            # A valid new search may reach this publisher before decide().
-            # Keep any existing loss-time budget; initialise only once.
-            if not self._search_rotation_feedback_seen and not fresh_feedback:
-                self._begin_search_rotation_measurement(frame)
-            self._mark_search_rotation_started(now)
-            if self._lost_started_at is None:
-                self._lost_started_at = now
-        if (not self._search_rotation_feedback_seen
-                or self._search_rotation_origin_integrated_yaw_deg is None) and self.cfg.search_timeout_sec <= 0:
-            return None
-        if fresh_feedback:
-            self._update_search_rotation_progress(frame)
-        if (self._search_revolution_complete_decision(now) is not None
-                or self._search_timeout_decision(now, feedback) is not None):
-            return None
-        return self.search_direction
-
     def search_brake_resume_context_current(self, context: object) -> bool:
         """Pure task-ownership check, shared by the controller and caller.
 
@@ -1643,8 +1600,7 @@ class FollowSafetyController:
                     self._lost_exit_direction = observed_side
                     self._lost_hint_confidence = 0.90
                     self._lost_hint_source = "search_candidate_opposite_side"
-                    # The candidate changes direction within this finite
-                    # scan, not its elapsed time, origin or coverage budget.
+                    self._reset_search_timeout()
                     logger.info(
                         "search_candidate_direction_switch observed=%s previous=%s "
                         "center=%.3f score=%s tracked=%s identity_match=%s "
@@ -1690,7 +1646,7 @@ class FollowSafetyController:
                 self._lost_exit_direction = candidate_side
                 self._lost_hint_confidence = 0.90
                 self._lost_hint_source = "search_candidate_side"
-                # Same-side promotion is evidence, not a fresh search task.
+                self._reset_search_timeout()
                 logger.info(
                     "search_candidate_direction_promoted side=%s center=%.3f confirmations=1",
                     candidate_side,
@@ -1716,8 +1672,7 @@ class FollowSafetyController:
                 self._lost_exit_direction = observed_side
                 self._lost_hint_confidence = 0.90
                 self._lost_hint_source = "search_candidate_opposite_side"
-                if not active_search:
-                    self._reset_search_timeout()
+                self._reset_search_timeout()
                 logger.info(
                     "candidate_centering_direction_switch observed=%s previous=%s "
                     "center=%.3f score=%s tracked=%s confirmations=1",
@@ -1750,8 +1705,7 @@ class FollowSafetyController:
         self.search_state = "searching"
         self._lost_hint_confidence = 0.75 if str(source) == "formal" else 0.50
         self._lost_hint_source = "search_candidate_%s" % candidate_source
-        if not active_search:
-            self._reset_search_timeout()
+        self._reset_search_timeout()
         self._reset_stale_direction_recovery("candidate_observation_complete")
         logger.info(
             "search_candidate_observation_complete context=%s source=%s center=%.3f "

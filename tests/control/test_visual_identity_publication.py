@@ -183,3 +183,4 @@ def test_paired_adapter_refresh_is_not_permission_to_ignore_negative_evidence(pa
         assert not handled and not state.active and state.plan is None
     else:
         assert state.plan is prior  # no new plan; executor separately gates expiry
+

@@ -255,7 +255,7 @@ def forward_ordinary_stop(monkeypatch, reason="identity"):
     assert driver.stops == [1]
     assert rt.backend.last_speed_receipt is None
     writer = rt._short_follow_executor
-    assert writer._park_tail_until == pytest.approx(clock[0] + .75)
+    assert writer._park_tail_until == pytest.approx(clock[0] + .35)
     return rt, owner, driver, symbols, clock
 
 

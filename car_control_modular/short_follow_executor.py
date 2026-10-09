@@ -25,11 +25,6 @@ class _TurnResponse:
 
 
 class ShortFollowExecutor:
-    # Forward braking can briefly cross zero after a longer positive coast.
-    # This is a fixed response clock from STOP ACK, not a command/identity TTL.
-    # Small-pivot response records intentionally retain their separate .35 s.
-    PARK_RESPONSE_SEC = .75
-
     def __init__(self, runtime):
         self.runtime = runtime
         self.owner = runtime.owner
@@ -56,10 +51,7 @@ class ShortFollowExecutor:
         self._motion_generation = self.backend.stop_write_generation
         self._turn_responses = ()
         self._park_tail_until = float("-inf")
-        self._park_tail_started_at = float("-inf")
-        self._park_tail_peak_rpm = 0.
         self._park_tail_reverse_seen = False
-        self._park_tail_logged = False
 
     def controller(self):
         controller = getattr(self.owner, "_short_follow", None)
@@ -206,7 +198,8 @@ class ShortFollowExecutor:
         if generation != self._motion_generation:
             self._motion_receipt = self._motion_pair = None
             self._turn_responses = ()
-            self._clear_park_response()
+            self._park_tail_until = float("-inf")
+            self._park_tail_reverse_seen = False
             self._motion_generation = generation
         receipt = self.backend.last_speed_receipt
         if receipt is None or receipt is self._motion_receipt:
@@ -240,31 +233,11 @@ class ShortFollowExecutor:
     def _park_response_overdue(self, now):
         return self._park_tail_reverse_seen and now > self._park_tail_until
 
-    def _clear_park_response(self):
-        self._park_tail_until = self._park_tail_started_at = float("-inf")
-        self._park_tail_peak_rpm = 0.
-        self._park_tail_reverse_seen = False
-        self._park_tail_logged = False
-
-    def _park_response_recovered(self, sample):
-        # Positive coasting after STOP is not a completed restart. Require a
-        # NEW nonzero forward ACK, then its own newer healthy encoder sample.
-        # Repeated zero ACKs from another control lane prove neither event.
-        receipt = self.backend.last_speed_receipt
-        if receipt is None or self._park_tail_peak_rpm <= 0:
-            return False
-        pair = self._receipt_pair(receipt)
-        return bool(receipt.completed_at > self._park_tail_started_at
-            and sample.timestamp >= receipt.completed_at
-            and min(pair) >= 0 and max(pair) > 0
-            and min(sample.left_forward_rpm, sample.right_forward_rpm) >= -2)
-
     def _expected_park_feedback(self, pair, now):
         # Fixed physical STOP-response history, independent of the plan TTL.
         # It can explain one small negative wheel while the other coasts;
         # it cannot produce identity, a distance observation or a wheel plan.
-        return (self._park_tail_peak_rpm > 0 and now <= self._park_tail_until
-                and max(pair) >= -2 and min(pair) >= -5
+        return (now <= self._park_tail_until and max(pair) >= -2 and min(pair) >= -5
                 and max(pair) <= min(self.controller().config.max_rpm, self.backend.config.max_target))
 
     def _expected_turn_feedback(self, sample, now):
@@ -345,8 +318,9 @@ class ShortFollowExecutor:
         if wheel_feedback_valid(sample, now):
             pair = sample.left_forward_rpm, sample.right_forward_rpm
             expected_turn = self._expected_turn_feedback(sample, now)
-            if self._park_response_recovered(sample):
-                self._clear_park_response()
+            if stamp > self._park_tail_until - .35 and min(pair) >= -2:
+                self._park_tail_until = float("-inf")
+                self._park_tail_reverse_seen = False
             if min(pair) < -2:
                 if not expected_turn and (self._turn_response_overdue(now) or self._park_response_overdue(now)):
                     return "feedback_reverse"
@@ -359,17 +333,6 @@ class ShortFollowExecutor:
                 expected_park = self._expected_park_feedback(pair, now)
                 if expected_park:
                     self._park_tail_reverse_seen = True
-                    if not self._park_tail_logged:
-                        self._park_tail_logged = True
-                        self.runtime.logger.info(
-                            "short_follow_forward_stop_tail original_stop_ts=%.9f "
-                            "deadline=%.9f prior_peak_rpm=%s capped_rpm=%s "
-                            "feedback_rpm=%s sample_ts=%.9f "
-                            "deadline_renewed=False motion_authorized=False",
-                            self._park_tail_started_at, self._park_tail_until,
-                            self._park_tail_peak_rpm,
-                            min(40, self._park_tail_peak_rpm, self.controller().config.max_rpm),
-                            pair, stamp)
                 if expected_turn or expected_park:
                     self._reverse_pending = None
                 elif min(pair) < -5 or max(pair) < -2 or not known_forward:
@@ -408,11 +371,6 @@ class ShortFollowExecutor:
         or faulted samples are rejected separately and never use this fallback.
         """
         limit = self.controller().config.max_rpm
-        if self._park_tail_peak_rpm > 0 and now <= self._park_tail_until:
-            # A 0/0 handoff receipt is not the previous legal forward ceiling.
-            # Preserve the STOP's acknowledged source, without reviving its
-            # command. Identity/depth/plan checks remain independently required.
-            return min(limit, 40, self._park_tail_peak_rpm)
         if self._reverse_pending:
             receipt = self.backend.last_speed_receipt
             prior = max(abs(receipt.left_rpm), abs(receipt.right_rpm)) if receipt else 0
@@ -493,22 +451,15 @@ class ShortFollowExecutor:
         self._motion_receipt = self._motion_pair = None
         self._motion_generation = self.backend.stop_write_generation
         if not ordinary_stop:
-            self._clear_park_response()
+            self._park_tail_until = float("-inf")
+            self._park_tail_reverse_seen = False
         elif previous_pair is not None:
             # An ordinary STOP does not turn small encoder braking tail
             # into an identity fault. Never grant this tolerance for a safety
             # STOP, unknown entry, or an already faulted drivetrain.
-            # Expiry bounds tolerance, not evidence that the physical response
-            # ended. Only a new forward ACK plus its newer normal feedback may
-            # retire the record; a later ordinary STOP cannot restart its clock.
-            pending_response = self._park_tail_peak_rpm > 0
             if (min(previous_pair) >= 0 and max(previous_pair) > 0
-                    and 0 <= completed_at - previous.completed_at <= .5
-                    and not pending_response):
-                self._park_tail_started_at = completed_at
-                self._park_tail_until = completed_at + self.PARK_RESPONSE_SEC
-                self._park_tail_peak_rpm = max(previous_pair)
-                self._park_tail_logged = False
+                    and not self._park_tail_reverse_seen):
+                self._park_tail_until = completed_at + .35
                 sample = self._feedback(completed_at)
                 self._park_tail_reverse_seen = bool(sample is not None
                     and min(sample.left_forward_rpm, sample.right_forward_rpm) < -2)

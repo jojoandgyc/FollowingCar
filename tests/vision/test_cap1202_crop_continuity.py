@@ -40,8 +40,7 @@ def test_crop_continuation_keeps_uid_without_gallery_or_anchor_updates():
     assert e.last_strong_observation == anchor
     assert e.feature_metadata == features and e.template_memory.last_learning == learning
     assert send(b, 1214, 100.59, 4) == 1
-    assert send(b, 1216, 100.99, 5) == 1
-    assert send(b, 1218, 101.101, 6) == 0  # Does not roll its one-second origin.
+    assert send(b, 1216, 100.61, 5) == 0  # Does not roll its half-second origin.
 
 
 @pytest.mark.parametrize('case', ['search','multiple','stale','wrong_person','sliver','jump','quarantine','duplicate'])

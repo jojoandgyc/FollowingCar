@@ -12,9 +12,7 @@ from .stage_timing import StageTiming
 from .template_memory import TemplateMemory, timestamp as template_timestamp
 from .candidate_observation import CandidateObservationMemory
 from .initial_enrollment import InitialEnrollment
-from .crop_continuity import (
-    MAPPED_CROP_FULL_DISTANCE_LIMIT, MAPPED_CROP_MAX_SEC, mapped_crop_continuous,
-)
+from .crop_continuity import mapped_crop_continuous
 from .verified_continuation import evaluate_continuation
 from .camera_geometry import horizontal_center_displacement
 
@@ -2298,48 +2296,16 @@ class IdentityBank:
             # not a search candidate or a way to release quarantine.
             crop_full = (_finite_float(self._authorization_full_distance(entry, feature, metadata))
                          if entry is not None and feature is not None else None)
-            # Reuse the already-computed, timestamp-aged full-body evidence.
-            # An archive's low distance cannot by itself justify this wider
-            # crop window. A coverage change need not have a same-crop recent
-            # template, but it still needs a strong recent full-body match.
-            crop_recent = _finite_float((diagnostics.get('template_recent_evidence') or {}).get('distance'))
-            reference = {} if entry is None else (entry.last_strong_observation or {})
-            crop_stamp = _finite_float(metadata.get('capture_timestamp'))
-            crop_origin = _finite_float(reference.get('capture_timestamp'))
-            crop_age = None if crop_stamp is None or crop_origin is None else crop_stamp-crop_origin
-            crop_reason = next((reason for reason, allowed in (
-                ('disabled', self.config.appearance_region_safety_enable and self.config.template_crosscheck_enable),
-                ('quality_not_crop_only', quality_reason == 'edge_touch>2'),
-                ('multiple_candidates', candidate_count == 1 and metadata.get('candidate_count', 1) == 1),
-                ('identity_not_stable', entry is not None and not self._reacquire_quarantine.is_held(uid)
-                    and uid not in self._reacquire_control_suspects and track_id not in self._mapped_geometry_conflicts),
-                ('partial_conflict', metadata.get('recent_partial_state') not in ('mismatch', 'tentative')),
-                ('full_distance', crop_full is not None and crop_full <= MAPPED_CROP_FULL_DISTANCE_LIMIT),
-                ('recent_full_unavailable', crop_recent is not None and crop_recent <= MAPPED_CROP_FULL_DISTANCE_LIMIT),
-                ('geometry_not_continuous', geometry_review.get('ok') is True),
-                ('identity_competition', self._reacquire_competition(uid, frame_index, candidate_count, metadata)[0]),
-                ('anchor_window_or_crop', mapped_crop_continuous(metadata, reference)),
-            ) if not allowed), 'accepted')
-            diagnostics.update(
-                crop_continuation_reason=crop_reason,
-                crop_continuation_origin_cap=reference.get('capture_frame_id'),
-                crop_continuation_origin_timestamp=crop_origin,
-                crop_continuation_window_ms=1000*MAPPED_CROP_MAX_SEC,
-                crop_continuation_remaining_ms=(None if crop_age is None else
-                    max(0., 1000*(MAPPED_CROP_MAX_SEC-crop_age))),
-                crop_continuation_full_limit=MAPPED_CROP_FULL_DISTANCE_LIMIT,
-                crop_continuation_recent_full_distance=crop_recent)
-            if quality_reason == 'edge_touch>2':
-                logger.info('mapped_crop_control capture=%s uid=%d track=%d reason=%s '
-                    'anchor_cap=%s anchor_ts=%s age_ms=%s window_ms=%.0f remaining_ms=%s '
-                    'full=%s recent_full=%s full_limit=%.2f templates_updated=False '
-                    'anchor_renewed=False motion_deadline_renewed=False',
-                    metadata.get('capture_frame_id'), uid, track_id, crop_reason,
-                    reference.get('capture_frame_id'), crop_origin,
-                    None if crop_age is None else 1000*crop_age, 1000*MAPPED_CROP_MAX_SEC,
-                    diagnostics['crop_continuation_remaining_ms'], crop_full, crop_recent,
-                    MAPPED_CROP_FULL_DISTANCE_LIMIT)
-            if crop_reason == 'accepted':
+            if (self.config.appearance_region_safety_enable and self.config.template_crosscheck_enable
+                    and quality_reason == 'edge_touch>2' and candidate_count == 1
+                    and entry is not None and not self._reacquire_quarantine.is_held(uid)
+                    and uid not in self._reacquire_control_suspects
+                    and track_id not in self._mapped_geometry_conflicts
+                    and metadata.get('recent_partial_state') not in ('mismatch', 'tentative')
+                    and crop_full is not None and crop_full <= .15
+                    and geometry_review.get('ok') is True
+                    and self._reacquire_competition(uid, frame_index, candidate_count, metadata)[0]
+                    and mapped_crop_continuous(metadata, entry.last_strong_observation)):
                 reference = entry.last_strong_observation
                 self._remember_track_seen(track_id, uid, frame_index)
                 self.last_assignments[track_id] = dict(
@@ -2347,7 +2313,7 @@ class IdentityBank:
                     distance=crop_full, bank_updated=False, bbox_quality_ok=True,
                     bbox_quality_tier='strong', bbox_quality_reason=None,
                     crop_continuation_origin_cap=reference['capture_frame_id'],
-                    crop_continuation_remaining_ms=1000*(MAPPED_CROP_MAX_SEC-(
+                    crop_continuation_remaining_ms=1000*(.5-(
                         metadata['capture_timestamp']-reference['capture_timestamp'])),
                     crop_original_quality_reason=quality_reason)
                 diagnostics.update(

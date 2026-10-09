@@ -1,16 +1,12 @@
 """Brief control continuity for a verified mapped body, never enrollment."""
 import math
 
-MAPPED_CROP_MAX_SEC = 1.0
-MAPPED_CROP_FULL_DISTANCE_LIMIT = .20
-
 
 def mapped_crop_continuous(metadata, reference):
     """Do not let top/bottom edge counting toggle a broad body's identity.
 
     Reference is the last ordinary strong observation, NOT a previous crop
-    continuation. The one-second budget cannot be rolled by these frames.
-    This is an identity observation window, not a motor/depth authorization.
+    continuation. The half-second budget cannot be rolled by these frames.
     Appearance, competition and contradiction checks belong to the bank.
     """
     m, r = metadata or {}, reference or {}
@@ -22,7 +18,7 @@ def mapped_crop_continuous(metadata, reference):
             return False
         return bool(m.get('is_fresh') is True and not m.get('search_reacquire_context_active')
             and m.get('track_id') == r.get('track_id')
-            and m['capture_frame_id'] > r['capture_frame_id'] and 0 < dt <= MAPPED_CROP_MAX_SEC
+            and m['capture_frame_id'] > r['capture_frame_id'] and 0 < dt <= .5
             and w > 0 and h > 0 and 0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h
             and y1 <= .02*h and h-y2 <= .02*h
             and ((x1 <= .02*w) != (w-x2 <= .02*w))

@@ -277,9 +277,6 @@ def test_forward_recovery_clears_park_tail_before_small_single_wheel_review(monk
     rt._service_short_follow()
     tick_observation(rt, clock, 512, 1.429, .5, (5, 5))
     tick_observation(rt, clock, 514, 1.8, .7, (5, 5))
-    # CAP514's cached feedback preceded its new forward ACK. Only a newer
-    # normal sample can prove that the ordinary STOP response has recovered.
-    tick_observation(rt, clock, 515, 1.8, .7, (8, 7))
     tick_observation(rt, clock, 516, 1.8, .7, (4, -4))
     # Existing small single-wheel anomaly review may continue at <=40 RPM,
     # but an old distance STOP must not silently waive that review entirely.

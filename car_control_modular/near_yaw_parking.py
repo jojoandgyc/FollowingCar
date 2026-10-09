@@ -24,8 +24,7 @@ class ParkSettlingEvidence:
 
     MIN_HOLD_SEC = .500
 
-    def __init__(self, request, sent_at, *, require_current_release=False,
-                 allow_early_quiet_release=False):
+    def __init__(self, request, sent_at, *, require_current_release=False):
         self.request = request
         self.sent_at = float(sent_at)
         self.last_sample = 0.0
@@ -38,11 +37,6 @@ class ParkSettlingEvidence:
         self.current_released_at = None
         self.fault = None
         self.forward_resume_until = 0.0
-        # Opt-in only for a normal search stop preceded by fresh low-speed
-        # feedback. This changes current-hold dwell, never motion permission.
-        self.allow_early_quiet_release = bool(allow_early_quiet_release)
-        self.early_quiet_release_completed = False
-        self.pre_release_quiet_at = None
 
     def request_forward_resume(self, capture_timestamp, sample_timestamp, now):
         """Qualified producer hint to release current, never motor authority."""
@@ -59,24 +53,8 @@ class ParkSettlingEvidence:
     def forward_resume_live(self, now):
         return not self.fault and self.sent_at < now < self.forward_resume_until
 
-    def quiet_current_release_ready(self, feedback, now):
-        """Two distinct post-STOP samples may finish the opted-in dwell.
-
-        A cached quiet result alone is insufficient: revalidate it on the
-        current motor tick. Serial readback/FREE completion and new evidence
-        after that completion are still required by the caller.
-        """
-        if (not self.allow_early_quiet_release or self.fault
-                or self.current_released_at is not None):
-            return False
-        return self.observe(feedback, now)
-
-    def mark_current_released(self, now, *, early_quiet=False):
+    def mark_current_released(self, now):
         """Called after dual 0A readback and FREE STOP completion, never 0RPM."""
-        self.early_quiet_release_completed = bool(
-            early_quiet and self.allow_early_quiet_release and not self.fault
-            and self.ready_at is not None)
-        self.pre_release_quiet_at = self.ready_at
         self.current_released_at = float(now)
         self.last_sample = 0.0
         self.quiet_count = 0
@@ -101,10 +79,6 @@ class ParkSettlingEvidence:
     def minimum_hold_complete(self, now):
         # Count from completed stop I/O, not request/camera time. Do not
         # sleep in the executor: emergency handling must remain immediate.
-        if (math.isfinite(now) and self.early_quiet_release_completed
-                and self.current_released_at is not None
-                and self.current_released_at <= now):
-            return True
         if not math.isfinite(now) or now < self.sent_at + self.MIN_HOLD_SEC:
             self.reason = f"minimum_normal_hold_{self.MIN_HOLD_SEC * 1000:.0f}ms"
             return False
@@ -117,8 +91,6 @@ class ParkSettlingEvidence:
         values = None if feedback is None else (
             feedback.timestamp, feedback.left_forward_rpm, feedback.right_forward_rpm)
         valid = bool(values is not None and feedback.trustworthy
-                     and not getattr(feedback, "left_error", 0)
-                     and not getattr(feedback, "right_error", 0)
                      and all(math.isfinite(float(v)) for v in values)
                      and self.feedback_boundary < feedback.timestamp <= now
                      and now - feedback.timestamp <= .15)

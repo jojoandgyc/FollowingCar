@@ -2792,29 +2792,21 @@ class MotionActionRuntime:
             owner._brake_hold_stop_mode = self._ordinary_park_stop_mode()
             owner._brake_hold_label = "search_reacquire_brake"
             owner._use_soft_stop_next = owner._soft_stop_active = False
-            stop_feedback = self.get_steering_feedback()  # cached, no serial I/O
-            before_stop = time.monotonic()  # qualify against the completed cache read
-            early_quiet_release = bool(
-                wheel_feedback_valid(stop_feedback, before_stop)
-                and max(abs(stop_feedback.left_forward_rpm),
-                        abs(stop_feedback.right_forward_rpm)) <= 10.)
             self.backend.send_stop("search_reacquire_brake", mode=owner._brake_hold_stop_mode,
                                    prepare_parking_current=True)
             self._search_reacquire_brake_sent_at = time.monotonic()
             self._search_brake_dispatch_delay_sec = min(.15, max(.05,
                 self._search_reacquire_brake_sent_at-request.requested_at))
             self._search_reacquire_settling = ParkSettlingEvidence(
-                request, self._search_reacquire_brake_sent_at, require_current_release=True,
-                allow_early_quiet_release=early_quiet_release)
+                request, self._search_reacquire_brake_sent_at, require_current_release=True)
             owner._last_brake_hold_send_ts = time.time()
             self._search_reacquire_brake_applied = request
             self.logger.info("search_reacquire_brake_applied capture_frame_id=%d mode=%s minimum_hold_ms=%.0f "
-                             "request_age_ms=%.1f capture_to_stop_ms=%.1f next_dispatch_allowance_ms=%.1f "
-                             "early_release_on_quiet=%s",
+                             "request_age_ms=%.1f capture_to_stop_ms=%.1f next_dispatch_allowance_ms=%.1f",
                              request.capture_frame_id, owner._brake_hold_stop_mode, ParkSettlingEvidence.MIN_HOLD_SEC * 1000,
                              (self._search_reacquire_brake_sent_at-request.requested_at)*1000,
                              (self._search_reacquire_brake_sent_at-request.capture_timestamp)*1000,
-                             self._search_brake_dispatch_delay_sec*1000, early_quiet_release)
+                             self._search_brake_dispatch_delay_sec*1000)
         return True
 
     def _observe_settled_search_brake(self):
@@ -2992,8 +2984,6 @@ class MotionActionRuntime:
                     and not getattr(owner, "_runtime_shutdown_requested", False))
         if evidence.fault or not owns_hold():
             return
-        release_feedback = (self.get_steering_feedback()
-                            if label == "search_reacquire_brake" else None)
         now = time.monotonic()
         early_forward = (label == "near_yaw_park" and evidence.forward_resume_live(now)
                          and getattr(owner, "search_state", "none") == "none"
@@ -3002,10 +2992,7 @@ class MotionActionRuntime:
                              "target_visible", "target_visible_depth_valid"}
                          and owner._follow_controller.search_state == "none"
                          and owner._follow_controller.active_target_id == evidence.request.uid)
-        early_search_quiet = (
-            label == "search_reacquire_brake"
-            and evidence.quiet_current_release_ready(release_feedback, now))
-        if not early_forward and not early_search_quiet and not evidence.minimum_hold_complete(now):
+        if not early_forward and not evidence.minimum_hold_complete(now):
             return
         if evidence.current_released_at is None:
             failure_reason = "current_release_failed"
@@ -3016,12 +3003,6 @@ class MotionActionRuntime:
                     owner._brake_hold_label = "safety_hold_hard_stop"
                     self.backend.send_stop("hard_stop", mode="emergency")
                     return  # In particular, a refresh may not clear 5A first.
-                if early_search_quiet and not getattr(evidence, "response_logged", False):
-                    evidence.response_logged = True
-                    self.logger.info("search_brake_stop_response cap=%d stop_sent_ts=%.6f "
-                                     "quiet_ts=%.6f stop_to_quiet_ms=%.1f phase=before_current_release",
-                                     evidence.request.capture_frame_id, evidence.sent_at, evidence.ready_at,
-                                     (evidence.ready_at-evidence.sent_at)*1000)
                 self.backend.release_parking_current_only()  # both 0A readbacks required; no speed write
                 if (not owns_hold()
                         or self.hard_stop_check(getattr(owner, "current_command", None))):
@@ -3038,13 +3019,12 @@ class MotionActionRuntime:
                 # Completion of both FREE writes, not merely the 0A readback,
                 # starts the fresh feedback/image boundary. The ordinary hold
                 # remains latched; its periodic service must not replay FREE.
-                evidence.mark_current_released(time.monotonic(), early_quiet=early_search_quiet)
+                evidence.mark_current_released(time.monotonic())
                 self.logger.info("ordinary_park_current_released cap=%s label=%s hold_ms=%.1f "
                                  "current_a=0 zero_rpm=False speed_write=False motion_authorized=False "
-                                 "exit_stop_mode=free early_release_on_quiet=%s pre_release_quiet_ts=%s",
+                                 "exit_stop_mode=free",
                                  evidence.request.capture_frame_id, label,
-                                 (evidence.current_released_at-evidence.sent_at)*1000,
-                                 evidence.early_quiet_release_completed, evidence.pre_release_quiet_at)
+                                 (evidence.current_released_at-evidence.sent_at)*1000)
             except Exception:
                 self.logger.exception("ordinary park current/free-stop release failed")
                 self._ordinary_park_exit_fault(evidence, failure_reason)
@@ -3053,8 +3033,7 @@ class MotionActionRuntime:
         # fresh evidence so existing release gates can recover after a long
         # coast; elapsed time never grants motion or replays an old command.
         # Current/STOP I/O failures and safety changes still fault above.
-        feedback = self.get_steering_feedback()
-        evidence.observe(feedback, time.monotonic())
+        evidence.observe(self.get_steering_feedback(), now)
 
     def _stop_predictive_turn_brake_emergency(self, request, reason):
         # Caller already holds the NON-reentrant motor lock. Do not call

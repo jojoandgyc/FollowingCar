@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 
 from .detector_identity_lease import read_visual_identity_evidence
 from .wheel_zero_cross import wheel_feedback_valid
+from .short_follow_yaw import ShortFollowYawResponse
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class ShortFollowExecutor:
         self._entry_sample = None
         self._entry_quiet_count = 0
         self._entry_stop_acknowledged = False
+        self._entry_tail_receipt = None
         self._reverse_pending = None
         self._identity_check = None
         self._live_feedback_reason = None
@@ -52,11 +54,13 @@ class ShortFollowExecutor:
         self._turn_responses = ()
         self._park_tail_until = float("-inf")
         self._park_tail_reverse_seen = False
+        self._park_tail_entry_stop_at = None
         # Same visual observation may taper an executed turn, but falling
         # rate feedback must not repeatedly restore that old turn request.
         # This is an output bound, not an observation/permission deadline.
         self._yaw_limit_key = None
         self._yaw_delta_limit = None
+        self._yaw_response = ShortFollowYawResponse()
 
     def controller(self):
         controller = getattr(self.owner, "_short_follow", None)
@@ -206,6 +210,8 @@ class ShortFollowExecutor:
             self._turn_responses = ()
             self._park_tail_until = float("-inf")
             self._park_tail_reverse_seen = False
+            self._park_tail_entry_stop_at = None
+            self._entry_tail_receipt = None
             self._motion_generation = generation
         receipt = self.backend.last_speed_receipt
         if receipt is None or receipt is self._motion_receipt:
@@ -239,10 +245,23 @@ class ShortFollowExecutor:
     def _park_response_overdue(self, now):
         return self._park_tail_reverse_seen and now > self._park_tail_until
 
-    def _expected_park_feedback(self, pair, now):
+    def _expected_park_feedback(self, pair, now, sample_timestamp=None):
         # Fixed physical STOP-response history, independent of the plan TTL.
         # It can explain one small negative wheel while the other coasts;
         # it cannot produce identity, a distance observation or a wheel plan.
+        if self._park_tail_entry_stop_at is not None:
+            # A known motion -> zero -> acknowledged entry STOP can briefly
+            # recoil on BOTH wheels. This is only diagnostic credit while the
+            # original quiet-feedback barrier still owns a physically stopped
+            # output; it never qualifies a moving pair or another STOP episode.
+            return bool(now <= self._park_tail_until
+                and self._entry_stop_acknowledged
+                and self._entry_stop_at == self._park_tail_entry_stop_at
+                and sample_timestamp is not None
+                and sample_timestamp > self._park_tail_entry_stop_at
+                and self.backend.last_speed_receipt is None
+                and self.backend.last_speed_write is None
+                and max(map(abs, pair)) <= 5)
         return (now <= self._park_tail_until and max(pair) >= -2 and min(pair) >= -5
                 and max(pair) <= min(self.controller().config.max_rpm, self.backend.config.max_target))
 
@@ -286,20 +305,30 @@ class ShortFollowExecutor:
         self._note_motion_receipt(now)
         receipt = self.backend.last_speed_receipt
         known_forward = False
+        known_turn_zero = False
+        self._entry_tail_receipt = None
         limit = self.controller().config.max_rpm
         if receipt is not None:
             pair = self._receipt_pair(receipt)
             if ((min(pair) < 0 and not self._small_pivot(pair)) or max(pair) > limit):
                 return True
             known_forward = min(pair) >= 0 and max(pair) > 0
+            # Remember the actual ACK before positive feedback retires the
+            # small-turn history below. A zero by itself proves no lineage.
+            known_turn_zero = pair == (0, 0) and any(
+                now <= record.expires_at for record in self._turn_responses)
         feedback = self._feedback(now)
         if feedback is None:
             return True
         pair = feedback.left_forward_rpm, feedback.right_forward_rpm
+        if (receipt is not None and 0 <= now - receipt.completed_at <= .5
+                and (known_forward or known_turn_zero) and min(pair) >= -2
+                and max(pair) <= min(limit, self.backend.config.max_target)):
+            self._entry_tail_receipt = receipt
         if (self._expected_turn_feedback(feedback, now)
                 and max(map(abs, pair)) <= min(limit, 10)):
             return False
-        if self._expected_park_feedback(pair, now):
+        if self._expected_park_feedback(pair, now, feedback.timestamp):
             return False
         if known_forward and min(pair) >= -2 and max(pair) <= limit:
             return False
@@ -324,9 +353,12 @@ class ShortFollowExecutor:
         if wheel_feedback_valid(sample, now):
             pair = sample.left_forward_rpm, sample.right_forward_rpm
             expected_turn = self._expected_turn_feedback(sample, now)
-            if stamp > self._park_tail_until - .35 and min(pair) >= -2:
+            if (stamp > self._park_tail_until - .35 and min(pair) >= -2
+                    and (self._park_tail_entry_stop_at is None
+                         or self._entry_sample is None or stamp >= self._entry_sample)):
                 self._park_tail_until = float("-inf")
                 self._park_tail_reverse_seen = False
+                self._park_tail_entry_stop_at = None
             if min(pair) < -2:
                 if not expected_turn and (self._turn_response_overdue(now) or self._park_response_overdue(now)):
                     return "feedback_reverse"
@@ -336,7 +368,7 @@ class ShortFollowExecutor:
                     and receipt.left_rpm * b.wheel_raw_state_to_target("left", 1, 0x01) >= 0
                     and receipt.right_rpm * b.wheel_raw_state_to_target("right", 1, 0x01) >= 0
                     and (receipt.left_rpm != 0 or receipt.right_rpm != 0))
-                expected_park = self._expected_park_feedback(pair, now)
+                expected_park = self._expected_park_feedback(pair, now, stamp)
                 if expected_park:
                     self._park_tail_reverse_seen = True
                 if expected_turn or expected_park:
@@ -487,7 +519,19 @@ class ShortFollowExecutor:
         # the prior stop. No ordinary parking/500 ms holding lifecycle here.
         previous = self.backend.last_speed_receipt
         previous_pair = self._receipt_pair(previous) if previous is not None else None
+        sample = self._feedback(now)
+        entry_tail = bool(reason == "entry_settling"
+            and self._entry_stop_at is not None and not self._entry_stop_acknowledged
+            and previous is not None and previous is self._entry_tail_receipt
+            and 0 <= now - previous.completed_at <= .5
+            and not self._live_feedback_reason and not self._reverse_pending
+            and not self._park_tail_reverse_seen and not self._turn_response_overdue(now)
+            and sample is not None
+            and min(sample.left_forward_rpm, sample.right_forward_rpm) >= -2
+            and max(sample.left_forward_rpm, sample.right_forward_rpm)
+                <= min(controller.config.max_rpm, self.backend.config.max_target))
         self.backend.send_stop("short_follow:" + reason, mode="emergency")
+        self._yaw_response.reset()
         # The driver must first acknowledge both STOP writes. If it raises,
         # no fictitious zero output is reported to PI.
         self._acknowledge_stopped_output(controller)
@@ -509,9 +553,13 @@ class ShortFollowExecutor:
             self._turn_responses = ()
         self._motion_receipt = self._motion_pair = None
         self._motion_generation = self.backend.stop_write_generation
-        if not ordinary_stop:
+        retained_entry_tail = (reason == "entry_settling"
+            and self._park_tail_entry_stop_at is not None
+            and self._entry_stop_at == self._park_tail_entry_stop_at)
+        if not ordinary_stop and not retained_entry_tail:
             self._park_tail_until = float("-inf")
             self._park_tail_reverse_seen = False
+            self._park_tail_entry_stop_at = None
         elif previous_pair is not None:
             # An ordinary STOP does not turn small encoder braking tail
             # into an identity fault. Never grant this tolerance for a safety
@@ -522,6 +570,14 @@ class ShortFollowExecutor:
                 sample = self._feedback(completed_at)
                 self._park_tail_reverse_seen = bool(sample is not None
                     and min(sample.left_forward_rpm, sample.right_forward_rpm) < -2)
+        if entry_tail:
+            self._park_tail_until = completed_at + .35
+            self._park_tail_entry_stop_at = completed_at
+            self._park_tail_reverse_seen = False
+            self.runtime.logger.info("short_follow_entry_stop_tail source_receipt=%s "
+                "stop_ack=%.9f deadline=%.9f max_abs_rpm=5 motion_authorized=False",
+                previous.sequence, completed_at, self._park_tail_until)
+        self._entry_tail_receipt = None
         if feedback_stop and (new_feedback_stop or self._stop_key != key):
             self._entry_stop_at = completed_at
             self._entry_sample = None
@@ -582,6 +638,64 @@ class ShortFollowExecutor:
             self._stop_locked(reason, snapshot.epoch if snapshot else -1, now)
         return True
 
+    def _retire_owner_locked(self, controller, latest, now, checked_reason=None):
+        """One inactive handoff path, including deactivation during a tick.
+
+        The caller holds motor I/O and the mailbox lock. A newly admitted
+        successor goes through its canonical guard; neither the earlier active
+        snapshot nor this helper grants it motion or changes its deadlines.
+        """
+        if controller is not None and latest.active:
+            return True  # A newer activation superseded this pending exit.
+        if controller is None and latest.active:
+            self._controller.deactivate("ownership_exit", time.monotonic())
+            latest = self._controller.snapshot()
+        hard_reason = self._hard_reason()
+        abnormal_reason = (checked_reason if checked_reason is not None
+                           and checked_reason != latest.reason else None)
+        transferred = False
+        if (controller is not None and latest.reason in {
+                "identity_or_search_handoff", "observation_expired", "lateral_handoff"}
+                and hard_reason is None and abnormal_reason is None
+                and self.backend.stop_write_generation == self._generation):
+            self._owned = False
+            before = self.backend.last_speed_receipt
+            try:
+                transferred = self.runtime._write_limited_yaw_successor()
+                receipt = self.backend.last_speed_receipt
+                if not transferred:
+                    hard_reason = self._hard_reason()
+                guarded_zero = bool(not transferred and receipt is not None and receipt is not before
+                    and self._receipt_pair(receipt) == (0, 0)
+                    and getattr(self.runtime, "_visible_wheel_waiting", False)
+                    and self.backend.stop_write_generation == self._generation
+                    and hard_reason is None)
+                if guarded_zero:
+                    # The successor already owns the required zero-crossing
+                    # wait. Another STOP would discard its actual ACK/history;
+                    # returning ownership grants no nonzero wheel permission.
+                    transferred = True
+                    self.runtime.logger.info("short_follow_ownership_exit epoch=%s "
+                        "successor_guard_zero=True receipt=%s additional_stop=False",
+                        latest.epoch, receipt.sequence)
+            finally:
+                self._owned = not transferred
+        if not transferred:
+            if hard_reason is None and abnormal_reason is None and self._completed_stop_still_current():
+                self.runtime.logger.info(
+                    "short_follow_ownership_exit epoch=%s reuse_completed_stop=True generation=%s",
+                    latest.epoch, self._generation)
+            else:
+                self._stop_locked(hard_reason or abnormal_reason or "ownership_exit",
+                                  latest.epoch, now, force=True)
+        self._owned = False
+        self._entry_stop_at = None
+        self._entry_stop_acknowledged = False
+        self._entry_tail_receipt = None
+        self._last_write_at = float("-inf")
+        self._next_write_due = None
+        return True
+
     def service(self):
         """Return True while this writer owns motion (also while stopped).
 
@@ -610,45 +724,7 @@ class ShortFollowExecutor:
                     # newer owner; an obsolete exit must not stop its pair.
                     mailbox = controller or self._controller
                     with mailbox.write_snapshot() as latest:
-                        if controller is not None and latest.active:
-                            return True
-                        if controller is None and latest.active:
-                            # Removing/disabling this writer is an exit, not
-                            # reactivation of its still-populated old mailbox.
-                            # Re-enabling also needs a new activation/observation.
-                            mailbox.deactivate("ownership_exit", time.monotonic())
-                            latest = mailbox.snapshot()
-                        # A mapped crop can already have an independently
-                        # admitted bounded yaw successor. Install that pair
-                        # through the canonical guard before retiring this
-                        # owner, instead of inserting a STOP then the yaw.
-                        transferred = False
-                        if (controller is not None and latest.reason == "identity_or_search_handoff"
-                                and self._hard_reason() is None
-                                and self.backend.stop_write_generation == self._generation):
-                            self._owned = False
-                            try:
-                                transferred = self.runtime._write_limited_yaw_successor()
-                            finally:
-                                self._owned = not transferred
-                        if transferred:
-                            self._entry_stop_at = None
-                            self._entry_stop_acknowledged = False
-                            self._last_write_at = float("-inf")
-                            self._next_write_due = None
-                            return True
-                        if self._completed_stop_still_current():
-                            self.runtime.logger.info(
-                                "short_follow_ownership_exit epoch=%s reuse_completed_stop=True generation=%s",
-                                latest.epoch, self._generation)
-                        else:
-                            self._stop_locked("ownership_exit", latest.epoch, now, force=True)
-                self._owned = False
-                self._entry_stop_at = None
-                self._entry_stop_acknowledged = False
-                self._last_write_at = float("-inf")
-                self._next_write_due = None
-                return True
+                        return self._retire_owner_locked(controller, latest, now)
             self._controller = controller
             snapshot = controller.snapshot()
             if not self._owned:
@@ -688,6 +764,8 @@ class ShortFollowExecutor:
                             controller.revoke(latest_reason, time.monotonic())
                         self._generation = self.backend.stop_write_generation
                         return True  # Next tick services the existing stop owner.
+                    if not latest.active:
+                        return self._retire_owner_locked(controller, latest, _checked_at, latest_reason)
                     if latest_reason is not None:
                         self._stop_locked(latest_reason, latest.epoch, time.monotonic())
                         return True
@@ -710,6 +788,8 @@ class ShortFollowExecutor:
                             controller.revoke(reason, now)
                         self._generation = self.backend.stop_write_generation
                         return True
+                    if not latest.active:
+                        return self._retire_owner_locked(controller, latest, now, reason)
                     if reason is not None:
                         self._stop_locked(reason, latest.epoch, now)
                         return True
@@ -745,6 +825,9 @@ class ShortFollowExecutor:
                     if limit == 0:
                         self._stop_locked("motor_limit_zero", latest.epoch, now)
                         return True
+                    response_source_plan = plan
+                    plan = self._yaw_response.adjust(plan, feedback_snapshot,
+                        self.backend.last_speed_receipt, now, controller.config, wheel_limit=limit)
                     # Never let selecting this mode increase an existing
                     # hardware limit. Scale both wheels to preserve steering.
                     scale = min(1., limit / max(abs(plan.left_rpm), abs(plan.right_rpm)))
@@ -756,6 +839,8 @@ class ShortFollowExecutor:
                     send_started_at = time.monotonic()
                     self.backend.send_targets(left, right, "SHORT_FOLLOW", max_target_override=limit,
                                               history_uid=plan.uid)
+                    self._yaw_response.acknowledge(response_source_plan,
+                        self.backend.last_speed_receipt, left_rpm, right_rpm)
                     self._remember_executed_yaw(plan, left_rpm, right_rpm)
                     # Only a successfully completed wheel pair can feed back
                     # the output ceiling. Actual encoder lag is NOT windup.
@@ -790,7 +875,8 @@ class ShortFollowExecutor:
                         "speed_cap_rpm=%.2f feedback_speed_cap=%s depth_age_ms=%.1f expires_in_ms=%.1f "
                         "motion_kind=%s command_delta_rpm=%s feedback_delta_rpm=%s feedback_age_ms=%s "
                         "yaw_cap=%s yaw_age_ms=%s yaw_observed_center=%s yaw_control_center=%s "
-                        "yaw_capture_deg=%s yaw_current_deg=%s yaw_rate_dps=%s yaw_adjustment=%s",
+                        "yaw_capture_deg=%s yaw_current_deg=%s yaw_rate_dps=%s yaw_adjustment=%s "
+                        "yaw_common_reduction_rpm=%s yaw_response_reason=%s yaw_response_samples=%s",
                         plan.capture_id, plan.uid, plan.epoch, plan.sequence,
                         left_rpm, right_rpm, plan.base_request_rpm, plan.p_rpm, plan.i_rpm,
                         min(plan.speed_cap_rpm, float(limit)), feedback_cap,
@@ -806,5 +892,7 @@ class ShortFollowExecutor:
                         getattr(plan, "yaw_center_x_ratio", None),
                         getattr(plan, "yaw_control_center_x_ratio", None),
                         getattr(plan, "yaw_capture_yaw_deg", None), current_yaw, yaw_rate,
-                        getattr(plan, "yaw_adjustment_reason", "none"))
+                        getattr(plan, "yaw_adjustment_reason", "none"),
+                        plan.yaw_common_reduction_rpm, plan.yaw_response_reason,
+                        plan.yaw_response_sample_count)
             return True

@@ -304,6 +304,227 @@ def formal_detection_continuous(current, state, geometry, *, confidence, gallery
         and area is not None and .55 <= area <= 1.)
 
 
+def bounded_crop_follow_geometry(*, uid, track_id, current, state, geometry,
+                                 gallery_distance, local_full_distance,
+                                 local_partial_distance, competition_ok, blocked,
+                                 partial_conflict):
+    return _bounded_crop_geometry(uid=uid, track_id=track_id, current=current,
+        state=state, geometry=geometry, gallery_distance=gallery_distance,
+        local_full_distance=local_full_distance, local_partial_distance=local_partial_distance,
+        competition_ok=competition_ok, blocked=blocked, partial_conflict=partial_conflict)
+
+
+def bounded_crop_observation_retainable(**kwargs):
+    """Keep the old candidate only; never grant UID or advance its clocks."""
+    return _bounded_crop_geometry(**kwargs, observation_only=True) is not None
+
+
+def _bounded_crop_geometry(*, uid, track_id, current, state, geometry,
+                          gallery_distance, local_full_distance,
+                          local_partial_distance, competition_ok, blocked,
+                          partial_conflict, observation_only=False):
+    """Finish a short same-raw crop episode using a fixed independent anchor.
+
+    The bank supplies two current-to-anchor descriptor comparisons. The anchor
+    was admitted by strong quality or the existing independent crop recheck,
+    not by this permission. Current gallery support remains mandatory. Neither
+    these weaker crops nor their descriptors can roll the anchor's .5 s age,
+    become learning parents, or establish a new raw/UID binding.
+    """
+    uid, track = _identifier(uid), _identifier(track_id)
+    anchor = (state or {}).get('crop_appearance_anchor')
+    if (uid is None or track is None or not isinstance(current, dict)
+            or not _valid_state(state, uid, track) or not state['active']
+            or state.get('position_only') or not isinstance(anchor, dict)
+            or anchor.get('uid') != uid or anchor.get('track_id') != track
+            or anchor.get('source') not in ('strong_gallery', 'independent_crop')
+            or current.get('track_id') != track or current.get('is_fresh') is not True
+            or current.get('quality_bbox_ok') is not False
+            or current.get('bbox_quality_tier') != 'weak'
+            or competition_ok is not True or blocked is not False or partial_conflict is not False
+            or any(current.get(key) for key in ('low_score_continuation', 'observation_only',
+                'search_observation_only', 'preferred_search_low_confidence'))):
+        return None
+    cap, stamp = _identifier(current.get('capture_frame_id')), _number(current.get('capture_timestamp'))
+    anchor_cap, anchor_stamp = _identifier(anchor.get('capture')), _number(anchor.get('timestamp'))
+    distances = tuple(_number(value) for value in (gallery_distance,
+        anchor.get('gallery_distance'), local_full_distance, local_partial_distance))
+    score = _number(current.get('detector_confidence'))
+    jump = _number((geometry or {}).get('yaw_compensated_center_jump_ratio'))
+    area = _number((geometry or {}).get('area_similarity'))
+    reference = anchor.get('observation')
+    if (cap is None or anchor_cap is None or not anchor_cap <= state['last_cap'] < cap
+            or stamp is None or anchor_stamp is None or not 0 < stamp-anchor_stamp <= .5
+            or not 0 < stamp-state['last_timestamp'] <= .35
+            or score is None or not .75 <= score <= 1.
+            or any(value is None for value in distances)
+            or not 0 <= distances[0] <= .35 or not 0 <= distances[1] <= .30
+            or not 0 <= distances[2] <= .25 or not 0 <= distances[3] <= .25
+            or not isinstance(reference, dict)
+            or reference.get('track_id') != track or reference.get('capture_frame_id') != anchor_cap
+            or reference.get('capture_timestamp') != anchor_stamp
+            or not current.get('partial_feature_source')
+            or current.get('partial_feature_source') != reference.get('partial_feature_source')
+            or not geometry or geometry.get('ok') is not True
+            or jump is None or not 0 <= jump <= .12
+            or area is None or not .65 <= area <= 1.):
+        return None
+    allowed = {'aspect<0.18', 'edge_touch>2'}
+    reasons = [str(current.get(key) or '').removeprefix('detector_crop:')
+               for key in ('quality_bbox_reason', 'bbox_quality_reason')]
+    if not any(reasons) or any(set(reason.split(','))-allowed for reason in reasons if reason):
+        return None
+    width, height = (_number(current.get(key)) for key in ('image_width', 'image_height'))
+    if width is None or height is None or min(width, height) <= 0:
+        return None
+    boxes, sides = [], []
+    for row in (reference, state['observation'], current):
+        box = row.get('detector_bbox')
+        if (row.get('image_width') != width or row.get('image_height') != height
+                or not isinstance(box, (tuple, list)) or len(box) != 4):
+            return None
+        values = [_number(value) for value in box]
+        if any(value is None for value in values):
+            return None
+        x1, y1, x2, y2 = values
+        left, right = x1 <= .02*width, x2 >= .98*width
+        if (not 0 <= x1 < x2 <= width or not 0 <= y1 < y2 <= height
+                or left == right or x2-x1 < max(64., .10*width)
+                or y2-y1 < .70*height or (x2-x1)*(y2-y1)/(width*height) < .08):
+            return None
+        boxes.append(values)
+        sides.append(left)
+    heights = [box[3]-box[1] for box in boxes]
+    widths = [box[2]-box[0] for box in boxes]
+    areas = [(box[2]-box[0])*(box[3]-box[1]) for box in boxes]
+    height_similarity = min(heights)/max(heights)
+    if len(set(sides)) != 1 or min(areas)/max(areas) < .60:
+        return None
+    # A tall same-side crop can gain/lose its upper or lower visible extent
+    # without changing person or scale (CAP734 -> 738). Require the OTHER end
+    # and the width/center to remain stable across the fixed anchor, previous
+    # accepted box and current box. This is not a general height tolerance.
+    tops, bottoms = [box[1] for box in boxes], [box[3] for box in boxes]
+    centers = [(box[0]+box[2])/2 for box in boxes]
+    end_changes = (max(tops)-min(tops), max(bottoms)-min(bottoms))
+    stable_height = height_similarity >= .95
+    edge_visibility_change = bool(not stable_height and height_similarity >= .85
+        and min(widths)/max(widths) >= .80
+        and max(centers)-min(centers) <= .05*width
+        and min(end_changes) <= .03*height and max(end_changes) <= .12*height
+        and distances[0] <= .30)
+    # CAP298 -> 304: a clipped person's visible center barely moved, while
+    # camera-yaw compensation contributed a .107 residual. Permit the small
+    # .10 -> .12 band only with stronger independent AND paired appearance,
+    # stable full-height same-edge boxes, and the existing fixed .5 s anchor.
+    # This does not change the rolling independent crop-reverification gate:
+    # this bounded permission cannot refresh its own anchor or learn.
+    stable_edge_motion = bool(stable_height
+        and min(widths)/max(widths) >= .90
+        and max(centers)-min(centers) <= .03*width
+        and all(box[1] <= .02*height and box[3] >= .98*height for box in boxes)
+        and max(distances[:2]) <= .15 and max(distances[2:]) <= .10)
+    if jump > .10 and not stable_edge_motion:
+        return None
+    local_limit = .16 if edge_visibility_change else .12
+    if not (stable_height or edge_visibility_change):
+        return None
+    if observation_only:
+        # Inconclusive appearance retains no *new* evidence. A bounded later
+        # frame must still pass every normal gate against the untouched anchor.
+        if distances[0] > .30:
+            return None
+    elif max(distances[2:]) > local_limit:
+        return None
+    return dict(geometry, bounded_crop_confirmation=dict(
+        reference_cap=anchor_cap, reference_timestamp=anchor_stamp,
+        expires_at=anchor_stamp+.5, reference_age_ms=1000*(stamp-anchor_stamp),
+        full_distance=distances[2], partial_distance=distances[3],
+        gallery_distance=distances[0], anchor_gallery_distance=distances[1],
+        visibility_mode='single_end_change' if edge_visibility_change else 'stable_height',
+        height_similarity=height_similarity, local_distance_limit=local_limit,
+        compensated_jump_limit=.12 if jump > .10 else .10,
+        fixed_anchor_motion_bridge=jump > .10,
+        permission='observation_only' if observation_only else 'follow_only',
+        learning_allowed=False, anchor_renewed=False))
+
+
+def narrow_edge_follow_geometry(*, uid, track_id, current, state, geometry,
+                               gallery_distance, competition_ok, blocked,
+                               partial_conflict):
+    """Retain a substantial same-person edge crop, without a quality upgrade.
+
+    CAP936's 85 px, full-height crop narrowly crosses the aspect limit while
+    keeping current independent appearance and the same physical trajectory.
+    This permission is only a bounded continuation of an active raw track;
+    it cannot enroll, hand off, learn, or renew the last strong-observation age.
+    """
+    uid, track_id = _identifier(uid), _identifier(track_id)
+    if (uid is None or track_id is None or not isinstance(current, dict)
+            or not _valid_state(state, uid, track_id) or not state['active']
+            or state.get('position_only') or current.get('track_id') != track_id
+            or current.get('is_fresh') is not True
+            or current.get('quality_bbox_ok') is not False or current.get('bbox_quality_tier') != 'weak'
+            or competition_ok is not True or blocked is not False or partial_conflict is not False
+            or any(current.get(key) for key in ('low_score_continuation', 'observation_only',
+                                                'search_observation_only', 'preferred_search_low_confidence'))):
+        return None
+    distance = _number(gallery_distance)
+    cap, stamp = _identifier(current.get('capture_frame_id')), _number(current.get('capture_timestamp'))
+    strong_stamp = _number(state.get('last_strong_timestamp'))
+    jump = _number((geometry or {}).get('yaw_compensated_center_jump_ratio'))
+    area = _number((geometry or {}).get('area_similarity'))
+    if (distance is None or not 0 <= distance <= .30 or cap is None or cap <= state['last_cap']
+            or stamp is None or not 0 < stamp-state['last_timestamp'] <= .35
+            or strong_stamp is None or not 0 < stamp-strong_stamp <= .75
+            or not geometry or geometry.get('ok') is not True
+            or jump is None or not 0 <= jump <= .12
+            or area is None or not .35 <= area <= 1.):
+        return None
+    previous = state['observation']
+    allowed = {'aspect<0.18', 'edge_touch>2'}
+    for row, permitted in ((current, (allowed,)), (previous, ({'edge_touch>2'}, allowed))):
+        reasons = [str(row.get(key) or '').removeprefix('detector_crop:')
+                   for key in ('quality_bbox_reason', 'bbox_quality_reason')]
+        if not any(reasons):
+            return None
+        for reason in reasons:
+            parts = set(reason.split(',')) if reason else set()
+            if parts and parts not in permitted:
+                return None
+    width, height = (_number(current.get(key)) for key in ('image_width', 'image_height'))
+    if (width is None or height is None or min(width, height) <= 0
+            or _number(previous.get('image_width')) != width
+            or _number(previous.get('image_height')) != height):
+        return None
+    boxes, sides = [], []
+    for row in (previous, current):
+        box = row.get('detector_bbox')
+        if not isinstance(box, (tuple, list)) or len(box) != 4:
+            return None
+        values = [_number(value) for value in box]
+        if any(value is None for value in values):
+            return None
+        x1, y1, x2, y2 = values
+        left, right = x1 <= .02*width, x2 >= .98*width
+        if (not 0 <= x1 < x2 <= width or not 0 <= y1 < y2 <= height
+                or left == right or y1 > .02*height or y2 < .98*height
+                or x2-x1 < max(80., .12*width)
+                or (x2-x1)*(y2-y1)/(width*height) < .12):
+            return None
+        boxes.append(values)
+        sides.append(left)
+    (px1, py1, px2, py2), (x1, y1, x2, y2) = boxes
+    height_similarity = min(py2-py1, y2-y1)/max(py2-py1, y2-y1)
+    if (sides[0] != sides[1] or height_similarity < .95 or x2-x1 > px2-px1
+            or (sides[1] and x1+x2 > px1+px2)
+            or (not sides[1] and x1+x2 < px1+px2)):
+        return None
+    return dict(geometry, crop_continuity_area_similarity=height_similarity,
+                crop_visible_area_similarity=area,
+                crop_visibility_reason='same_raw_narrow_edge_height_continuous')
+
+
 def cropped_follow_continuous(current, state, geometry):
     """A recent accepted candidate may retain a substantial three-edge crop.
 

@@ -16,6 +16,11 @@ from .camera_geometry import horizontal_center_displacement
 FULL_PROOF_TTL_SEC = .60
 MAX_FULL_RESULT_AGE_SEC = .35
 FULL_RECHECK_INTERVAL_SEC = .20
+# Reserve time for the NEXT full check before spending another fast frame.
+# CAP812 -> 816 left ~270 ms at detector completion; CAP819 then needed
+# 248 ms processing plus capture/control spacing. Capture cadence alone
+# scheduled that check too late. This is a scheduling budget, never extra TTL.
+FULL_RECHECK_HEADROOM_SEC = .30
 # CAP49/53/57: valid full checks were ~195/202ms apart. Allow that
 # capture cadence without clearing the verification streak. This is NOT
 # extra processing time, a sliding identity lease or a motor authorization.
@@ -192,7 +197,8 @@ def continuation_reason(proof, observation, now, hfov):
         return "full_verification_streak"
     if proof.fast_count >= MAX_FAST_FRAMES:
         return "fast_budget_exhausted"
-    if observation.timestamp >= proof.verified.timestamp+interval:
+    if (observation.timestamp >= proof.verified.timestamp+interval
+            or now + FULL_RECHECK_HEADROOM_SEC >= proof.deadline):
         return "full_recheck_due"
     if not geometry_matches(proof.previous, observation, hfov):
         return "adjacent_geometry"

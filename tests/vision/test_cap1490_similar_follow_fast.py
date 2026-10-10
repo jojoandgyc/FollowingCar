@@ -100,7 +100,9 @@ def test_variable_cadence_full_uses_measured_fast_position_not_retimed_embedding
     bank = t.identity_bank
     gallery = gallery_snapshot(bank)
     samples = list(t._provisional_association.entries[3].samples)
-    s.step(23, timestamp=fast_stamp, result_age=.10)
+    # A 249 ms cadence can only remain fast with a genuinely early result;
+    # a 100 ms result now correctly starts full recheck before proof expiry.
+    s.step(23, timestamp=fast_stamp, result_age=min(.10, result_age))
     assert p.last_identity_processing["mode"] == "detector_continuation"
     assert bank._similar_follow_states[(1, 3)]["last_timestamp"] == 3.2
     assert [(r[0], r[1]) for r in t._provisional_association.entries[3].samples] == [
@@ -145,6 +147,34 @@ def test_fast_budget_and_full_capture_lease_cannot_slide(similar_pipeline):
     assert p.last_identity_processing["mode"] == "full"
     assert p.last_identity_processing["reason"] == "fast_budget_exhausted"
     assert p.reid.calls == 2
+
+
+def test_cap816_recorded_clock_runs_full_early_then_keeps_next_healthy_frame_fast(similar_pipeline):
+    s = similar_pipeline; p = s.pipeline
+    old = p.tracker._detector_proof
+    # Translate real CAP812/816/819 monotonic spacing to the fixture's 3.2 s
+    # independent full check. Features/detections are synthetic, clocks are not.
+    cap816 = old.verified.timestamp + (35739.594371324 - 35739.367821647)
+    cap819 = old.verified.timestamp + (35739.758493129 - 35739.367821647)
+    original_extract = p.reid.extract
+    def measured_full_tail(*args):
+        values = original_extract(*args)
+        s.clock.now += .24802 - .12593
+        return values
+    p.reid.extract = measured_full_tail
+    before_calls = p.reid.calls
+    records = s.step(816, timestamp=cap816, result_age=.10671)
+    assert [(r.track_id, r.reid_uid) for r in records] == [(3, 1)]
+    assert p.last_identity_processing['mode'] == 'full'
+    assert p.last_identity_processing['reason'] == 'full_recheck_due'
+    assert p.reid.calls == before_calls + 1
+    assert s.clock.now < old.verified.timestamp + .5
+    assert p.tracker._detector_proof.verified.capture == 816
+    deadline = p.tracker._detector_proof.deadline
+    s.step(819, timestamp=cap819, result_age=.10671)
+    assert p.last_identity_processing['mode'] == 'detector_continuation'
+    assert p.reid.calls == before_calls + 1
+    assert p.tracker._detector_proof.deadline == deadline
 
 
 @pytest.mark.parametrize("gap", [.25, .299])

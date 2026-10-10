@@ -509,9 +509,23 @@ class DeepSortTracker:
             return "identity_assignment_rejected"
         tracks = self.deepsort.tracker.tracks
         expected = {track_id, *(item.track_id for item in backgrounds)}
-        if (len(tracks) != len(expected) or {t.track_id for t in tracks} != expected
-                or any(not t.is_confirmed() or t.time_since_update != 0 for t in tracks)):
+        current_tracks = [t for t in tracks if t.time_since_update == 0]
+        if (len({t.track_id for t in tracks}) != len(tracks)
+                or any(t.time_since_update < 0 for t in tracks)
+                or len(current_tracks) != len(expected)
+                or {t.track_id for t in current_tracks} != expected
+                or any(not t.is_confirmed() for t in current_tracks)):
             return "track_not_unique_current"
+        if len(current_tracks) != len(tracks):
+            # CAP332: the former raw owner can remain in DeepSORT's missed
+            # track lifetime after a FULL-verified raw handoff. It is not an
+            # additional current detection. Keep explicit competition proof
+            # for this exception; raw detector count/geometry/color are still
+            # checked by plan_detected_continuation on EVERY fast frame.
+            competition = assignment.get("identity_competition") or {}
+            if (competition.get("passed") is not True or competition.get("uid") != uid
+                    or competition.get("candidate_count") != len(expected)):
+                return "current_competition_unverified"
         if any(self._detector_background_eligibility(item.track_id, uid, track_id, stamp)
                != item.eligibility for item in backgrounds):
             return "background_exclusion_changed"
@@ -670,6 +684,12 @@ class DeepSortTracker:
             tracks[background.track_id].update(self.deepsort.tracker.kf, DeepSortDetection(
                 (cx-width/2, cy-height/2, width, height), item.score, 0, None,
                 store_feature=False, source_detection_index=index))
+        observed_tracks = {proof.track_id, *(bg.track_id for _, bg, _ in plan.backgrounds)}
+        for old_track in self.deepsort.tracker.tracks:
+            if old_track.track_id not in observed_tracks:
+                old_track.mark_missed()
+        self.deepsort.tracker.tracks = [old_track for old_track in self.deepsort.tracker.tracks
+                                       if not old_track.is_deleted()]
         self.deepsort._frame_index += 1
         self._frame_index += 1
         # Detector measurements also advance local quality clocks. The
@@ -845,6 +865,8 @@ class DeepSortTracker:
         clock = finite_number(now)
         assignment = self.identity_bank.last_assignments.get(record.track_id, {})
         distance = finite_number(assignment.get("distance"))
+        competition = assignment.get("identity_competition") or {}
+        missed_tracks = any(t.time_since_update > 0 for t in self.deepsort.tracker.tracks)
         evidence = target_evidence
         target_track = next((t for t in self.deepsort.tracker.tracks if t.track_id == record.track_id), None)
         if (observation is None or clock is None or not 0 <= clock-observation.timestamp < MAX_FULL_RESULT_AGE_SEC
@@ -856,6 +878,11 @@ class DeepSortTracker:
                 or (not follow_only and assignment.get("reason") not in {
                     "mapped", "updated_diverse", "skip_update_redundant", "skip_update_distance"})
                 or (not follow_only and assignment.get("match_source") != "strong")
+                or (missed_tracks and (competition.get("passed") is not True
+                    or competition.get("uid") != uid
+                    or competition.get("frame_index") != self._frame_index
+                    or competition.get("source_detection_index") != source_index
+                    or competition.get("candidate_count") != len(detections)))
                 or distance is None or not 0 <= distance <= min(.30, self.config.identity_mapped_verify_threshold)
                 or len(evidence) != 1 or evidence[0].get("uid") != uid
                 or evidence[0].get("raw_track_id") != record.track_id

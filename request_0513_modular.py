@@ -65,7 +65,8 @@ from car_control_modular.action_queue_policy import merge_pending_actions
 from car_control_modular.search_identity_evidence import confirmed_search_candidate_uid
 from car_control_modular.action_command import ActionCommandSnapshot
 from car_control_modular.search_reacquire_braking import (search_brake_reason, handoff_yaw_limit,
-    limit_handoff_yaw, handoff_retirement_reason, observe_moving_handoff, moving_handoff_yaw)
+    limit_handoff_yaw, handoff_retirement_reason, observe_moving_handoff, moving_handoff_yaw,
+    paired_search_takeover_available)
 from car_control_modular.distance_runtime import DistanceRuntime, DistanceRuntimeConfig
 from car_control_modular.depth_async_scheduler import DepthAsyncScheduler
 from car_control_modular.depth_authority_timing import MAX_FORWARD_DEPTH_TTL_SEC
@@ -104,7 +105,8 @@ from car_control_modular.search_candidate_gate import (
 from car_control_modular.search_observation_retry import (
     confirmed_observation_for_release,
     SearchObservationRetry, DetectorObservationSettlement, retry_evidence_source,
-    DEFERRED_EDGE_COVERAGE, incomparable_edge_observation,
+    DEFERRED_EDGE_COVERAGE, incomparable_edge_observation, side_crop_search_observation,
+    detector_only_side_search_observation,
 )
 from car_control_modular.historical_direction_backfill import (
     HistoricalDirectionBackfill,
@@ -11518,6 +11520,17 @@ class PersonTracker:
         if reason is None:
             self._search_candidate_brake_episode = None
             return False
+        if (confirmed and eligible and search_active
+                and paired_search_takeover_available(self, feedback, now)):
+            # Confirmed low-speed search motion already has a bounded handoff
+            # in the paired writer. Do not insert an unrelated full parking
+            # lifecycle before that writer gets the new independent evidence.
+            self._search_candidate_brake_episode = now
+            logger.info("search_reacquire_paired_takeover capture_frame_id=%s uid=%s "
+                        "reason=%s parking_requested=False motion_authorized=False depth_required=True",
+                        getattr(self, "_active_capture_frame_id", 0),
+                        self._follow_controller.active_target_id, reason)
+            return False
         if confirmed and search_active:
             # A bank-confirmed candidate may arrive after the observation
             # gate has already written zero. Do not turn that same low-
@@ -11991,10 +12004,13 @@ class PersonTracker:
         self, *, search_active, width, height, formal_candidates,
         capture_id, capture_timestamp, stale=False,
     ):
-        """Current incomparable edge crops defer STOP only, never claim UID."""
+        """Same-side observation defers STOP only, never claims UID or renews search."""
         uid = getattr(self._follow_controller, "active_target_id", None)
         now = time.monotonic()
-        if (not search_active or stale or uid is None
+        if (not search_active or stale or type(uid) is not int or uid <= 0
+                or not getattr(self, "running", True)
+                or any(getattr(self, flag, False) for flag in (
+                    "_explicit_stop_requested", "_runtime_shutdown_requested", "_brake_hold_active"))
                 or not math.isfinite(capture_timestamp)
                 or not 0 <= now-capture_timestamp <= .19):
             return ()
@@ -12010,7 +12026,12 @@ class PersonTracker:
         item = unique[0]
         tracker = getattr(getattr(self, "_rknn_pipeline", None), "tracker", None)
         matches = []
-        for observation in getattr(tracker, "last_identity_observations", ()) or ():
+        reasons = []
+        direction = getattr(self._follow_controller, "search_direction", None)
+        if direction not in ("left", "right"):
+            direction = getattr(self, "search_direction", None)
+        observations = getattr(tracker, "last_identity_observations", None)
+        for observation in observations or ():
             try:
                 metadata = observation.get("sample_metadata") or {}
                 bbox = tuple(float(v) for v in observation["detector_bbox"])
@@ -12021,15 +12042,37 @@ class PersonTracker:
                         or SearchCandidateGate._iou(item.bbox, bbox) < .85):
                     continue
                 assignment = self._identity_assignment_debug_for_track(int(observation["raw_track_id"]))
-                matches.append(incomparable_edge_observation(
-                    assignment, metadata, observation.get("uid"), uid, bbox, width))
+                incomparable = incomparable_edge_observation(
+                    assignment, metadata, observation.get("uid"), uid, bbox, width)
+                same_side = side_crop_search_observation(
+                    assignment, metadata, observation.get("uid"), uid, bbox, width, direction)
+                matches.append(incomparable or same_side)
+                reasons.append("incomparable_side_crop" if incomparable else
+                    "same_side_low_score" if metadata.get("low_score_continuation") is True
+                    else "same_side_crop")
             except (KeyError, TypeError, ValueError, OverflowError):
                 continue
-        if matches != [True]:
+        # Some low-score detections do not associate to a raw track at all.
+        # Do not convert their absence of identity into a new STOP request.
+        # An explicit empty CURRENT tracker result is required: failed,
+        # conflicting, stale, or malformed identity records cannot fall back
+        # to this detector-only policy. The ordinary search remains bounded.
+        frame_context = getattr(tracker, "_frame_context", None)
+        detector_only = bool(isinstance(observations, (list, tuple)) and not observations
+            and isinstance(frame_context, dict)
+            and frame_context.get("capture_frame_id") == capture_id
+            and frame_context.get("capture_timestamp") == capture_timestamp
+            and detector_only_side_search_observation(
+                item.bbox, item.score, width, height, direction,
+                min_score=self._search_candidate_gate.config.formal_min_score,
+                confidence_limit=getattr(getattr(tracker, "config", None), "min_confidence", None)))
+        if matches != [True] and not detector_only:
             return ()
         logger.info("search_observation_deferred capture_frame_id=%s uid=%s bbox=%s "
-                    "reason=incomparable_side_crop identity_claim=False "
-                    "direction_change=False longitudinal_allowed=False", capture_id, uid, item.bbox)
+                    "reason=%s identity_claim=False "
+                    "direction_change=False longitudinal_allowed=False search_budget_renewed=False",
+                    capture_id, uid, item.bbox,
+                    "same_side_detector_only" if detector_only else reasons[0])
         return (item.bbox,)
 
     def _retry_search_candidate_observation(
@@ -12049,6 +12092,19 @@ class PersonTracker:
         settlement = getattr(self, "_search_detector_settlement", None)
         if settlement is None:
             settlement = self._search_detector_settlement = DetectorObservationSettlement()
+        if decision.reason == DEFERRED_EDGE_COVERAGE and not stale:
+            # This is a decision not to take a stationary look, not a
+            # completed identity observation. Retire only this observation's
+            # hold so neither the detector nor retry layer can insert zero
+            # after the current crop was explicitly deferred. Keep the spent
+            # budget, normal search deadline and all motor brake state.
+            was_active = bool(retry.active or settlement.active
+                or getattr(self, "_search_evidence_observation_active", False))
+            retry.release()
+            settlement.active = False
+            return replace(decision, entered=False, pause_rotation=False,
+                           completed=decision.completed or was_active,
+                           preferred_target_match=False)
         if not retry.active:
             if (search_active and not stale and decision.entered and decision.pause_rotation
                     and not settlement.active):
@@ -14633,10 +14689,13 @@ class PersonTracker:
         pipeline = self._rknn_pipeline
         self._late_visual_preserved_evidence = None
         self._late_visual_identity_only = False
+        self._late_visual_current_follow = False
         self._late_visual_identity_epoch = None
         self._late_visual_identity_roi_published = False
         processing = getattr(pipeline, "last_identity_processing", {})
         mode = processing.get("mode")
+        short = getattr(self, "_short_follow_adapter", None)
+        paired_owned = bool(short is not None and short.owned)
         if mode is None:  # legacy/full-only pipeline adapter
             return True
         previous = getattr(self, "_identity_processing_watermark", None)
@@ -14698,7 +14757,7 @@ class PersonTracker:
             if callable(clear_position):
                 clear_position('hazard' if current_danger else
                                position_contradiction or 'new_formal_observation')
-        if (stale and not current_danger and mode == "full" and processing.get("full_features_current")
+        if (stale and not paired_owned and not current_danger and mode == "full" and processing.get("full_features_current")
                 and processing.get("capture_frame_id") == capture_id
                 and processing.get("capture_timestamp") == capture_timestamp
                 and math.isfinite(capture_timestamp) and math.isfinite(now)
@@ -14745,20 +14804,21 @@ class PersonTracker:
                 lease=lease if lease is not None else False)
             return lease is not None
         observation = None
-        full_source_current = bool(mode == "full" and processing.get("full_features_current")
+        full_source_matches = bool(mode == "full" and processing.get("full_features_current")
                 and processing.get("capture_frame_id") == capture_id
                 and processing.get("capture_timestamp") == capture_timestamp
                 and math.isfinite(capture_timestamp) and math.isfinite(now)
-                and 0 < capture_timestamp <= now < capture_timestamp + MAX_FULL_RESULT_AGE_SEC)
+                and 0 < capture_timestamp <= now)
+        full_source_current = bool(full_source_matches
+                and now < capture_timestamp + MAX_FULL_RESULT_AGE_SEC)
         scheduler = getattr(self, "_depth_async_scheduler", None)
         # CAP97: this exposure occurred while the prior identity was live;
         # the full verification finished after that proof expired. A 210ms
-        # processing-time miss forbids new yaw, but does not invalidate a
-        # current (<350ms capture age) accepted identity check. This is NOT a
+        # legacy processing-time miss forbids new yaw, but does not invalidate
+        # a current (<350ms capture age) accepted identity check. This is NOT a
         # lost-target/recheck bootstrap: require the same stable raw track,
         # original live-at-exposure proof, and unchanged safe-follow context.
-        identity_only = bool(stale and full_source_current
-            and expected_epoch is not None and scheduler is not None
+        late_same_source_scope = bool(expected_epoch is not None and scheduler is not None
             and scheduler.publication_snapshot()[0] == expected_epoch
             and not current_danger
             and isinstance(previous_visual, ValidatedVisualObservation)
@@ -14777,8 +14837,20 @@ class PersonTracker:
                 "_explicit_stop_requested", "_runtime_shutdown_requested",
                 "_brake_hold_active", "_reacquire_depth_pending"))
             and getattr(self, "_near_yaw_park_request", None) is None)
-        full_current = full_source_current and (not stale or identity_only)
-        short = getattr(self, "_short_follow_adapter", None)
+        # CAP819: 248 ms of processing, but the independently accepted FULL
+        # capture was only 281 ms old. The paired consumer already enforces
+        # capture-bound identity/ROI and physical-depth deadlines. Do not drop
+        # this newer same-track result solely on the legacy 210 ms stopwatch.
+        # The existing 350 ms NEW-full admission ceiling still applies; the
+        # capture+500 ms maximum only bounds an already admitted observation.
+        # No lost-target bootstrap, detector-only lease, or old-image renewal.
+        current_follow = bool(stale and paired_owned and full_source_current
+            and late_same_source_scope
+            and now < capture_timestamp + min(visibility_window,
+                ASTRA_DEPTH_LONGITUDINAL_BBOX_MAX_AGE_SEC))
+        identity_only = bool(stale and full_source_current
+            and late_same_source_scope and not current_follow)
+        full_current = bool((full_source_current and (not stale or identity_only)) or current_follow)
         probe_position_only = False
         if (full_current and not hard_stop and not current_danger and len(records) == 1
                 and short is not None and short.owned
@@ -14822,6 +14894,11 @@ class PersonTracker:
                         "depth_renewed=False bank_update=False", capture_id, uid,
                         records[0].track_id, previous_visual.track_id)
             return True
+        if (not full_current and not records and not current_danger
+                and PersonTracker._retain_paired_identity_on_empty_detector(
+                    self, processing, capture_id, capture_timestamp, now,
+                    stale=stale, expected_epoch=expected_epoch)):
+            return True
         if (full_current and not records and not current_danger
                 and short is not None and short.owned
                 and isinstance(previous_visual, ValidatedVisualObservation)
@@ -14853,6 +14930,14 @@ class PersonTracker:
                         visibility_window=visibility_window,
                         capture_max_age_sec=VISUAL_DEPTH_VISIBILITY_MAX_AGE_SEC)
         full_accepted = observation is not None
+        if (observation is None and full_current and not current_danger
+                and PersonTracker._retain_paired_pivot_on_mapped_crop(
+                    self, records, processing, capture_id, capture_timestamp, now,
+                    expected_epoch=expected_epoch)):
+            # This helper already published under the paired mailbox lock.
+            # Do not overwrite its sample-only proof with the generic UID0
+            # rejection before the current limited-yaw handoff can run.
+            return True
         if observation is None and full_current:
             observation = PersonTracker._retain_visual_proof_for_identity_recheck(
                 self, records, capture_id, capture_timestamp, now)
@@ -14870,6 +14955,11 @@ class PersonTracker:
             self, observation=(observation if observation is not None
                                else False if uid is not None else None),
             lease=next_lease)
+        if current_follow and full_accepted:
+            # The main callsite must successfully publish this exact ROI under
+            # the unchanged safety epoch before consuming any control result.
+            self._late_visual_current_follow = True
+            return True
         if identity_only and full_accepted:
             self._late_visual_identity_only = True
             self._late_visual_identity_epoch = expected_epoch
@@ -14878,6 +14968,306 @@ class PersonTracker:
                 getattr(self, "_detector_identity_lease", None))
             return False  # Still skip this late frame's yaw/control decisions.
         return True  # normal full-result rejection/observation logic still runs
+
+    def _retain_paired_pivot_on_mapped_crop(
+        self, records, processing, cap, stamp, now, *, expected_epoch,
+    ):
+        """Finish an existing pivot while this mapped crop reaches lateral control.
+
+        A weak edge crop is not a new UID or distance authorization. Publishing
+        False here before its LimitedYawSource exists can race the motor reader
+        into a hard identity revoke. Keep only the exact already-issued pure
+        pivot's sample and original deadline, never forward or a new Depth.
+        """
+        short = getattr(self, "_short_follow_adapter", None)
+        controller = self._follow_controller
+        uid = getattr(controller, "active_target_id", None)
+        pipeline = self._rknn_pipeline
+        tracker = getattr(pipeline, "tracker", None)
+        review = getattr(tracker, "associated_position_contradiction", None)
+        scheduler = getattr(self, "_depth_async_scheduler", None)
+        if (short is None or not short.owned or len(records) != 1
+                or not callable(review) or type(uid) is not int or uid <= 0
+                or type(cap) is not int or cap <= 0
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) for v in (stamp, now))
+                or not 0 < stamp <= now < stamp + MAX_FULL_RESULT_AGE_SEC
+                or processing.get("mode") != "full"
+                or processing.get("full_features_current") is not True
+                or processing.get("capture_frame_id") != cap
+                or processing.get("capture_timestamp") != stamp
+                or processing.get("detector_result_complete") is not True
+                or type(processing.get("detector_person_count")) is not int
+                or processing["detector_person_count"] != 1
+                or processing.get("detector_result_capture_frame_id") != cap
+                or processing.get("detector_result_capture_timestamp") != stamp):
+            return False
+        rec = records[0]
+        raw = rec.track_id
+        if (type(raw) is not int or raw <= 0 or rec.reid_uid != 0
+                or rec.time_since_update != 0 or rec.class_id != PERSON_CLASS_ID):
+            return False
+        width = int(getattr(pipeline, "last_frame_width", VISION_FRAME_WIDTH))
+        height = int(getattr(pipeline, "last_frame_height", VISION_FRAME_HEIGHT))
+        bbox = PersonTracker._track_record_bbox(rec)
+        if (bbox is None or width <= 0 or height <= 0
+                or not all(math.isfinite(v) for v in bbox)
+                or not (0 <= bbox[0] < bbox[2] <= width
+                        and 0 <= bbox[1] < bbox[3] <= height)):
+            return False
+        center = (bbox[0] + bbox[2]) / (2. * width)
+
+        def current_crop():
+            if (getattr(self, "_active_capture_frame_id", None) != cap
+                    or getattr(self, "_active_capture_timestamp", None) != stamp
+                    or getattr(self, "_identity_processing_watermark", None) != (cap, stamp)):
+                return False
+            assignment = self._identity_assignment_debug_for_track(raw)
+            if (assignment.get("uid") != 0 or assignment.get("mapped_uid") != uid
+                    or assignment.get("reason") != "mapped_weak_observed"
+                    or assignment.get("bbox_quality_ok") is not False
+                    or assignment.get("bbox_quality_tier") != "weak"
+                    or assignment.get("bbox_quality_reason") != "edge_touch>2"
+                    or any(assignment.get(key) for key in (
+                        "identity_control_rejected", "identity_recheck_pending",
+                        "search_excluded", "search_contradiction_retained"))
+                    or assignment.get("reacquire_geometry_ok") is False
+                    or (assignment.get("reacquire_geometry") or {}).get("ok") is False
+                    or (assignment.get("identity_competition") or {}).get("passed") is False
+                    or PersonTracker._bbox_quality_is_fragment(assignment)
+                    or PersonTracker._bbox_quality_is_near_camera_occlusion(
+                        assignment.get("bbox_quality_reason"), bbox, width, height)):
+                return False
+            rows = getattr(tracker, "last_identity_observations", ())
+            if len(rows) != 1:
+                return False
+            row = rows[0]
+            meta = row.get("sample_metadata") or {}
+            competition = meta.get("identity_competition") or {}
+            return bool(row.get("raw_track_id") == raw and row.get("uid") == 0
+                and meta.get("track_id") == raw and meta.get("is_fresh") is True
+                and meta.get("capture_frame_id") == cap and meta.get("capture_timestamp") == stamp
+                and meta.get("quality_bbox_ok") is False
+                and meta.get("quality_bbox_reason") == "edge_touch>2"
+                and not meta.get("low_score_continuation")
+                and not (meta.get("template_learning_risk") or {}).get("risky")
+                and competition.get("passed") is True and competition.get("uid") == uid
+                and competition.get("candidate_count") == 1
+                and competition.get("frame_index") == row.get("frame_index")
+                and meta.get("source_detection_index") is not None
+                and competition.get("source_detection_index") == meta.get("source_detection_index")
+                and not review(uid, raw, cap, stamp))
+
+        def safe():
+            # Identity publication must not poll IR or advance its debounce.
+            # Consumers/writer retain their ordinary live hardware checks.
+            return bool(getattr(self, "running", False)
+                and getattr(controller, "active_target_id", None) == uid
+                and getattr(self, "_depth_roi_safety_clear", False) is True
+                and getattr(self, "search_state", None) == "none"
+                and getattr(controller, "search_state", None) == "none"
+                and not any(getattr(self, key, False) for key in (
+                    "_explicit_stop_requested", "_runtime_shutdown_requested",
+                    "_brake_hold_active", "stop_action_execution", "_use_soft_stop_next"))
+                and getattr(self, "_near_yaw_park_request", None) is None
+                and not self._current_hazard_state_for_controller().active
+                and (expected_epoch is None or (scheduler is not None
+                    and scheduler.publication_snapshot()[0] == expected_epoch)))
+
+        evidence, checked_at = read_visual_identity_evidence(self)
+        now = max(now, checked_at)
+        proof = evidence.observation
+        before = short.controller.snapshot()
+
+        def superseding_full(publication, checked_now):
+            newer = publication.observation
+            watermark = getattr(self, "_identity_processing_watermark", None)
+            return bool(isinstance(newer, ValidatedVisualObservation)
+                and newer.uid == uid and newer.kind == "full"
+                and newer.continuation_sample_timestamp is None
+                and newer.capture > cap and stamp < newer.timestamp <= checked_now
+                and isinstance(watermark, tuple) and len(watermark) == 2
+                and watermark[0] >= newer.capture and watermark[1] >= newer.timestamp
+                and publication.live(uid, checked_now))
+
+        def eligible_plan(snapshot, checked_now):
+            plan = snapshot.plan
+            return bool(snapshot.active and snapshot.uid == uid and plan is not None
+                and plan.uid == uid and plan.epoch == snapshot.epoch
+                and plan.pivot and plan.base_rpm == 0 and plan.valid(checked_now)
+                and plan.capture_id < cap and plan.capture_timestamp < stamp
+                and ((center > FOLLOW_CENTER_RIGHT_RATIO and plan.left_rpm > 0)
+                     or (center < FOLLOW_CENTER_LEFT_RATIO and plan.left_rpm < 0))
+                and evidence.permits_depth(uid, plan.depth_timestamp, checked_now))
+
+        if (not safe() or (not superseding_full(evidence, now) and (
+                not isinstance(proof, ValidatedVisualObservation) or proof.track_id != raw
+                or proof.capture >= cap or proof.timestamp >= stamp
+                or not current_crop() or not eligible_plan(before, now)))):
+            return False
+        with getattr(self, "_control_update_lock", nullcontext()):
+            with short.controller.write_snapshot() as latest:
+                publication, checked_at = read_visual_identity_evidence(self)
+                final_now = max(now, checked_at)
+                if superseding_full(publication, final_now):
+                    # Never let this older result overwrite a strictly newer
+                    # completed FULL. It owns its independent publication.
+                    return safe()
+                if (publication is not evidence or latest.epoch != before.epoch
+                        or not safe() or not current_crop()
+                        or final_now >= stamp + MAX_FULL_RESULT_AGE_SEC
+                        or not eligible_plan(latest, final_now)):
+                    return False
+                # A same-epoch Depth commit may have finished while acquiring
+                # the lock. Bind ONLY that already committed valid pivot; an
+                # old sample-only proof cannot permit a different Depth.
+                plan = latest.plan
+                narrowed = replace(proof, continuation_sample_timestamp=plan.depth_timestamp,
+                                   expires_at=min(proof.expires_at, plan.expires_at))
+                if narrowed != proof:
+                    publish_visual_identity_evidence(self, observation=narrowed, lease=evidence.lease)
+        logger.info("short_follow_mapped_crop_pivot_bridge capture_frame_id=%s original_cap=%s "
+                    "uid=%s raw_track_id=%s pair=%s remaining_ms=%.1f "
+                    "identity_renewed=False depth_renewed=False plan_renewed=False forward_allowed=False",
+                    cap, plan.capture_id, uid, raw, (plan.left_rpm, plan.right_rpm),
+                    (min(narrowed.expires_at, getattr(evidence.lease, "expires_at", float("inf")))
+                     - final_now) * 1000.)
+        return True
+
+    def _retain_paired_identity_on_empty_detector(
+        self, processing, cap, stamp, now, *, stale, expected_epoch,
+    ):
+        """An actual detector miss may finish only the already issued pair.
+
+        Empty detection has no appearance features to verify. Its independent
+        completion/capture contract must not masquerade as a new full ReID.
+        Unlike associated-position delivery, this path changes no yaw, ROI or
+        plan. Narrow the old proof to that plan's exact Depth sample so an
+        in-flight ROI measurement cannot publish a replacement wheel pair.
+        """
+        if (stale or processing.get("mode") != "full"
+                or processing.get("detector_result_complete") is not True
+                or type(processing.get("detector_person_count")) is not int
+                or processing["detector_person_count"] != 0
+                or type(cap) is not int or cap <= 0
+                or type(processing.get("detector_result_capture_frame_id")) is not int
+                or processing["detector_result_capture_frame_id"] != cap
+                or processing.get("capture_frame_id") != cap
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) for value in (stamp, now))
+                or processing.get("detector_result_capture_timestamp") != stamp
+                or processing.get("capture_timestamp") != stamp
+                or not 0 < stamp <= now < stamp + MAX_FULL_RESULT_AGE_SEC):
+            return False
+        short = getattr(self, "_short_follow_adapter", None)
+        controller = self._follow_controller
+        uid = getattr(controller, "active_target_id", None)
+        if (short is None or not short.owned
+                or not getattr(self, "running", False)
+                or getattr(self, "_depth_roi_safety_clear", False) is not True
+                or getattr(self, "search_state", None) != "none"
+                or getattr(controller, "search_state", None) != "none"
+                or any(getattr(self, flag, False) for flag in (
+                    "_explicit_stop_requested", "_runtime_shutdown_requested",
+                    "_brake_hold_active", "stop_action_execution", "_use_soft_stop_next"))
+                or getattr(self, "_near_yaw_park_request", None) is not None):
+            return False
+        scheduler = getattr(self, "_depth_async_scheduler", None)
+        if (expected_epoch is not None and (scheduler is None
+                or scheduler.publication_snapshot()[0] != expected_epoch)):
+            return False
+        evidence, checked_at = read_visual_identity_evidence(self)
+        now = max(now, checked_at)
+        proof = evidence.observation
+
+        def superseding_full(publication, checked_now):
+            current = publication.observation
+            watermark = getattr(self, "_identity_processing_watermark", None)
+            return bool(isinstance(current, ValidatedVisualObservation)
+                and current.uid == uid and current.kind == "full"
+                and current.continuation_sample_timestamp is None
+                and current.capture > cap and stamp < current.timestamp <= checked_now
+                and isinstance(watermark, tuple) and len(watermark) == 2
+                and watermark[0] >= current.capture and watermark[1] >= current.timestamp
+                and publication.live(uid, checked_now))
+
+        before = short.controller.snapshot()
+        plan = before.plan
+        if (not before.active or before.uid != uid or plan is None
+                or plan.uid != uid or plan.epoch != before.epoch
+                or not plan.valid(now) or not plan.moving
+                or not isinstance(proof, ValidatedVisualObservation)
+                or not evidence.permits_depth(uid, plan.depth_timestamp, now)
+                or (not superseding_full(evidence, now)
+                    and (not proof.capture < cap or not proof.timestamp < stamp
+                         or not plan.capture_id < cap or not plan.capture_timestamp < stamp))
+                or now >= stamp + MAX_FULL_RESULT_AGE_SEC):
+            return False
+        review = getattr(getattr(self._rknn_pipeline, "tracker", None),
+                         "associated_position_contradiction", None)
+        # A persistent geometry/competition veto still matters with no formal
+        # record or direction hint. Never translate a missing record into a
+        # way around an explicit negative identity decision.
+        if not callable(review) or review(uid, proof.track_id, cap, stamp):
+            return False
+        # This only narrows an existing proof. Do not poll IR or advance its
+        # debounce here; the consumer and final writer retain their ordinary
+        # live obstacle checks. The cached safety verdict was checked above.
+        if self._current_hazard_state_for_controller().active:
+            return False
+        with getattr(self, "_control_update_lock", nullcontext()):
+            with short.controller.write_snapshot() as latest:
+                latest_evidence, checked_at = read_visual_identity_evidence(self)
+                final_now = max(now, checked_at)
+                # An ordinary Depth commit replaces the immutable snapshot,
+                # not its ownership epoch. Bind the already committed latest
+                # pair rather than treating normal progress as a revocation.
+                plan = latest.plan
+                superseded = superseding_full(latest_evidence, final_now)
+                if (not latest.active or latest.uid != uid or latest.epoch != before.epoch
+                        or plan is None or plan.uid != uid or plan.epoch != latest.epoch
+                        or not plan.moving
+                        or (not superseded and (latest_evidence != evidence
+                            or not plan.capture_id < cap or not plan.capture_timestamp < stamp))
+                        or not plan.valid(final_now)
+                        or not latest_evidence.permits_depth(uid, plan.depth_timestamp, final_now)
+                        or final_now >= stamp + MAX_FULL_RESULT_AGE_SEC
+                        or getattr(controller, "active_target_id", None) != uid
+                        or getattr(controller, "search_state", None) != "none"
+                        or getattr(self, "search_state", None) != "none"
+                        or not getattr(self, "running", False)
+                        or getattr(self, "_depth_roi_safety_clear", False) is not True
+                        or any(getattr(self, flag, False) for flag in (
+                            "_explicit_stop_requested", "_runtime_shutdown_requested",
+                            "_brake_hold_active", "stop_action_execution", "_use_soft_stop_next"))
+                        or getattr(self, "_near_yaw_park_request", None) is not None
+                        or (expected_epoch is not None
+                            and scheduler.publication_snapshot()[0] != expected_epoch)):
+                    return False
+                if not superseded:
+                    narrowed = replace(proof, continuation_sample_timestamp=plan.depth_timestamp,
+                                       expires_at=min(proof.expires_at, plan.expires_at))
+                    if narrowed != proof:
+                        publish_visual_identity_evidence(self, observation=narrowed, lease=evidence.lease)
+        if superseded:
+            # A strictly later completed FULL owns its evidence already. Do
+            # not replace it with the old empty result's rejection, nor narrow
+            # its independent authority. Returning False would invoke stale
+            # handling, which can itself revoke the newer normal-follow state.
+            logger.info("short_follow_empty_detector_superseded capture_frame_id=%s uid=%s "
+                        "newer_full_cap=%s pair=%s publication_unchanged=True "
+                        "identity_renewed=False depth_renewed=False plan_renewed=False",
+                        cap, uid, latest_evidence.observation.capture,
+                        (plan.left_rpm, plan.right_rpm))
+            return True
+        logger.info("short_follow_empty_detector_bridge capture_frame_id=%s original_cap=%s "
+                    "uid=%s pair=%s depth_age_ms=%.1f remaining_ms=%.1f "
+                    "identity_renewed=False depth_renewed=False plan_renewed=False",
+                    cap, plan.capture_id, uid, (plan.left_rpm, plan.right_rpm),
+                    (final_now-plan.depth_timestamp)*1000.,
+                    (min(plan.expires_at, narrowed.expires_at,
+                         getattr(evidence.lease, "expires_at", float("inf")))-final_now)*1000.)
+        return True
 
     def _retain_visual_proof_for_identity_recheck(self, records, cap, stamp, now):
         """Preserve the existing narrow recheck bridge, never authorize UID0.
@@ -15237,16 +15627,27 @@ class PersonTracker:
                 now=vision_finished_mono, stale=stale_result_discarded,
                 expected_epoch=depth_publication_epoch):
             stale_result_discarded = True
-        if not stale_result_discarded or getattr(self, "_late_visual_identity_only", False):
+        current_follow = bool(getattr(self, "_late_visual_current_follow", False))
+        if not stale_result_discarded or getattr(self, "_late_visual_identity_only", False) or current_follow:
             roi_published = PersonTracker._publish_validated_depth_observation(
                 self, records, width, height, current_capture_id, frame_received_ts,
                 expected_epoch=depth_publication_epoch)
             self._late_visual_identity_roi_published = bool(
                 getattr(self, "_late_visual_identity_only", False) and roi_published)
-            if getattr(self, "_late_visual_identity_only", False) and not roi_published:
+            if current_follow and roi_published:
+                stale_result_discarded = False
+                logger.info("processing_late_current_follow capture_frame_id=%s uid=%s "
+                            "processing_age_ms=%.1f capture_age_ms=%.1f "
+                            "full_admission_max_ms=%.1f capture_bound=True depth_deadline_renewed=False",
+                            current_capture_id, self._follow_controller.active_target_id,
+                            vision_result_age_sec*1000.,
+                            (vision_finished_mono-frame_received_ts)*1000.,
+                            MAX_FULL_RESULT_AGE_SEC*1000.)
+            if (getattr(self, "_late_visual_identity_only", False) or current_follow) and not roi_published:
                 # A safety/epoch/geometry rejection of this off-lock mailbox
                 # publication cannot leave a new identity-only exception live.
                 self._late_visual_identity_only = False
+                self._late_visual_current_follow = False
                 self._late_visual_identity_epoch = None
                 self._late_visual_preserved_evidence = None
                 publish_visual_identity_evidence(self, observation=False, lease=False)

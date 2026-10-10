@@ -26,6 +26,7 @@ def test_production_ini_selects_paired_pi_with_shared_tuning_and_motor_ceiling(m
     assert cfg.depth_ttl_sec == .35 and cfg.visual_ttl_sec == .50
     assert cfg.max_integral_gap_sec == .30
     assert cfg.yaw_max_delta_rpm == 16 and cfg.yaw_full_error_ratio == .30
+    assert cfg.yaw_response_exponent == .5 and cfg.yaw_understeer_reduction_rpm == 8
     assert cfg.yaw_camera_hfov_deg == 60 and cfg.yaw_damping_sec == .10
     assert cfg.pivot_max_rpm == 8 and cfg.center_deadband_ratio == .08
     assert os.environ["DISTANCE_CONTROL_MODE"] == "distance_pi"
@@ -136,4 +137,17 @@ def test_yaw_damping_override_does_not_change_rpm_or_deadlines(monkeypatch):
     cfg = ShortFollowConfig.from_env()
     assert cfg.yaw_damping_sec == 0
     assert cfg.yaw_max_delta_rpm == 16 and cfg.pivot_max_rpm == 8
+    assert cfg.depth_ttl_sec == .35 and cfg.visual_ttl_sec == .50
+
+
+def test_turn_response_trial_can_roll_back_without_changing_limits_or_distance_pi(monkeypatch):
+    monkeypatch.setattr(os, "environ", {
+        "SHORT_FOLLOW_YAW_RESPONSE_EXPONENT": "1",
+        "SHORT_FOLLOW_YAW_UNDERSTEER_REDUCTION_RPM": "0",
+    })
+    load_config_to_env(str(CONFIG))
+    cfg = ShortFollowConfig.from_env()
+    assert cfg.yaw_response_exponent == 1 and cfg.yaw_understeer_reduction_rpm == 0
+    assert cfg.yaw_max_delta_rpm == 16 and cfg.pivot_max_rpm == 8
+    assert (cfg.kp_per_sec, cfg.ki_per_sec2, cfg.max_rpm) == (3., .4, 200)
     assert cfg.depth_ttl_sec == .35 and cfg.visual_ttl_sec == .50

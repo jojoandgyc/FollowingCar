@@ -11,6 +11,74 @@ from .search_candidate_gate import BBox, SearchCandidateGate, SearchCandidateGat
 DEFERRED_EDGE_COVERAGE = "candidate_observation_deferred_edge_coverage"
 
 
+def _same_search_edge(bbox, width, search_direction):
+    """Current detector geometry, not a predicted/display box or identity."""
+    try:
+        if any(isinstance(v, bool) or not isinstance(v, (int, float))
+               or not math.isfinite(v) for v in (*bbox, width)):
+            return False
+        x1, y1, x2, y2 = bbox
+        if not width > 0 or not 0 <= x1 < x2 <= width or not 0 <= y1 < y2:
+            return False
+        center = (x1+x2)/(2*width)
+        return ((search_direction == "left" and x1 <= width*.02 and center <= .20)
+                or (search_direction == "right" and x2 >= width*.98 and center >= .80))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def detector_only_side_search_observation(bbox, score, width, height,
+                                          search_direction, *, min_score, confidence_limit):
+    """A low-score edge fragment alone need not interrupt an existing sweep.
+
+    Called only for a fresh, unique formal detection from a completed tracker
+    update with NO identity observations. Never a fallback for rejected or
+    ambiguous identity evidence. This neither identifies the person nor changes
+    search direction, speed, deadline, or the eligibility of a central look.
+    """
+    try:
+        if any(isinstance(v, bool) or not isinstance(v, (int, float))
+               or not math.isfinite(v) for v in (score, height, min_score, confidence_limit)):
+            return False
+        if not _same_search_edge(bbox, width, search_direction):
+            return False
+        x1, y1, x2, y2 = bbox
+        return bool(0 < confidence_limit <= 1
+                    and 0 < min_score <= score < min(.50, confidence_limit)
+                    and height > 0 and y2 <= height
+                    and .12 <= (x2-x1)/(y2-y1) < .50)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return False
+
+
+def _low_score_observation_only(assignment, metadata):
+    """Current low-score association with an explicit non-conflict outcome.
+
+    The bank's generic low-score rejection used to hide both missing anchors
+    and real contradictions. Only its explicit current diagnostic can separate
+    those cases; an absent flag must not be interpreted as no conflict.
+    """
+    a, m = assignment, metadata
+    if (a.get("reason") not in {"low_score_observation_rejected", "low_score_observation_only",
+                                "similar_follow_observe"}
+            or a.get("low_score_observation_blocked") is not False
+            or m.get("low_score_continuation") is not True
+            or m.get("association_reason") != "low_score_existing_track"):
+        return False
+    try:
+        cap, previous_cap = m.get("capture_frame_id"), m.get("association_previous_capture_frame_id")
+        stamp, previous_stamp = m.get("capture_timestamp"), m.get("association_previous_capture_timestamp")
+        score, limit = m.get("detector_confidence"), m.get("association_confidence_limit")
+        if any(isinstance(v, bool) or not isinstance(v, (int, float))
+               or not math.isfinite(v) for v in (stamp, previous_stamp, score, limit)):
+            return False
+        return bool(type(cap) is int and type(previous_cap) is int and cap > previous_cap >= 0
+                    and 0 < stamp-previous_stamp <= .50
+                    and 0 < limit <= 1 and 0 < score < min(.50, limit))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def incomparable_edge_observation(assignment, metadata, output_uid, uid, bbox, width):
     """Defer STOP, not identity: stopping cannot restore a side-cut body crop.
 
@@ -47,6 +115,87 @@ def incomparable_edge_observation(assignment, metadata, output_uid, uid, bbox, w
             and ((x1 <= 2 and center <= .15) or (x2 >= width - 2 and center >= .85))
         )
     except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return False
+
+
+def side_crop_search_observation(assignment, metadata, output_uid, uid, bbox, width,
+                                 search_direction):
+    """Skip an unsuitable stationary look, never authorize target movement.
+
+    A fresh unique same-side crop with gallery support may still be UID0
+    because its secondary region is unavailable or its detector score dipped.
+    Neither quality-label change alone requests a stationary look. Leave the
+    existing bounded search in charge, without assigning this candidate,
+    extending search/identity clocks, or changing its learning permission.
+
+    The caller binds this observation to the exact current CAP/detection,
+    checks all visible candidates and hard safety, and requires active search.
+    No candidate/self-reference descriptor can substitute for gallery proof.
+    """
+    if not isinstance(assignment, dict) or not isinstance(metadata, dict):
+        return False
+    a, m = assignment, metadata
+    geometry = a.get("reacquire_geometry") or {}
+    similar = a.get("similar_follow") or {}
+    competition = a.get("identity_competition") or m.get("identity_competition") or {}
+    match = a.get("match_evidence") or {}
+    if not all(isinstance(value, dict) for value in (geometry, similar, competition, match)):
+        return False
+    conflict_flags = ("search_excluded", "candidate_geometry_conflict", "identity_recheck_pending",
+        "mapped_geometry_blocked", "search_contradiction_retained", "search_cross_edge_conflict",
+        "short_handoff_identity_conflict")
+    if (any(container.get(key) for container in (a, m, geometry) for key in conflict_flags)
+            or m.get("search_direction_compatible") is False
+            or (geometry.get("ok") is False and geometry.get("reason") not in {
+                "stale_reference", "search_reacquire_time_window", "not_evaluated"})
+            or (a.get("reacquire_geometry_ok") is False and a.get("reacquire_geometry_reason") not in {
+                "stale_reference", "search_reacquire_time_window", "not_evaluated"})
+            or a.get("reacquire_partial_state") in {"conflict", "mismatch"}
+            or a.get("low_score_observation_blocked") is True
+            or any(a.get(key) for key in ("bank_updated", "recent_bank_updated", "learning_written_tiers"))
+            or a.get("learning_allowed") is True or similar.get("learning_allowed") is True):
+        return False
+    try:
+        # Real rejected assignments retain this read-only match_evidence via
+        # IdentityBank.assign's diagnostics merge; their top-level source may
+        # be absent after the secondary gate rebuilt the UID0 assignment.
+        source = match.get("match_source", a.get("match_source"))
+        matched_uid = match.get("matched_uid", a.get("best_uid", a.get("mapped_uid")))
+        distance = match.get("strong_distance", match.get("distance",
+            a.get("strong_distance", a.get("distance"))))
+        values = (*bbox, width, distance)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) for value in values):
+            return False
+        x1, y1, x2, y2 = bbox
+        if not width > 0 or not 0 <= x1 < x2 <= width or not 0 <= y1 < y2:
+            return False
+        reasons = {item.strip() for item in str(m.get("quality_bbox_reason")
+                   or m.get("bbox_quality_reason") or "").split(",") if item.strip()}
+        same_edge = _same_search_edge(bbox, width, search_direction)
+        crop_quality = (m.get("quality_bbox_ok") is False and m.get("bbox_quality_tier") == "weak"
+                        and bool(reasons) and reasons <= {"edge_touch>2", "aspect<0.18"})
+        clean_quality = (m.get("quality_bbox_ok") is True and m.get("bbox_quality_tier") == "strong"
+                         and not reasons)
+        unknown_secondary = (a.get("reason") == "secondary_evidence_unavailable"
+                             and a.get("reacquire_partial_comparable") is False
+                             and a.get("reacquire_partial_state") == "unknown")
+        observation_only = unknown_secondary or _low_score_observation_only(a, m)
+        frame = m.get("control_frame_id", m.get("frame_index"))
+        source_index = m.get("source_detection_index")
+        return bool(type(uid) is int and uid > 0 and type(output_uid) is int and output_uid == 0
+            and a.get("uid", output_uid) == 0 and matched_uid == uid
+            and a.get("mapped_uid", uid) in (None, 0, uid)
+            and a.get("best_uid", uid) in (None, 0, uid)
+            and observation_only
+            and source == "strong" and 0 <= distance <= .30
+            and m.get("is_fresh") is True and (crop_quality or clean_quality) and same_edge
+            and competition.get("passed") is True and competition.get("uid") == uid
+            and type(competition.get("candidate_count")) is int and competition["candidate_count"] == 1
+            and type(frame) is int and frame > 0 and competition.get("frame_index") == frame
+            and type(source_index) is int and source_index >= 0
+            and competition.get("source_detection_index") == source_index)
+    except (TypeError, ValueError, OverflowError):
         return False
 
 

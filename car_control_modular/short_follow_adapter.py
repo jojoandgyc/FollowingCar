@@ -16,6 +16,7 @@ from .detector_identity_lease import ValidatedVisualObservation, read_visual_ide
 from .short_follow import ShortFollowObservation, ShortFollowYawObservation
 from .wheel_zero_cross import wheel_feedback_valid
 from .associated_position import AssociatedPosition
+from .low_quality_lateral import LimitedYawSource
 
 
 class ShortFollowAdapter:
@@ -65,10 +66,12 @@ class ShortFollowAdapter:
 
     def publish_visual_lateral(self, target, width, height, capture_id, capture_timestamp,
                                *, now, feedback=None):
-        """Replace yaw in an existing pair, never range, PI or its deadline.
+        """Replace yaw without renewing range, PI or forward permission.
 
         This also runs at the early identity/ROI publication point, before the
         visual controller can wait for a Depth task. No motor or sensor I/O.
+        A verified pivot may use the new yaw deadline, bounded by the original
+        physical Depth expiry; forward motion retains its original deadline.
         """
         owner = self.owner
         evidence, checked_at = read_visual_identity_evidence(owner)
@@ -115,7 +118,8 @@ class ShortFollowAdapter:
         before = self.controller.snapshot().plan
         plan = self.controller.update_lateral(ShortFollowYawObservation(
             proof.uid, capture_id, capture_timestamp, center, capture_heading), now,
-            publication_guard=current, **self._yaw_feedback(feedback, now))
+            publication_guard=current, allow_yaw_renewal=True,
+            **self._yaw_feedback(feedback, now))
         if plan is not None and plan is not before:
             self.logger.info("short_follow_yaw_publish capture_frame_id=%s uid=%s "
                 "source=identity_bound_detector center=%.4f capture_yaw=%s "
@@ -174,6 +178,29 @@ class ShortFollowAdapter:
         return bool(plan is not None and plan.base_rpm == 0
                     and plan.longitudinal_reason == 'reacquire_depth_pending'
                     and plan.left_rpm + plan.right_rpm == 0)
+
+    def _current_lateral_handoff(self, frame, target, uid, now):
+        """A current admitted crop withdraws translation, not future captures.
+
+        This is not a new identity admission: the mapped-crop selector already
+        supplied the source. The executor still needs its published limited
+        yaw intent before it may transfer motion; no old wheel pair is kept.
+        """
+        source = getattr(self.owner, '_limited_yaw_source', None)
+        return bool(isinstance(source, LimitedYawSource) and target is not None
+            and source.uid == uid == target.track_id
+            and source.track_id > 0 and source.capture > 0
+            and source.capture == frame.capture_frame_id
+            and source.timestamp == frame.capture_timestamp
+            and source.bbox == tuple(target.bbox)
+            and source.identity_publication is not None
+            and source.identity_publication is getattr(self.owner, '_visual_identity_evidence', None)
+            and math.isfinite(source.timestamp) and 0 < source.timestamp <= now
+            and now < source.timestamp + self.controller.config.visual_ttl_sec
+            and getattr(self.owner._follow_controller, 'search_state', 'none') == 'none'
+            and getattr(self.owner, 'search_state', 'none') == 'none'
+            and not any(getattr(self.owner, key, False) for key in (
+                '_explicit_stop_requested', '_runtime_shutdown_requested', '_brake_hold_active')))
 
     def hold_explicit_stop(self, capture_timestamp, now):
         """Consume only a documented auto-clear stop AFTER physical STOP ack.
@@ -372,16 +399,56 @@ class ShortFollowAdapter:
                       and not low_quality_visible
                       and getattr(ctl, "search_state", "none") == "none")
         if not normal:
-            prior = self.controller.snapshot()
-            if (prior.active and prior.uid == uid and target is None
-                    and getattr(ctl, "search_state", "none") == "none"
-                    and not low_quality_visible and target_steerable
-                    and prior.plan is not None and prior.plan.valid(now)
-                    and evidence.live(uid, now)):
-                # A single missing observation is not a negative identity
-                # verdict. Keep ONLY the original plan until its fixed expiry.
-                owner._short_follow_handled_frame = True
-                return True
+            handoff_state = self.controller.snapshot()
+            handoff_source = getattr(owner, '_limited_yaw_source', None)
+            if (low_quality_visible and handoff_state.active
+                    and handoff_state.uid == uid
+                    and self._current_lateral_handoff(frame, target, uid, now)):
+                # The replacement yaw is published by the existing lateral
+                # producer below. Retire the old translation atomically, but
+                # don't label every already-exposed next frame as pre-danger.
+                retired = self.controller.retire_for_lateral_handoff(
+                    now, expected_snapshot=handoff_state)
+                if (retired.reason != 'lateral_handoff' or retired.active
+                        or retired.uid != uid or retired.epoch != handoff_state.epoch + 1):
+                    # A later revoke/UID/plan publication owns the outcome.
+                    # Do not let this stale crop enter the legacy yaw producer
+                    # after its ordinary-handoff classification was superseded.
+                    if getattr(owner, '_limited_yaw_source', None) is handoff_source:
+                        owner._limited_yaw_source = None
+                    owner._short_follow_handled_frame = True
+                    self.logger.info("short_follow_lateral_handoff_superseded "
+                        "cap=%s uid=%s reason=%s stale_crop_consumed=True",
+                        frame.capture_frame_id, uid, retired.reason)
+                    return True
+                self.logger.info("short_follow_lateral_handoff cap=%s uid=%s "
+                    "source=mapped_crop identity_renewed=False "
+                    "depth_renewed=False hard_floor_advanced=False",
+                    frame.capture_frame_id, uid)
+                return False
+            expired_plan = None
+            with self.controller.write_snapshot() as prior:
+                if (prior.active and prior.uid == uid and target is None
+                        and getattr(ctl, "search_state", "none") == "none"
+                        and not low_quality_visible and target_steerable
+                        and prior.plan is not None and evidence.live(uid, now)):
+                    if prior.plan.valid(now):
+                        # A missing observation is not a negative identity
+                        # verdict. Keep ONLY the original finite plan.
+                        owner._short_follow_handled_frame = True
+                        return True
+                    # A plain expiry retires this packet, but must not label
+                    # the next independently verified image "before rejection"
+                    # merely because exposure preceded this processing tick.
+                    # The same lock prevents a newer Depth plan being discarded
+                    # between classifying expiry and retiring the old pair.
+                    self.controller.expire_observation(now, deactivate=True)
+                    expired_plan = prior.plan
+            if expired_plan is not None:
+                self.logger.info("short_follow_observation_expired_handoff "
+                    "cap=%s uid=%s old_cap=%s old_deadline=%.9f hard_floor_advanced=False",
+                    frame.capture_frame_id, uid, expired_plan.capture_id, expired_plan.expires_at)
+                return False
             self.deactivate("identity_or_search_handoff", now)
             return False
         if (proof is False or not evidence.motion_identity_live(uid, now)

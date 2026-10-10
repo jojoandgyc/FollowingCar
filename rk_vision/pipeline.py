@@ -1019,8 +1019,7 @@ class RKNNVisionPipeline:
         frame_format: Optional[str] = None,
     ) -> List[TrackRecord]:
         """Run detector-only recovery without advancing ReID or tracker state."""
-        self.last_identity_processing = {"mode": "probe", "reason": "search_observation_only",
-                                         "full_features_current": False}
+        self._reset_identity_processing(mode="probe", reason="search_observation_only")
         frame_start = time.perf_counter()
         arr, width, height, fmt = numpy_from_frame(frame, frame_format)
         self.last_frame_width = width
@@ -1073,6 +1072,9 @@ class RKNNVisionPipeline:
         return []
 
     def process_frame(self, frame: Any, frame_format: Optional[str] = None) -> List[TrackRecord]:
+        # Reset before frame conversion or inference: any exception must not
+        # expose the previous capture's completed empty-detection contract.
+        self._reset_identity_processing(mode="full", reason="processing_pending")
         frame_start = time.perf_counter()
         arr, width, height, fmt = numpy_from_frame(frame, frame_format)
         self.last_frame_width = width
@@ -1083,6 +1085,17 @@ class RKNNVisionPipeline:
         detections = self.detector.detect(packet, fmt)
         detect_end = time.perf_counter()
         persons = self._record_detector_output(detections)
+        # Count hypotheses before size/appearance filtering. Low-score person
+        # diagnostics are not identity evidence, but must not turn a frame with
+        # a possible person into a certified empty one. Formal detections are
+        # already included, so count only sub-threshold diagnostics here.
+        detector_person_count = sum(
+            int(det.class_id) == int(self.config.person_class_id) for det in detections
+        ) + sum(
+            int(det.class_id) == int(self.config.person_class_id)
+            and float(det.score) < float(self.config.conf_threshold)
+            for det in self.last_search_diagnostic_detections
+        )
         check_start = time.perf_counter()
         records = self._try_detected_continuation(packet, persons, fmt)
         fast_check_ms = _elapsed_ms(check_start, time.perf_counter())
@@ -1227,6 +1240,14 @@ class RKNNVisionPipeline:
                 len(persons),
                 len(records),
             )
+        # This reports only successful current-frame detection processing, not
+        # an identity proof. Empty frames keep full_features_current=False;
+        # consumers must also match both capture fields and bound old proof TTL.
+        # Publish last so tracker/ReID/diagnostic failures remain incomplete.
+        self.last_identity_processing.update(
+            detector_result_complete=True,
+            detector_person_count=detector_person_count,
+        )
         return records
 
     def _lk_shadow_seed(self, records, capture_id, timestamp):
@@ -1342,8 +1363,22 @@ class RKNNVisionPipeline:
         if callable(setter):
             setter(active_uid=active_uid, allowed=allowed)
 
+    def _reset_identity_processing(self, *, mode: str, reason: str) -> None:
+        context = getattr(self, "_frame_context", {})
+        self.last_identity_processing = {
+            "mode": mode,
+            "reason": reason,
+            "full_features_current": False,
+            "capture_frame_id": context.get("capture_frame_id"),
+            "capture_timestamp": context.get("capture_timestamp"),
+            "detector_result_complete": False,
+            "detector_person_count": None,
+            "detector_result_capture_frame_id": context.get("capture_frame_id"),
+            "detector_result_capture_timestamp": context.get("capture_timestamp"),
+        }
+
     def _try_detected_continuation(self, packet, persons, fmt):
-        self.last_identity_processing = {"mode": "full", "reason": "disabled"}
+        self.last_identity_processing.update(mode="full", reason="disabled")
         if not (getattr(self.config, "detector_continuation_enable", False)
                 and self.config.reid_enable and self.config.identity_bank_enable):
             return None
@@ -1363,11 +1398,11 @@ class RKNNVisionPipeline:
         )
         records = None if plan is None else self.tracker.commit_detected_continuation(
             plan, now=time.monotonic())
-        self.last_identity_processing = {
-            "mode": "detector_continuation" if records is not None else "full",
-            "reason": getattr(self.tracker, "last_detector_continuation_reason", "unavailable"),
-            "permission": plan.proof.permission if records is not None else "full",
-        }
+        self.last_identity_processing.update(
+            mode="detector_continuation" if records is not None else "full",
+            reason=getattr(self.tracker, "last_detector_continuation_reason", "unavailable"),
+            permission=plan.proof.permission if records is not None else "full",
+        )
         return records
 
     def set_frame_context(

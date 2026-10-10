@@ -39,6 +39,8 @@ class ShortFollowConfig:
     braking_margin_m: float = .02
     yaw_max_delta_rpm: int = 16
     yaw_full_error_ratio: float = .30
+    yaw_response_exponent: float = 1.
+    yaw_understeer_reduction_rpm: int = 0
     pivot_max_rpm: int = 8
     center_deadband_ratio: float = .08
     yaw_camera_hfov_deg: float = 60.
@@ -68,6 +70,8 @@ class ShortFollowConfig:
                 or not 0 <= self.yaw_max_delta_rpm <= 24
                 or not 0 <= self.center_deadband_ratio < .5
                 or not self.center_deadband_ratio < self.yaw_full_error_ratio <= .5
+                or not .5 <= self.yaw_response_exponent <= 1.
+                or not 0 <= self.yaw_understeer_reduction_rpm <= 8
                 or not 0 <= self.pivot_max_rpm <= 8
                 or not 30 <= self.yaw_camera_hfov_deg <= 120
                 or not 0 <= self.yaw_damping_sec <= .20
@@ -79,7 +83,8 @@ class ShortFollowConfig:
                 or not .02 <= self.write_period_sec <= .10
                 or not .10 <= self.stop_refresh_sec <= 1.):
             raise ValueError("invalid paired PI config; requires bounded PI, braking and finite clocks")
-        if any(int(v) != v for v in (self.max_rpm, self.yaw_max_delta_rpm, self.pivot_max_rpm)):
+        if any(int(v) != v for v in (self.max_rpm, self.yaw_max_delta_rpm, self.pivot_max_rpm,
+                                     self.yaw_understeer_reduction_rpm)):
             raise ValueError("short-follow wheel limits must be integer RPM")
 
     @property
@@ -168,8 +173,9 @@ class ShortFollowPlan:
     i_rpm: float = 0.
     integral_dt_sec: float = 0.
     limit_reason: str = "none"
-    # Yaw can be refreshed independently; the original depth/visual clocks
-    # above are never renewed by such a refresh.
+    # Yaw can be refreshed independently. Original measurement clocks remain
+    # provenance; a zero-forward pivot may use its newer qualified yaw clock
+    # only inside the original physical-depth deadline below.
     longitudinal_reason: str = ""
     yaw_capture_id: int = 0
     yaw_capture_timestamp: float = 0.
@@ -177,6 +183,14 @@ class ShortFollowPlan:
     yaw_capture_yaw_deg: Optional[float] = None
     yaw_control_center_x_ratio: float = .5
     yaw_adjustment_reason: str = "none"
+    yaw_common_reduction_rpm: int = 0
+    yaw_response_reason: str = "none"
+    yaw_response_sample_count: int = 0
+    depth_expires_at: float = 0.
+    longitudinal_expires_at: float = 0.
+    # Explicitly withheld translation cannot be restored by another yaw update.
+    # A new independently qualified depth update is required for forward motion.
+    yaw_only: bool = False
 
     @property
     def moving(self):
@@ -193,7 +207,11 @@ class ShortFollowPlan:
             or (self.reason == "pivot_right" and self.right_rpm < 0 < self.left_rpm)))
 
     def valid(self, now):
-        return bool(_finite(now) and max(self.capture_timestamp, self.depth_timestamp) <= now < self.expires_at)
+        return bool(_finite(now) and max(self.capture_timestamp, self.depth_timestamp) <= now < self.expires_at
+            and (not self.depth_expires_at or now < self.depth_expires_at)
+            and (not self.forwarding or not self.longitudinal_expires_at
+                 or now < self.longitudinal_expires_at)
+            and (not self.yaw_only or (self.base_rpm == 0 and self.left_rpm == -self.right_rpm)))
 
 
 @dataclass(frozen=True)
@@ -218,6 +236,8 @@ class ShortFollowController:
         self._lock = threading.RLock()
         self._state = ShortFollowSnapshot(False, None, 0, None, "inactive")
         self._sequence = 0
+        # Hard revocation/UID changes establish a source-time barrier. Normal
+        # sample expiry keeps this separate from the ordering watermarks below.
         self._source_floor = 0.
         self._last_depth = 0.
         self._last_capture = 0.
@@ -228,6 +248,7 @@ class ShortFollowController:
         self._integral_stamp = None
         self._latest_yaw = None
         self._latest_yaw_center = None
+        self._latest_yaw_renewal = False
 
     def _reset_integral(self):
         self._integral_m_s = 0.
@@ -300,6 +321,7 @@ class ShortFollowController:
             self._reset_integral()
             self._latest_yaw = None
             self._latest_yaw_center = None
+            self._latest_yaw_renewal = False
             return True
 
     def _revoke(self, reason, now, *, deactivate):
@@ -317,11 +339,46 @@ class ShortFollowController:
             self._reset_integral()
             self._latest_yaw = None
             self._latest_yaw_center = None
+            self._latest_yaw_renewal = False
             self._state = ShortFollowSnapshot(active, old.uid, old.epoch + 1, None, str(reason))
             return self._state
 
     def revoke(self, reason, now):
         return self._revoke(reason, now, deactivate=False)
+
+    def expire_observation(self, now, *, deactivate=False):
+        """Retire an expired pair without inventing a new hard source floor.
+
+        The caller must independently classify this as ordinary observation
+        expiry, not a hazard, rejected identity or target switch. A newer
+        qualified same-UID observation can have been captured while the old
+        pair was expiring; its own source clocks, TTL and deduplication still
+        apply. This never restores a plan or extends an existing deadline.
+
+        Advancing the epoch invalidates old writer snapshots/ACKs, while the
+        prior hard floor and Depth/capture watermarks survive reactivation.
+        An intervening valid new plan is never retired by a stale expiry call.
+        """
+        if not _finite(now) or now <= 0 or type(deactivate) is not bool:
+            raise ValueError("observation expiry requires a finite clock and boolean ownership flag")
+        with self._lock:
+            old = self._state
+            if old.plan is not None:
+                if now < old.plan.expires_at:
+                    return old
+            elif old.reason != "observation_expired":
+                return old
+            active = old.active and not deactivate
+            if old.plan is None and old.active == active:
+                return old
+            self._parked = True
+            self._reset_integral()
+            self._latest_yaw = None
+            self._latest_yaw_center = None
+            self._latest_yaw_renewal = False
+            self._state = ShortFollowSnapshot(active, old.uid, old.epoch + 1,
+                                             None, "observation_expired")
+            return self._state
 
     def wait_for_existing_brake(self, now):
         """Suspend the pair without inventing a new observation rejection time.
@@ -347,11 +404,42 @@ class ShortFollowController:
             self._reset_integral()
             self._latest_yaw = None
             self._latest_yaw_center = None
+            self._latest_yaw_renewal = False
             self._state = ShortFollowSnapshot(True, old.uid, old.epoch + 1, None, reason)
             return self._state
 
     def deactivate(self, reason, now):
         return self._revoke(reason, now, deactivate=True)
+
+    def retire_for_lateral_handoff(self, now, *, expected_snapshot=None):
+        """Yield to a separately verified current limited-yaw owner.
+
+        The adapter alone qualifies that same-UID visual handoff and excludes
+        hard safety/identity rejection. Retire this complete pair and every
+        writer snapshot by epoch, but do not treat processing time as a new
+        hard source floor. CAP118 can already have been captured when CAP116's
+        limited crop finishes processing. Later normal control still needs a
+        new qualified physical range and the retained capture/depth watermarks.
+        This method authorizes no yaw, forward command, or cached-plan restore.
+        A rejected/empty mailbox is never relabelled as a soft handoff. Callers
+        qualifying an earlier snapshot can bind this retirement to that exact
+        immutable state, so a concurrent hard event or new UID/plan wins.
+        """
+        if not _finite(now) or now <= 0:
+            raise ValueError("lateral handoff requires the actual monotonic clock")
+        with self._lock:
+            old = self._state
+            reason = "lateral_handoff"
+            if (not old.active or old.plan is None
+                    or (expected_snapshot is not None and old is not expected_snapshot)):
+                return old
+            self._parked = True
+            self._reset_integral()
+            self._latest_yaw = None
+            self._latest_yaw_center = None
+            self._latest_yaw_renewal = False
+            self._state = ShortFollowSnapshot(False, old.uid, old.epoch + 1, None, reason)
+            return self._state
 
     def _valid_yaw(self, obs, now):
         return bool(isinstance(obs, ShortFollowYawObservation)
@@ -377,6 +465,9 @@ class ShortFollowController:
                 and cfg.yaw_max_delta_rpm > 0):
             fraction = min(1., (abs(lateral) - cfg.center_deadband_ratio)
                            / (cfg.yaw_full_error_ratio - cfg.center_deadband_ratio))
+            # An opt-in smooth curve gives small visible errors useful yaw
+            # without a minimum-RPM step at the deadband or a higher ceiling.
+            fraction = fraction ** cfg.yaw_response_exponent
             if base > 0:
                 delta = min(int(base), max(1, int(round(fraction * cfg.yaw_max_delta_rpm))))
                 if lateral < 0:
@@ -391,7 +482,7 @@ class ShortFollowController:
         return left, right, reason
 
     def _with_yaw(self, plan, obs, *, current_yaw_deg=None, yaw_rate_deg_s=None,
-                  center_limit=None):
+                  center_limit=None, allow_yaw_renewal=False):
         center, adjustment = tapered_center(obs, current_yaw_deg=current_yaw_deg,
             yaw_rate_deg_s=yaw_rate_deg_s, camera_hfov_deg=self.config.yaw_camera_hfov_deg,
             damping_sec=self.config.yaw_damping_sec)
@@ -400,21 +491,37 @@ class ShortFollowController:
         longitudinal_reason = plan.longitudinal_reason or (
             "forward" if plan.base_rpm > 0 else plan.limit_reason)
         left, right, reason = self._mix_yaw(plan.base_rpm, plan.distance_m, center, longitudinal_reason)
-        return replace(plan, left_rpm=left, right_rpm=right, reason=reason,
+        expires = plan.expires_at
+        if (allow_yaw_renewal and plan.base_rpm == 0 and left == -right and left != 0
+                and reason in {"pivot_left", "pivot_right"}
+                and self.config.pivot_allowed(plan.distance_m, center)
+                and _finite(plan.depth_expires_at) and plan.depth_expires_at > plan.depth_timestamp):
+            # CAP105 Depth remained physically fresh when CAP110 supplied a
+            # new full identity-bound yaw. Do not kill that zero-forward pair
+            # at CAP105's older RGB deadline. Neither the physical range clock
+            # nor the original translation deadline moves by even one tick.
+            expires = min(plan.depth_expires_at, obs.capture_timestamp + self.config.visual_ttl_sec)
+        return replace(plan, left_rpm=left, right_rpm=right, reason=reason, expires_at=expires,
             longitudinal_reason=longitudinal_reason, yaw_capture_id=obs.capture_id,
             yaw_capture_timestamp=obs.capture_timestamp, yaw_center_x_ratio=obs.center_x_ratio,
             yaw_capture_yaw_deg=obs.capture_yaw_deg, yaw_control_center_x_ratio=center,
             yaw_adjustment_reason=adjustment)
 
     def update_lateral(self, observation, now, *, current_yaw_deg=None, yaw_rate_deg_s=None,
-                       publication_guard=None):
+                       publication_guard=None, longitudinal_allowed=True,
+                       allow_yaw_renewal=False):
         """Publish a new qualified visual yaw without waiting for depth.
 
         Invalid/repeated samples do nothing. A first visual sample may be
         remembered while awaiting depth, but can never create a motion plan.
-        Existing longitudinal values and *all* original deadlines are kept.
+        Default position-only callers retain their existing deadline. Only
+        an explicit independently qualified yaw can give a zero-forward pivot
+        its own visual deadline, still capped by the original physical Depth
+        deadline. It never extends forward authority or admits a first expired
+        Depth ROI. Explicitly withholding translation only removes permission.
         """
-        if not self._valid_yaw(observation, now):
+        if (type(longitudinal_allowed) is not bool or type(allow_yaw_renewal) is not bool
+                or not self._valid_yaw(observation, now)):
             return None
         with self._lock:
             old = self._state
@@ -428,16 +535,29 @@ class ShortFollowController:
                         return None
                 except Exception:
                     return None
+            # A publication guard is allowed to invoke a hard revoke under
+            # this reentrant lock. Never publish from its pre-revocation view.
+            if self._state is not old:
+                return None
             self._latest_yaw = observation
+            self._latest_yaw_renewal = allow_yaw_renewal
             self._latest_yaw_center, _ = tapered_center(observation,
                 current_yaw_deg=current_yaw_deg, yaw_rate_deg_s=yaw_rate_deg_s,
                 camera_hfov_deg=self.config.yaw_camera_hfov_deg,
                 damping_sec=self.config.yaw_damping_sec)
             prior = old.plan
-            if prior is None or not prior.valid(now):
+            if prior is None:
                 return None
+            if not longitudinal_allowed:
+                prior = replace(prior, left_rpm=0, right_rpm=0, base_rpm=0.,
+                    base_request_rpm=0., yaw_only=True,
+                    reason="reacquire_depth_pending", limit_reason="reacquire_depth_pending",
+                    longitudinal_reason="reacquire_depth_pending")
             plan = self._with_yaw(prior, observation, current_yaw_deg=current_yaw_deg,
-                                  yaw_rate_deg_s=yaw_rate_deg_s)
+                                  yaw_rate_deg_s=yaw_rate_deg_s,
+                                  allow_yaw_renewal=allow_yaw_renewal)
+            if not plan.valid(now):
+                return None
             self._sequence += 1
             plan = replace(plan, sequence=self._sequence)
             self._state = ShortFollowSnapshot(True, old.uid, old.epoch, plan, plan.reason)
@@ -560,15 +680,18 @@ class ShortFollowController:
             else:
                 self._latest_yaw = yaw
                 self._latest_yaw_center = None
+                self._latest_yaw_renewal = False
             self._sequence += 1
             plan = ShortFollowPlan(obs.uid, self._sequence, old.epoch, left, right, reason,
                 obs.capture_id, obs.capture_timestamp, obs.depth_timestamp, expires, distance,
                 base_request_rpm=demand, base_rpm=base, speed_cap_rpm=cap,
                 p_rpm=p_rpm, i_rpm=self._integral_m_s * 60. / cfg.wheel_circumference_m,
                 integral_dt_sec=dt, limit_reason=limit_reason,
-                longitudinal_reason=reason)
+                longitudinal_reason=reason, depth_expires_at=obs.depth_timestamp + cfg.depth_ttl_sec,
+                longitudinal_expires_at=expires, yaw_only=not longitudinal_allowed)
             plan = self._with_yaw(plan, yaw, current_yaw_deg=current_yaw_deg,
-                yaw_rate_deg_s=yaw_rate_deg_s, center_limit=self._latest_yaw_center)
+                yaw_rate_deg_s=yaw_rate_deg_s, center_limit=self._latest_yaw_center,
+                allow_yaw_renewal=self._latest_yaw_renewal)
             # Preserve an already planned taper even if this new Depth result
             # beats the first physical write and its feedback is unavailable.
             # Only a new visual observation releases this same-frame bound.

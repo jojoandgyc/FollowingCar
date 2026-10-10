@@ -214,14 +214,15 @@ def test_real_sdk_default_emits_one_03_burst_at_lz_addresses(vendor):
     assert wire.requests[0][:6] == bytes.fromhex("01 03 00 5F 00 02")
 
 
-def test_real_sdk_override_uses_only_06_at_005f_and_preserves_mode_and_deceleration(vendor):
+@pytest.mark.parametrize("value,hex_value", [(600, "02 58"), (900, "03 84")])
+def test_real_sdk_override_uses_only_06_at_005f_and_preserves_mode_and_deceleration(vendor, value, hex_value):
     driver, wire = memory_driver(vendor)
-    result = configure_closed_loop_ramp(driver, 600)
+    result = configure_closed_loop_ramp(driver, value)
     assert result["changed"] and result["persist"] is False
     writes = [packet for packet in wire.requests if packet[1] != 3]
     assert len(writes) == 1
-    assert writes[0][:6] == bytes.fromhex("01 06 00 5F 02 58")
-    assert wire.registers[0x005F] == 600
+    assert writes[0][:6] == bytes.fromhex("01 06 00 5F " + hex_value)
+    assert wire.registers[0x005F] == value
     assert wire.registers[0x0060] == 450 and wire.registers[0x0087] == 1
     ramp_reads = [packet for packet in wire.requests if packet[1:6] == bytes.fromhex("03 00 5F 00 02")]
     assert len(ramp_reads) == 2

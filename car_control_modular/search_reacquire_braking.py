@@ -149,6 +149,58 @@ def _finite_values(*values):
     return all(isinstance(v, (int, float)) and math.isfinite(v) for v in values)
 
 
+def paired_search_takeover_available(owner, feedback, now):
+    """An acknowledged small search pivot can enter the paired writer directly.
+
+    Called ONLY for a current, independently confirmed candidate. This is not
+    motion authorization: the normal identity, range and terminal wheel checks
+    still run. It avoids starting a new park/quiet/new-image cycle merely
+    because that candidate crossed the old search direction's centre line.
+    Unknown motion, a STOP already underway, or abnormal feedback cannot use it.
+    All evidence is cached; no serial reads or additional locks are introduced.
+    """
+    runtime = getattr(owner, "_action_runtime", None)
+    backend = getattr(runtime, "backend", None)
+    short = getattr(owner, "_short_follow", None)
+    config = getattr(short, "config", None)
+    ctl = getattr(owner, "_follow_controller", None)
+    uid = getattr(ctl, "active_target_id", None)
+    if (getattr(owner, "_short_follow_adapter", None) is None
+            or not getattr(config, "enabled", False) or type(uid) is not int or uid <= 0
+            or not getattr(owner, "running", False)
+            or any(getattr(owner, key, False) for key in (
+                "_explicit_stop_requested", "_runtime_shutdown_requested",
+                "_near_yaw_park_request", "_brake_hold_active", "stop_action_execution"))
+            or getattr(runtime, "_search_reacquire_brake_request", None) is not None
+            or any(getattr(backend, key, False) for key in (
+                "motion_write_fault", "parking_release_fault", "normal_zero_hold",
+                "parking_current_a", "_parking_current_uncertain"))):
+        return False
+    receipt = getattr(backend, "last_speed_receipt", None)
+    submission = getattr(backend, "last_speed_write", None)
+    completed = getattr(receipt, "completed_at", None)
+    if (receipt is None or submission is None
+            or getattr(submission, "completed_receipt", None) is not receipt
+            or getattr(submission, "stop_generation", None) != getattr(backend, "stop_write_generation", None)
+            or not _finite_values(now, completed) or not 0 <= now-completed <= .15):
+        return False
+    left = receipt.left_rpm * backend.wheel_raw_state_to_target("left", 1, 0x01)
+    right = receipt.right_rpm * backend.wheel_raw_state_to_target("right", 1, 0x01)
+    if not (_finite_values(left, right) and left == -right and 0 < abs(left) <= 8):
+        return False
+    if (feedback is None or not getattr(feedback, "trustworthy", False)
+            or getattr(feedback, "left_error", None) != 0
+            or getattr(feedback, "right_error", None) != 0):
+        return False
+    stamp = getattr(feedback, "timestamp", None)
+    measured = (getattr(feedback, "left_forward_rpm", None),
+                getattr(feedback, "right_forward_rpm", None))
+    return bool(_finite_values(stamp, *measured) and 0 <= now-stamp <= .10
+        and max(map(abs, measured)) <= 10 and max(measured) >= -2
+        and all(value >= -2 or (target < 0 and value >= target-2)
+                for value, target in zip(measured, (left, right))))
+
+
 def _zero_handoff_episode(runtime, uid):
     owner = runtime.owner
     backend = runtime.backend

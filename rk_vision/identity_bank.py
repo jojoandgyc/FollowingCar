@@ -20,7 +20,8 @@ from .verified_continuation import evaluate_continuation, evaluate_pose_continua
 from .similar_follow import (evaluate_similar_follow, cropped_follow_continuous,
                              observe_low_score_position, candidate_motion_geometry,
                              cropped_visibility_geometry, crop_reverification_eligible,
-                             formal_detection_continuous)
+                             formal_detection_continuous, narrow_edge_follow_geometry,
+                             bounded_crop_follow_geometry, bounded_crop_observation_retainable)
 from .camera_geometry import horizontal_center_displacement
 from .detector_continuation import DetectorProof, MAX_FULL_RESULT_AGE_SEC
 
@@ -2675,6 +2676,10 @@ class IdentityBank:
         reliable_partial_conflict = bool(reliable.get('distance') is not None
             and reliable['distance'] > max(.55, self.config.partial_match_threshold+.10))
         if metadata.get('low_score_continuation') is True:
+            # A low-score rejection can mean missing evidence OR a measured
+            # contradiction. Search-observation consumers must not infer the
+            # absence of conflict from the shared rejection reason alone.
+            diagnostics['low_score_observation_blocked'] = bool(blocked or reliable_partial_conflict)
             retained = observe_low_score_position(uid=identity, track_id=track_id,
                 current=metadata, state=state, geometry=local, competition_ok=competition_ok,
                 blocked=bool(blocked or reliable_partial_conflict), full_distance=full)
@@ -2733,6 +2738,50 @@ class IdentityBank:
         crop_continuation = bool(handoff is None and self._quality_ok(confidence, area)
                                  and (cropped_follow_continuous(current, state, local)
                                       or crop_reverified))
+        narrow_crop_geometry = (narrow_edge_follow_geometry(
+            uid=identity, track_id=track_id, current=current, state=state, geometry=local,
+            gallery_distance=gallery_full, competition_ok=competition_ok, blocked=blocked,
+            partial_conflict=reliable_partial_conflict)
+            if handoff is None and detector_state is None and standard_quality
+            and uid == identity and self.track_to_uid.get(track_id) == identity else None)
+        if narrow_crop_geometry is not None:
+            crop_continuation = True
+            local = narrow_crop_geometry
+        # CAP1428/1499: a fresh same-raw crop can fall just outside either the
+        # independent .30 recheck or the full-height/80 px crop shape. Compare
+        # BOTH descriptors with one independently admitted, fixed-age anchor;
+        # the follow-only references above are never used as this evidence.
+        bounded_crop_geometry = None
+        bounded_crop_retention = False
+        anchor = (state or {}).get('crop_appearance_anchor')
+        normalized_partial = _normalize_feature(partial_feature) if partial_feature is not None else None
+        if (not crop_continuation and handoff is None and detector_state is None
+                and standard_quality and uid == identity
+                and self.track_to_uid.get(track_id) == identity and isinstance(anchor, dict)):
+            local_distances = []
+            for query, name in ((normalized, 'full_feature'), (normalized_partial, 'partial_feature')):
+                stored = _normalize_feature(anchor.get(name)) if anchor.get(name) is not None else None
+                distance = (_finite_float(1.-float(query.dot(stored)))
+                    if query is not None and stored is not None and query.shape == stored.shape else None)
+                local_distances.append(max(0., distance) if distance is not None else None)
+            crop_review = dict(
+                uid=identity, track_id=track_id, current=current, state=state, geometry=local,
+                gallery_distance=gallery_full, local_full_distance=local_distances[0],
+                local_partial_distance=local_distances[1], competition_ok=competition_ok,
+                blocked=blocked, partial_conflict=reliable_partial_conflict)
+            bounded_crop_geometry = bounded_crop_follow_geometry(**crop_review)
+            bounded_crop_retention = bool(bounded_crop_geometry is None
+                and bounded_crop_observation_retainable(**crop_review))
+            diagnostics['bounded_crop_review'] = dict(
+                reference_cap=anchor.get('capture'),
+                reference_age_ms=1000.*(now-anchor['timestamp']),
+                gallery_distance=gallery_full, local_full_distance=local_distances[0],
+                local_partial_distance=local_distances[1], eligible=bounded_crop_geometry is not None,
+                observation_retainable=bounded_crop_retention,
+                learning_allowed=False, anchor_renewed=False)
+            if bounded_crop_geometry is not None:
+                crop_continuation = True
+                local = bounded_crop_geometry
         if crop_continuation:
             # Only the follow-only evaluator sees the qualified permission;
             # raw quality diagnostics and all gallery metadata stay unchanged.
@@ -2761,8 +2810,9 @@ class IdentityBank:
                 original_deadline=detector_position_bridge['proof'].deadline,
                 learning_allowed=False)
         retain_crop_observation = bool(decision.status == 'reject'
-            and decision.reason == 'observation_unverified' and crop_recheck
-            and gallery_full <= self.config.similar_follow_retain_threshold)
+            and decision.reason == 'observation_unverified'
+            and ((crop_recheck and gallery_full <= self.config.similar_follow_retain_threshold)
+                 or bounded_crop_retention))
         if retain_crop_observation:
             # Inconclusive current crop: preserve the already observed local
             # candidate only, without advancing CAP/time or granting identity.
@@ -2779,6 +2829,25 @@ class IdentityBank:
                 decision.state['last_strong_timestamp'] = (
                     state.get('last_strong_timestamp', state['last_timestamp'])
                     if crop_continuation else now)
+                if (decision.status == 'follow' and handoff is None and detector_state is None
+                        and bounded_crop_geometry is None and competition_ok and not blocked
+                        and not reliable_partial_conflict and gallery_full <= .30
+                        and normalized is not None and normalized_partial is not None
+                        and normalized_partial.size > 0 and _np().isfinite(normalized_partial).all()
+                        and metadata.get('partial_feature_source')
+                        and confidence >= .75
+                        and ((metadata.get('quality_bbox_ok') is True and standard_quality)
+                             or crop_reverified)):
+                    decision.state['crop_appearance_anchor'] = dict(
+                        uid=identity, track_id=track_id, capture=metadata['capture_frame_id'],
+                        timestamp=now, gallery_distance=gallery_full,
+                        source='independent_crop' if crop_reverified else 'strong_gallery',
+                        observation=deepcopy(metadata), full_feature=tuple(normalized.tolist()),
+                        partial_feature=tuple(normalized_partial.tolist()))
+                elif state and anchor and anchor.get('track_id') == track_id:
+                    # In particular, accepted bounded crops never move this
+                    # anchor, its descriptors or its deadline forward.
+                    decision.state['crop_appearance_anchor'] = deepcopy(anchor)
         if decision.status == 'reject':
             if explicit_conflict:
                 diagnostics['identity_control_rejected'] = True
@@ -2808,6 +2877,11 @@ class IdentityBank:
             diagnostics['similar_follow']['detector_confidence'] = float(confidence)
         if crop_continuation:
             diagnostics['similar_follow']['crop_continuation'] = True
+            if narrow_crop_geometry is not None:
+                diagnostics['similar_follow']['narrow_edge_continuation'] = True
+            if bounded_crop_geometry is not None:
+                diagnostics['similar_follow']['bounded_crop_continuation'] = dict(
+                    bounded_crop_geometry['bounded_crop_confirmation'])
             diagnostics['similar_follow']['original_quality_reason'] = metadata.get('quality_bbox_reason')
             if crop_reverified:
                 diagnostics['similar_follow'].update(
@@ -3005,6 +3079,9 @@ class IdentityBank:
             # The detector's secondary association can observe an existing
             # raw track only; neither legacy mapped nor enrollment paths may
             # turn that match into a current identity/motion permission.
+            # No low_score_observation_blocked=False here: this fallback did
+            # not necessarily evaluate current geometry/reliable torso
+            # conflicts. Missing diagnostics must not exempt a search STOP.
             self.last_assignments[track_id] = dict(uid=0, mapped_uid=uid,
                 reason='low_score_observation_only', bank_updated=False,
                 bbox_quality_ok=False, bbox_quality_tier='weak', identity_control_rejected=True)

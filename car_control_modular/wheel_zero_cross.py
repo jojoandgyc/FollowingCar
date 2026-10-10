@@ -55,9 +55,25 @@ class WheelZeroCrossGuard:
         self.residual_turn_count = 0
         self.residual_turn_signs = None
         self.residual_turn_until = 0.0
+        self.pivot_handoff = None
 
     def reset(self):
         self.__init__()
+
+    def accepts_acknowledged_pivot(self, requested, feedback, now):
+        """Read-only recheck of an existing bounded owner-transfer window.
+
+        A newer encoder publication still needs the same physical envelope.
+        This never seeds/renews a window or supplies identity/motion authority.
+        """
+        if (self.pivot_handoff is None or not wheel_feedback_valid(feedback, now)
+                or sum(requested) != 0 or requested[0] * requested[1] >= 0
+                or max(map(abs, requested)) > 8):
+            return False
+        signs, until = self.pivot_handoff
+        return bool(now < until and all(v * sign > 0 for v, sign in zip(requested, signs))
+            and bounded_turn_residual(requested,
+                (feedback.left_forward_rpm, feedback.right_forward_rpm), 2.))
 
     def quiet_forward_tail(self, feedback, now):
         """Small signed feedback, without actual reverse-command provenance.
@@ -98,7 +114,8 @@ class WheelZeroCrossGuard:
     def limit(self, requested, feedback, now, *, allow_forward_handoff=False,
               allow_aligned_turn=False, residual_reverse_max_rpm=0.0,
               residual_turn_max_rpm=0.0, aligned_deceleration_max_rpm=0.0,
-              preserve_wait_on_zero=False, allow_quiet_forward_tail=False):
+              preserve_wait_on_zero=False, allow_quiet_forward_tail=False,
+              acknowledged_pivot=None):
         signs = tuple(1 if v > 0 else -1 if v < 0 else 0 for v in requested)
         if not any(signs):
             if preserve_wait_on_zero:
@@ -126,6 +143,31 @@ class WheelZeroCrossGuard:
             self.residual_turn_signs = None
             return (0, 0), "feedback_unavailable"
         measured = (feedback.left_forward_rpm, feedback.right_forward_rpm)
+        # A software-owner change is not a physical wheel reversal. Only the
+        # caller's actual paired-writer ACK may seed this short transition;
+        # a proposed turn or a forward/STOP receipt cannot. A +/-2 RPM inner
+        # residual is tolerated without inventing a zero/two-sample episode.
+        # New writes and observations do not extend this response window.
+        small_turn = bool(sum(requested) == 0 and requested[0]*requested[1] < 0
+            and max(map(abs, requested)) <= 8)
+        if (acknowledged_pivot is not None and self.pivot_handoff is None
+                and small_turn and not self.commanded_reverse
+                and self.pending_signs is None and not self.pending_full_reverse):
+            pair, stamp = acknowledged_pivot
+            if (math.isfinite(stamp) and 0 <= now-stamp <= .25
+                    and feedback.timestamp >= stamp and sum(pair) == 0
+                    and pair[0]*pair[1] < 0 and max(map(abs, pair)) <= 8
+                    and all(a*b > 0 for a, b in zip(pair, requested))
+                    and bounded_turn_residual(requested, measured, 2.)):
+                self.pivot_handoff = (signs, now + .15)
+        if self.pivot_handoff is not None:
+            handoff_signs, _until = self.pivot_handoff
+            if self.accepts_acknowledged_pivot(requested, feedback, now):
+                return tuple(requested), 'acknowledged_pivot_continuation'
+            # Keep the expired marker until ordinary reset/sign change; it
+            # must not be re-armed by repeated copies of the same ACK.
+            if signs != handoff_signs:
+                self.pivot_handoff = None
         if (allow_quiet_forward_tail and all(v > 0 for v in requested)
                 and self.quiet_forward_tail(feedback, now)):
             # Preserve signed measurements for braking; no invented zero

@@ -5355,7 +5355,8 @@ class MotionActionRuntime:
                 self._follow_commit_locked = False
 
     def _plan_follow_wheel_targets(
-        self, left, right, label, *, max_target_override=None, visible_required=False
+        self, left, right, label, *, max_target_override=None, visible_required=False,
+        paired_pivot_receipt=None
     ):
         """Periodic planning is off-I/O-lock; legacy direct calls stay locked."""
         self._follow_base_contraction_reject_reason = "not_checked"
@@ -5699,8 +5700,12 @@ class MotionActionRuntime:
             handoff_reason = loss_reason or handoff_reason
         cross_started = self._visible_wheel_guard.started if self._visible_wheel_guard.pending_signs else None
         cross_brake_enabled = getattr(self.config, "follow_cross_brake_enable", False)
+        prior_pivot = (self._acknowledged_pivot_handoff(
+            paired_pivot_receipt, uid, guarded_request, feedback, now)
+            if label == 'LIMITED_YAW_HANDOFF' else None)
         applied, reason = self._visible_wheel_guard.limit(
             guarded_request, feedback, now,
+            acknowledged_pivot=prior_pivot,
             allow_quiet_forward_tail=bool(base > 0 and linear and linear[0] == "forward"
                 and self._ordinary_forward_feedback_eligible(uid, feedback, now)),
             allow_forward_handoff=bool(
@@ -6571,9 +6576,14 @@ class MotionActionRuntime:
                                     commit_feedback.left_forward_rpm,
                                     commit_feedback.right_forward_rpm)))
                         and not (min(applied) > 0 and self._ordinary_forward_feedback_eligible(
-                            uid, commit_feedback, commit_now))):
+                            uid, commit_feedback, commit_now))
+                        and not (reason == 'acknowledged_pivot_continuation'
+                            and self._visible_wheel_guard.accepts_acknowledged_pivot(
+                                applied, commit_feedback, commit_now))):
                     # A newer encoder sample cannot inherit a wheel-crossing
-                    # guard which ran on different direction evidence.
+                    # guard which ran on different direction evidence. The
+                    # existing pivot handoff may only recheck its SAME finite
+                    # envelope; this creates no window or motion permission.
                     self._follow_motor_call("send_targets", 0, 0, "FOLLOW_COMMIT_FEEDBACK_CHANGED")
                     return False
                 feedback = commit_feedback
@@ -6946,7 +6956,8 @@ class MotionActionRuntime:
         ls = self.backend.wheel_raw_state_to_target("left", 1, 0x01)
         rs = self.backend.wheel_raw_state_to_target("right", 1, 0x01)
         self._send_follow_wheel_targets(yaw * ls, -yaw * rs, "LIMITED_YAW_HANDOFF",
-            max_target_override=int(self.config.motor_forward_max_target_rpm), visible_required=True)
+            max_target_override=int(self.config.motor_forward_max_target_rpm), visible_required=True,
+            paired_pivot_receipt=before)
         receipt = getattr(self.backend, "last_speed_receipt", None)
         if (receipt is None or receipt is before or receipt.left_rpm * ls == 0
                 or receipt.left_rpm * ls != -receipt.right_rpm * rs):
@@ -6958,6 +6969,31 @@ class MotionActionRuntime:
             "pair=%s stop_preface=False forward_authorized=False", uid, intent.capture_frame_id,
             (receipt.left_rpm * ls, receipt.right_rpm * rs))
         return True
+
+    def _acknowledged_pivot_handoff(self, receipt, uid, requested, feedback, now):
+        """Carry actual same-direction pivot provenance across writer owners.
+
+        No forward-to-pivot shortcut, invented quiet feedback, or permission
+        renewal. Final publication/feedback/hardware checks remain unchanged.
+        """
+        executor = getattr(self, '_short_follow_executor', None)
+        plan = getattr(self.owner, '_short_follow_last_applied_plan', None)
+        if (receipt is None or receipt is not self.backend.last_speed_receipt
+                or executor is None or receipt is not executor._motion_receipt
+                or executor._generation != self.backend.stop_write_generation
+                or plan is None or plan.uid != uid or not plan.pivot
+                or not wheel_feedback_valid(feedback, now)
+                or not limited_yaw_identity_live(self.owner, uid, now)
+                or getattr(self.owner, '_last_motor_dispatch_source', None) != 'short_follow'):
+            return None
+        pair = (receipt.left_rpm * self.backend.wheel_raw_state_to_target('left', 1, 0x01),
+                receipt.right_rpm * self.backend.wheel_raw_state_to_target('right', 1, 0x01))
+        if (pair != (plan.left_rpm, plan.right_rpm) or sum(requested) != 0
+                or max(map(abs, requested)) > 8 or max(map(abs, pair)) > 8
+                or not all(a*b > 0 for a, b in zip(pair, requested))
+                or not 0 <= now-receipt.completed_at <= .25):
+            return None
+        return pair, receipt.completed_at
 
     def can_handoff_limited_yaw(self, uid, capture_frame_id):
         """Queue interruption is not a stop when the sole writer has new yaw.

@@ -287,7 +287,8 @@ def test_capture_gap_extension_does_not_extend_current_detection_age(age):
 
 def test_commit_cannot_use_gap_budget_as_extra_processing_time():
     tracker = ready_tracker()
-    stamp = tracker._detector_proof.previous.timestamp + .194916
+    # Keep enough full-check headroom so this isolates the detection-age gate.
+    stamp = tracker._detector_proof.previous.timestamp + .10
     p = plan(tracker, stamp=stamp, now=stamp+.179999)
     assert p is not None
     assert tracker.commit_detected_continuation(p, now=stamp+.18) is None

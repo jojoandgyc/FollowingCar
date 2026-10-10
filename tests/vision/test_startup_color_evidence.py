@@ -194,7 +194,8 @@ def test_pipeline_forwards_only_aligned_color_and_supports_legacy_extractors(kin
     calls = []
     p = RKNNVisionPipeline.__new__(RKNNVisionPipeline)
     p.config = SimpleNamespace(predicted_reid_verify_enable=False,
-                               identity_suppress_duplicate_uids=False)
+                               identity_suppress_duplicate_uids=False,
+                               person_class_id=0, conf_threshold=.35)
     p.logger = None
     p._frame_context = {'capture_frame_id': 17, 'capture_timestamp': 10.1}
     p.detector = SimpleNamespace(detect=lambda *_: [Detection(BOX, .94, 0)], last_timing_ms={})
@@ -202,6 +203,9 @@ def test_pipeline_forwards_only_aligned_color_and_supports_legacy_extractors(kin
     if kind != 'legacy':
         p.reid.last_color_features = [COLOR] if kind == 'current' else [COLOR, COLOR]
     p.tracker = SimpleNamespace(update=lambda *args, **kwargs: calls.append(kwargs) or [])
+    # This test stubs detector bookkeeping, so provide the current empty
+    # diagnostic list that the real _record_detector_output publishes.
+    p.last_search_diagnostic_detections = []
     p._record_detector_output = lambda detections: detections
     p._record_reid_diagnostics = lambda *_: None
     assert p.process_frame(image()) == []

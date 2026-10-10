@@ -143,7 +143,15 @@ def test_failed_yaw_successor_keeps_required_stop(monkeypatch, failure):
     else:
         rt.hard_stop_check = lambda _: True
     rt._service_short_follow()
-    assert driver.stops
+    if failure == "feedback":
+        # The canonical successor already ACKed its feedback-wait zero. The
+        # retired paired owner must not replace that barrier with another STOP.
+        assert driver.pairs == [(0, 0)] and not driver.stops
+        assert rt._visible_wheel_waiting and not executor._owned
+        assert not rt._service_short_follow()
+        assert not driver.stops
+    else:
+        assert driver.stops
     assert not any(pair != (0, 0) for pair in driver.pairs)
 
 

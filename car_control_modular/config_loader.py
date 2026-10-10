@@ -135,6 +135,7 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     # create a second P-only speed policy or a hidden 40 RPM ceiling here.
     for option in ("stop_margin_m", "restart_margin_m",
                    "yaw_max_delta_rpm", "yaw_full_error_ratio", "yaw_damping_sec", "pivot_max_rpm", "center_deadband_ratio",
+                   "yaw_response_exponent", "yaw_understeer_reduction_rpm",
                    "depth_ttl_sec", "visual_ttl_sec", "write_period_sec", "stop_refresh_sec"):
         _set_env_if_unset(parser, "short_follow", option, "SHORT_FOLLOW_" + option.upper())
 

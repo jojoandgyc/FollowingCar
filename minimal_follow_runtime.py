@@ -283,6 +283,7 @@ class MinimalFollowRuntime:
             min_height_px=_float_env("MINIMAL_REID_MIN_HEIGHT_PX", 120.0),
             min_area_px=_float_env("MINIMAL_REID_MIN_AREA_PX", 8000.0),
             edge_margin_ratio=_float_env("MINIMAL_REID_EDGE_MARGIN_RATIO", 0.015),
+            freeze_after_first_enrollment=_bool_env("MINIMAL_REID_FREEZE_AFTER_FIRST_ENROLLMENT", False),
         )
         if not cfg.reid_enabled:
             LOG.info("minimal ReID v2 disabled")
@@ -538,6 +539,7 @@ class MinimalFollowRuntime:
             "reid_result_age_ms": appearance_decision.result_age_ms,
             "reid_full_templates": appearance_decision.full_templates,
             "reid_torso_templates": appearance_decision.torso_templates,
+            "reid_profile_frozen": appearance_decision.profile_frozen,
             "reid_view_templates": appearance_decision.view_templates,
             "reid_probe_candidates": appearance_decision.probe_candidates,
             "reid_probe_attempts": appearance_decision.probe_attempts,

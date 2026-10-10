@@ -87,6 +87,26 @@ def test_reacquire_requires_repeated_fresh_reid_evidence():
     assert confirmed.accepted and confirmed.reason == "reid_confirmed"
 
 
+def test_fixed_profile_does_not_submit_or_add_later_follow_samples():
+    worker = _Worker()
+    policy = ReidPolicy(ReidConfig(
+        stable_frames=1, min_full_templates=1, min_torso_templates=1,
+        freeze_after_first_enrollment=True,
+    ), worker)
+    frame = _Frame()
+    candidate = _candidate()
+    policy.observe(frame=frame, candidates=[candidate], frame_id=1, now=1.0, frame_width=640, frame_height=480)
+    worker.results.append(ReidResult(1, 1.0, 1.01, "enroll", candidate.bbox, .9, (1.0, 0.0), (1.0, 0.0), {}))
+    locked = policy.observe(frame=frame, candidates=[candidate], frame_id=2, now=1.1, frame_width=640, frame_height=480)
+    assert locked.state == "LOCKED"
+    assert locked.profile_frozen
+    assert policy.profile.full_count == 1
+    request_count = len(worker.requests)
+    policy.observe(frame=frame, candidates=[candidate], frame_id=3, now=1.2, frame_width=640, frame_height=480)
+    assert len(worker.requests) == request_count
+    assert policy.profile.full_count == 1
+
+
 def test_search_round_robins_after_one_candidate_uses_its_confirmation_window():
     worker = _Worker()
     policy = ReidPolicy(ReidConfig(

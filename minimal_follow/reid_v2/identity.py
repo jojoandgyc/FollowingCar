@@ -34,6 +34,9 @@ class ReidConfig:
     min_height_px: float = 120.0
     min_area_px: float = 8000.0
     edge_margin_ratio: float = 0.015
+    # Test mode: preserve the first accepted target descriptor exactly as it
+    # was captured. No normal-follow sample may later update the gallery.
+    freeze_after_first_enrollment: bool = False
     view_capture_enabled: bool = True
     view_change_threshold: float = 0.90
     max_templates_per_view: int = 2
@@ -54,6 +57,7 @@ class ReidDecision:
     probe_candidates: int = 0
     probe_attempts: int = 0
     view_templates: Optional[dict] = None
+    profile_frozen: bool = False
 
 
 class ReidPolicy:
@@ -77,6 +81,7 @@ class ReidPolicy:
         self._probe_hits = 0
         self._probe_candidates = 0
         self._enroll_view_index = 0
+        self._profile_frozen = False
 
     def _enrollment_view(self, feature) -> str:
         """Assign samples to an ordered four-view capture session.
@@ -158,6 +163,12 @@ class ReidPolicy:
             self._latest_match = None
             return
         if result.purpose == "enroll":
+            # A fixed-profile run has exactly one enrollment result. Results
+            # queued just before the first one completed are discarded here,
+            # so they cannot silently replace or supplement the target.
+            if self.config.freeze_after_first_enrollment and self._profile_frozen:
+                self._latest_match = None
+                return
             view_bin = self._view_bin(result.bbox, result.frame_width)
             view = self._enrollment_view(result.full_feature)
             full_added = self.profile.add(result.full_feature, source="full", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
@@ -170,6 +181,8 @@ class ReidPolicy:
                     # Keep collecting the current view until a visual change;
                     # the next result will remain here if it is still similar.
                     pass
+            if self.config.freeze_after_first_enrollment and (full_added or torso_added):
+                self._profile_frozen = True
             self._latest_match = None
             return
         age = max(0.0, now - result.submitted_at)
@@ -186,7 +199,7 @@ class ReidPolicy:
             None if match is None else match.score,
             None if match is None else match.source,
             age_ms, self._last_worker_timing, self.profile.full_count, self.profile.torso_count,
-            self._probe_candidates, self._probe_attempts, self.profile.view_counts(),
+            self._probe_candidates, self._probe_attempts, self.profile.view_counts(), self._profile_frozen,
         )
 
     def _same_result_candidate(self, evidence_bbox: BBox, candidate: ReidCandidate, frame_width: int) -> bool:
@@ -275,11 +288,12 @@ class ReidPolicy:
             self._last_bbox = associated.bbox
             self._stable_frames += 1
             if self._stable_frames >= self.config.stable_frames:
-                self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
-                             frame_width=frame_width, frame_height=frame_height)
-                self.state = "LOCKED" if self.profile.ready(
-                    min_full=self.config.min_full_templates, min_torso=self.config.min_torso_templates,
-                ) else "ENROLLING"
+                if self.profile.ready(min_full=self.config.min_full_templates, min_torso=self.config.min_torso_templates):
+                    self.state = "LOCKED"
+                else:
+                    self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
+                                 frame_width=frame_width, frame_height=frame_height)
+                    self.state = "ENROLLING"
             return self._decision(True, associated, state=self.state, reason="initial_target")
 
         if self.state == "LOCKED" and associated is not None:
@@ -287,8 +301,9 @@ class ReidPolicy:
             # Keep collecting a small number of views after lock. Otherwise a
             # target enrolled only front-facing would be very hard to recover
             # after the vehicle rotates during a loss episode.
-            self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
-                         frame_width=frame_width, frame_height=frame_height)
+            if not self._profile_frozen:
+                self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
+                             frame_width=frame_width, frame_height=frame_height)
             return self._decision(True, associated, state="LOCKED", reason="geometry_associated")
 
         # No continuous target: probe every detected person in turn. A large

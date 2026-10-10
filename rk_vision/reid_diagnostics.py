@@ -122,6 +122,7 @@ class ReIDDiagnosticsWriter:
             record = _json_value(metadata)
             if not isinstance(record, dict):
                 raise ValueError("metadata must be a mapping")
+            record.update(template_learning_labels(record))
             control_id = _record_id(record, "control_frame_id", "frame_index")
             capture_id = _record_id(record, "capture_frame_id")
             track_id = _record_id(record, "raw_track_id", "track_id", "rawtrack")
@@ -141,7 +142,7 @@ class ReIDDiagnosticsWriter:
                 sequence = self.accepted_samples + 1
                 relative_path = (
                     f"frame_{_id_name(control_id)}_capture_{_id_name(capture_id)}"
-                    f"_track_{_id_name(track_id)}_{sequence:04d}.png"
+                    f"_track_{_id_name(track_id)}_{sequence:04d}_{record['learning_label']}.png"
                 )
                 path_key = None if control_id is None or track_id is None else (control_id, track_id)
                 try:
@@ -255,6 +256,41 @@ def _record_id(record: Dict[str, Any], *keys: str) -> Optional[int]:
             except (TypeError, ValueError, OverflowError):
                 continue
     return None
+
+
+def template_learning_labels(record: Mapping[str, Any]) -> Dict[str, Any]:
+    """Classify saved evidence, never imply that a saved PNG is a template.
+
+    Raw pixels and CAP/track prefixes stay unchanged. A short filename suffix
+    distinguishes the saved diagnostic crop from an actual learned template;
+    JSON keeps the full reason, through the existing bounded writer only.
+    """
+    assignment = record.get("assignment") or {}
+    if not isinstance(assignment, Mapping):
+        assignment = {}
+    learning = assignment.get("template_learning") or {}
+    if not isinstance(learning, Mapping):
+        learning = {}
+    tiers = assignment.get("learning_written_tiers") or learning.get("written_tiers") or []
+    tiers = [str(tier) for tier in tiers] if isinstance(tiers, (list, tuple)) else []
+    if assignment.get("bank_updated") or assignment.get("recent_bank_updated") or tiers:
+        status = "stored"
+    elif learning.get("status") == "pending":
+        status = "learning_pending"
+    elif learning.get("status") == "frozen":
+        status = "learning_frozen"
+    elif learning.get("status") == "rejected":
+        status = "learning_rejected"
+    elif not assignment.get("uid", record.get("uid", 0)):
+        status = "identity_rejected"
+    else:
+        status = "observation_only"
+    label = {"stored": "STORED", "learning_pending": "PENDING",
+             "learning_frozen": "FROZEN", "learning_rejected": "REJECTED",
+             "identity_rejected": "REJECTED", "observation_only": "OBSERVE"}[status]
+    return {"learning_status": status, "learning_label": label,
+            "learning_reason": str(learning.get("reason") or assignment.get("reason") or ""),
+            "learning_written_tiers": tiers}
 
 
 def _id_name(value: Optional[int]) -> str:

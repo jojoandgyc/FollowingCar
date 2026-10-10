@@ -25,7 +25,7 @@ def test_production_ini_selects_paired_pi_with_shared_tuning_and_motor_ceiling(m
     assert cfg.target_distance_m == 1.4
     assert cfg.depth_ttl_sec == .35 and cfg.visual_ttl_sec == .50
     assert cfg.max_integral_gap_sec == .30
-    assert cfg.yaw_max_delta_rpm == 18 and cfg.yaw_full_error_ratio == .30
+    assert cfg.yaw_max_delta_rpm == 16 and cfg.yaw_full_error_ratio == .30
     assert cfg.pivot_max_rpm == 8 and cfg.center_deadband_ratio == .08
     assert os.environ["DISTANCE_CONTROL_MODE"] == "distance_pi"
     assert "SHORT_FOLLOW_MIN_RPM" not in os.environ
@@ -67,6 +67,13 @@ def test_explicit_legacy_override_is_rollback_not_a_second_writer(monkeypatch):
 def test_old_environment_without_mode_does_not_enable_new_path(monkeypatch):
     monkeypatch.setattr(os, "environ", {})
     assert not ShortFollowConfig.from_env().enabled
+
+
+def test_default_forward_differential_is_16_without_changing_pivot_limit(monkeypatch):
+    monkeypatch.setattr(os, "environ", {})
+    for cfg in (ShortFollowConfig(), ShortFollowConfig.from_env()):
+        assert cfg.yaw_max_delta_rpm == 16
+        assert cfg.pivot_limit_rpm == 8
 
 
 @pytest.mark.parametrize("change", [

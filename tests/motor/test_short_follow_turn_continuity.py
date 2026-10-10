@@ -202,11 +202,11 @@ def test_pivot_keeps_independent_emergency_identity_and_distance_guards(monkeypa
 
 
 @pytest.mark.parametrize("direction", [1, -1], ids=["right", "left"])
-def test_far_turn_uses_full_eighteen_rpm_difference(monkeypatch, direction):
+def test_far_turn_uses_full_sixteen_rpm_difference(monkeypatch, direction):
     rt, owner, driver, _, clock = short_runtime(monkeypatch)
     tick_observation(rt, clock, 430, 2., mirrored_x(.8, direction), (0, 0))
     left, right = normalized_pair(driver)
-    assert direction * (left - right) == 18
+    assert direction * (left - right) == 16
     assert not driver.stops
 
 

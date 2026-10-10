@@ -145,6 +145,79 @@ def test_cap879_strong_reacquisition_survives_later_point_two_search_gate():
     assert bank._reacquire_quarantine.is_held(1)
 
 
+def test_recomputed_held_capture_cannot_enter_pose_follow_with_a_different_crop():
+    bank = checkpoint()
+    assert send(bank, 832, .326, .420) == 0
+    assert bank.last_assignments[3]["reason"] == "verified_continuation_recheck"
+    assert send(bank, 832, .25, .420,
+                detector_bbox=[470., 135.827, 560., 444.679]) == 0
+    assert bank.last_assignments[3]["reason"] == "verified_continuation_nonnew"
+    assert "identity_pose_continuation" not in bank.last_assignments[3]
+    assert not bank.last_assignments[3]["bank_updated"]
+
+
+def test_pose_follow_episode_does_not_collide_with_legacy_pose_reference_fields():
+    bank = checkpoint()
+    frozen = gallery(bank)
+    narrow = [470., 135.827, 560., 444.679]
+    assert send(bank, 832, .25, .42, detector_bbox=narrow) == 1
+    episode = deepcopy(bank._appearance_verified[1]['pose_follow_episode'])
+    assert send(bank, 837, .25, .50, detector_bbox=narrow) == 1
+    assert bank._appearance_verified[1]['pose_follow_episode']['origin'] == episode['origin']
+    assert bank.last_assignments[3]['identity_pose_continuation']['deadline'] == episode['decision']['deadline']
+    assert gallery(bank) == frozen
+    assert not bank.last_assignments[3]['bank_updated']
+
+
+@pytest.mark.parametrize('quarantined', [True, False])
+def test_pose_expiry_needs_two_independent_matches_before_new_episode_or_learning(quarantined):
+    bank = checkpoint()
+    if not quarantined:
+        # Model an established binding whose original quarantine has cleared.
+        bank._reacquire_quarantine._held.pop(1)
+    frozen = gallery(bank)
+    origin_time = ROWS[830][1]
+    narrow = [470., 135.827, 560., 444.679]
+
+    def sample(index, elapsed, part, box=narrow):
+        return send(bank, 832, .10, part, detector_bbox=box,
+                    capture_frame_id=832+index*2, capture_timestamp=origin_time+elapsed,
+                    frame_index=ROWS[832][0]+index)
+
+    assert sample(0, .1, .42) == 1
+    deadline = bank._appearance_verified[1]['pose_follow_episode']['decision']['deadline']
+    for index in range(1, 19):
+        assert sample(index, .1+index*.1, .50) == 1
+        assert not bank.last_assignments[3]['bank_updated']
+    # Ordinary positive evidence after expiry is usable, but cannot alone
+    # discard the fence or approve a new pose epoch/gallery sample.
+    assert sample(19, 2.01, .20) == 1
+    state = bank._appearance_verified[1]['pose_follow_episode']['decision']
+    assert state['recovery_streak'] == 1
+    assert state['deadline'] == deadline
+    assert not bank.last_assignments[3]['bank_updated']
+    assert gallery(bank) == frozen
+    recovered = deepcopy(bank)
+    # A second matching frame closes the episode, still without writing.
+    assert sample(20, 2.11, .20) == 1
+    assert 'pose_follow_episode' not in bank._appearance_verified[1]
+    assert not bank.last_assignments[3]['bank_updated']
+    bank = recovered
+    assert sample(20, 2.11, .42, [475., 135.827, 550., 444.679]) == 0
+    assert bank._appearance_verified[1]['pose_follow_episode']['decision']['deadline'] == deadline
+    assert bank._appearance_verified[1]['pose_follow_episode']['decision']['recovery_streak'] == 0
+    assert not bank.last_assignments[3]['bank_updated']
+    # The old .35s hold can expire before the next independently matching
+    # frame. Ordinary mapped acceptance must not leak through to the writer.
+    assert sample(21, 2.37, .20) == 1
+    assert not bank.last_assignments[3]['bank_updated']
+    assert gallery(bank) == frozen
+    assert sample(22, 2.47, .20) == 1
+    assert not bank.last_assignments[3]['bank_updated']
+    assert 1 not in bank._pose_learning_fences
+    assert 'pose_follow_episode' not in bank._appearance_verified[1]
+
+
 @pytest.mark.parametrize("partial_label", [False, True])
 def test_complete_vs_clipped_label_does_not_change_valid_current_descriptor_permission(partial_label):
     bank = checkpoint()

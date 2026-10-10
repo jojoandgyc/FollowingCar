@@ -4,6 +4,7 @@ from .follow_bbox_policy import lower_compact_bbox_reason
 import logging
 import math
 import time
+from numbers import Integral
 from dataclasses import dataclass, replace
 from typing import Any, List, Optional, Sequence, Set, Tuple
 
@@ -28,6 +29,65 @@ logger = logging.getLogger(__name__)
 TRACK_STATE_NEW = 0
 TRACK_STATE_UNSTABLE = 1
 TRACK_STATE_STABLE = 2
+
+
+def _template_learning_risk(detections, source_index, *, is_fresh, all_detections=None):
+    """Describe crop mixing for learning only, without running ReID or gating UID.
+
+    A small excluded person may still occlude most of its visible body inside
+    the target crop. Intersection/min(area) deliberately detects that case;
+    IoU alone misses it. Indices refer to the supplied all-detections snapshot.
+    """
+    result = dict(observed=False, risky=False, reason="no_fresh_detector_source",
+                  overlap=0.0, other_indices=[])
+    if (not is_fresh or isinstance(source_index, bool)
+            or not isinstance(source_index, Integral)
+            or not 0 <= int(source_index) < len(detections)):
+        return result
+
+    def person_box(item):
+        try:
+            values = tuple(float(v) for v in item.bbox)
+            if (int(item.class_id) != 0 or len(values) != 4
+                    or not all(math.isfinite(v) for v in values)
+                    or values[2] <= values[0] or values[3] <= values[1]):
+                return None
+            return values
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    target = detections[int(source_index)]
+    box = person_box(target)
+    if box is None:
+        return result
+    candidates = detections if all_detections is None else all_detections
+    # An optional broader snapshot must actually contain this observation.
+    # Missing/older snapshots must not manufacture an "unoccluded" proof.
+    matches = [i for i, item in enumerate(candidates) if item is target]
+    if not matches:
+        matches = [i for i, item in enumerate(candidates)
+                   if person_box(item) == box and item.score == target.score]
+    if len(matches) != 1:
+        return result
+    own_index = matches[0]
+    area = (box[2] - box[0]) * (box[3] - box[1])
+    result.update(observed=True, reason="clear")
+    for index, item in enumerate(candidates):
+        if index == own_index:
+            continue
+        other = person_box(item)
+        if other is None:
+            continue
+        intersection = max(0.0, min(box[2], other[2]) - max(box[0], other[0])) * max(
+            0.0, min(box[3], other[3]) - max(box[1], other[1]))
+        denominator = min(area, (other[2] - other[0]) * (other[3] - other[1]))
+        overlap = intersection / denominator
+        result["overlap"] = max(result["overlap"], overlap)
+        if overlap >= 0.15:
+            result["other_indices"].append(index)
+    if result["other_indices"]:
+        result.update(risky=True, reason="overlapping_person_crop")
+    return result
 
 
 @dataclass(frozen=True)
@@ -72,6 +132,11 @@ class DeepSortTrackerConfig:
     identity_max_features: int = 20
     identity_template_memory_enable: bool = False
     identity_template_crosscheck_enable: bool = False
+    identity_template_learning_guard_enable: bool = False
+    identity_similar_follow_enable: bool = False
+    identity_similar_follow_entry_threshold: float = 0.50
+    identity_similar_follow_retain_threshold: float = 0.55
+    identity_similar_follow_max_gap_sec: float = 0.50
     identity_appearance_region_safety_enable: bool = False
     identity_template_recent_sec: float = 30.0
     identity_template_archive_sec: float = 120.0
@@ -187,6 +252,11 @@ class DeepSortTracker:
                 max_features=config.identity_max_features,
                 template_memory_enable=config.identity_template_memory_enable,
                 template_crosscheck_enable=config.identity_template_crosscheck_enable,
+                template_learning_guard_enable=config.identity_template_learning_guard_enable,
+                similar_follow_enable=config.identity_similar_follow_enable,
+                similar_follow_entry_threshold=config.identity_similar_follow_entry_threshold,
+                similar_follow_retain_threshold=config.identity_similar_follow_retain_threshold,
+                similar_follow_max_gap_sec=config.identity_similar_follow_max_gap_sec,
                 appearance_region_safety_enable=config.identity_appearance_region_safety_enable,
                 template_recent_sec=config.identity_template_recent_sec,
                 template_archive_sec=config.identity_template_archive_sec,
@@ -702,6 +772,7 @@ class DeepSortTracker:
         partial_features: Optional[Sequence[Optional[Any]]] = None,
         partial_feature_sources: Optional[Sequence[Optional[str]]] = None,
         color_features: Optional[Sequence[Optional[Any]]] = None,
+        learning_detections: Optional[Sequence[Detection]] = None,
         image_width: int,
         image_height: Optional[int] = None,
         frame_context: Optional[dict] = None,
@@ -726,6 +797,10 @@ class DeepSortTracker:
         self._frame_index += 1
         self._frame_context = dict(frame_context or {})
         self._current_detections = tuple(detections)
+        # Learning needs all current person boxes, including observations that
+        # were excluded from identity competition or the normal size filter.
+        # This snapshot is read-only and never changes assignment eligibility.
+        self._learning_detections = tuple(detections if learning_detections is None else learning_detections)
         self._identity_competition = {}
         self.last_identity_observations = []
         startup_tracks_before = {
@@ -755,6 +830,14 @@ class DeepSortTracker:
         bbox_xywh = [_xyxy_to_expanded_xywh(det.bbox, self.config.bbox_expand_scale) for det in detections]
         confidences = [float(det.score) for det in detections]
         classes = [int(det.class_id) for det in detections]
+        # Association runs before UID verification. Preserve the raw-track
+        # gallery so follow-only acceptance cannot silently train DeepSORT.
+        # Arrays are immutable here; list copies suffice and avoid copying
+        # full descriptors on every physical frame.
+        association_gallery_before = (
+            {track: list(values) for track, values in self.deepsort.tracker.metric.samples.items()}
+            if self.config.identity_similar_follow_enable else None
+        )
         outputs = self.deepsort.update(
             bbox_xywh,
             confidences,
@@ -813,6 +896,8 @@ class DeepSortTracker:
             )
             for out in outputs
         ]
+        if association_gallery_before is not None:
+            self._restore_follow_only_association_gallery(association_gallery_before)
         timer.mark("records")
         if not records:
             probe = self._search_probe_record(
@@ -828,6 +913,30 @@ class DeepSortTracker:
         timer.mark("probe")
         self.last_timing_ms = timer.finish()
         return records
+
+    def _restore_follow_only_association_gallery(self, before):
+        """Follow-only embeddings remain observations, not association parents."""
+        tracker = self.deepsort.tracker
+        for track in tracker.tracks:
+            assignment = self.identity_bank.last_assignments.get(int(track.track_id), {})
+            proof = assignment.get("similar_follow") or {}
+            uid = int(assignment.get("uid") or assignment.get("mapped_uid")
+                      or self.identity_bank.track_to_uid.get(int(track.track_id), 0))
+            fenced = uid in self.identity_bank._similar_learning_fences
+            if (assignment.get("match_source") != "similar_follow"
+                    and proof.get("status") not in ("observe", "follow") and not fenced):
+                continue
+            if int(track.track_id) in before:
+                tracker.metric.samples[int(track.track_id)] = before[int(track.track_id)]
+            else:
+                tracker.metric.samples.pop(int(track.track_id), None)
+            # Tentative tracks can hold features until confirmation; clear
+            # these too. last_feature is current evidence, not learned state.
+            track.features = []
+            assignment["association_gallery_frozen"] = True
+            for observation in self.last_identity_observations:
+                if observation.get("raw_track_id") == int(track.track_id):
+                    observation["assignment"]["association_gallery_frozen"] = True
 
     def _frame_identity_competition(self, detections, features, *, suppressed_indices=(),
                                     outputs=(), image_width=None, image_height=None):
@@ -1181,6 +1290,10 @@ class DeepSortTracker:
         sample_metadata.pop("initial_color_feature", None)
         sample_metadata.pop("initial_color_source", None)
         sample_metadata["is_fresh"] = output_is_fresh
+        sample_metadata["template_learning_risk"] = _template_learning_risk(
+            self._current_detections, source_index, is_fresh=output_is_fresh,
+            all_detections=getattr(self, "_learning_detections", None),
+        )
         sample_metadata["quality_bbox_source"] = (
             "detector" if detector_bbox is not None else "track"
         )
@@ -1498,6 +1611,13 @@ class DeepSortTracker:
         )
         sample_metadata["is_fresh"] = True
         sample_metadata["source_detection_index"] = detection_index
+        sample_metadata["template_learning_risk"] = _template_learning_risk(
+            detections, detection_index, is_fresh=True,
+            all_detections=(getattr(self, "_learning_detections", None)
+                if len(detections) == len(self._current_detections)
+                and all(a is b for a, b in zip(detections, self._current_detections))
+                else None),
+        )
         sample_metadata["identity_competition"] = probe_competition.get(detection_index, {})
         if 0 <= detection_index < len(partial_feature_sources):
             source = partial_feature_sources[detection_index]

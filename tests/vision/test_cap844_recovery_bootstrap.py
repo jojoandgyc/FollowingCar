@@ -103,7 +103,7 @@ def test_seed_does_not_refresh_identity_anchor_gallery_or_quarantine():
     {"identity_competition": {"passed": False}},
     {"candidate_count": 2, "candidate_score_gap": 0.},
     {"candidate_count": 2, "candidate_score_gap": .9},
-    {"row_changes": {"full": .21}},
+    {"row_changes": {"full": .301}},
     {"row_changes": {"recent_partial": .38}},
     {"row_changes": {"quality": "weak", "edges": 3}},
 ])

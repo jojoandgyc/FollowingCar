@@ -35,7 +35,7 @@ class ShortFollowConfig:
     deceleration_m_s2: float = 1.
     response_delay_sec: float = .15
     braking_margin_m: float = .02
-    yaw_max_delta_rpm: int = 18
+    yaw_max_delta_rpm: int = 16
     yaw_full_error_ratio: float = .30
     pivot_max_rpm: int = 8
     center_deadband_ratio: float = .08

@@ -398,7 +398,7 @@ def test_logged_near_distance_offset_stops_translation_not_centering(capture, di
     assert plan.expires_at == pytest.approx(100.-.02+.30)
 
 
-@pytest.mark.parametrize("center,expected_delta", [(.60, 2), (.70, 10), (.80, 18), (.95, 18)])
+@pytest.mark.parametrize("center,expected_delta", [(.60, 1), (.70, 9), (.80, 16), (.95, 16)])
 def test_stronger_arc_steering_does_not_raise_the_longitudinal_pi_or_outer_wheel(center, expected_delta):
     straight = _publish(_controller(), 100., distance=2., center=.5)
     turn = _publish(_controller(), 100., distance=2., center=center)

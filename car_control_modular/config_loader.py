@@ -611,6 +611,7 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "identity_bank", "max_features", "Y8_IDENTITY_MAX_FEATURES")
     _set_bool_env_if_present(parser, "identity_bank", "template_memory_enable", "Y8_IDENTITY_TEMPLATE_MEMORY_ENABLE")
     _set_bool_env_if_present(parser, "identity_bank", "template_crosscheck_enable", "Y8_IDENTITY_TEMPLATE_CROSSCHECK_ENABLE")
+    _set_bool_env_if_present(parser, "identity_bank", "template_learning_guard_enable", "Y8_IDENTITY_TEMPLATE_LEARNING_GUARD_ENABLE")
     _set_bool_env_if_present(parser, "identity_bank", "appearance_region_safety_enable", "Y8_IDENTITY_APPEARANCE_REGION_SAFETY_ENABLE")
     _set_env_if_present(parser, "identity_bank", "template_recent_sec", "Y8_IDENTITY_TEMPLATE_RECENT_SEC")
     _set_env_if_present(parser, "identity_bank", "template_archive_sec", "Y8_IDENTITY_TEMPLATE_ARCHIVE_SEC")
@@ -738,6 +739,10 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
         "Y8_IDENTITY_REACQUIRE_MULTI_CANDIDATE_MARGIN",
     )
     _set_env_if_present(parser, "identity_bank", "new_identity_confirm_frames", "Y8_IDENTITY_NEW_CONFIRM_FRAMES")
+    _set_bool_env_if_present(parser, "identity_bank", "similar_follow_enable", "Y8_IDENTITY_SIMILAR_FOLLOW_ENABLE")
+    _set_env_if_present(parser, "identity_bank", "similar_follow_entry_threshold", "Y8_IDENTITY_SIMILAR_FOLLOW_ENTRY_THRESHOLD")
+    _set_env_if_present(parser, "identity_bank", "similar_follow_retain_threshold", "Y8_IDENTITY_SIMILAR_FOLLOW_RETAIN_THRESHOLD")
+    _set_env_if_present(parser, "identity_bank", "similar_follow_max_gap_sec", "Y8_IDENTITY_SIMILAR_FOLLOW_MAX_GAP_SEC")
     _set_bool_env_if_present(parser, "identity_bank", "mapped_verify_enable", "Y8_IDENTITY_MAPPED_VERIFY_ENABLE")
     _set_env_if_present(parser, "identity_bank", "mapped_verify_threshold", "Y8_IDENTITY_MAPPED_VERIFY_THRESHOLD")
     _set_bool_env_if_present(

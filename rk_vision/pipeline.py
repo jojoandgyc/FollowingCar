@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 import time
 from .follow_bbox_policy import lower_compact_bbox_reason
 from dataclasses import dataclass, replace
@@ -230,6 +231,11 @@ class RKNNVisionConfig:
     identity_max_features: int = 20
     identity_template_memory_enable: bool = False
     identity_template_crosscheck_enable: bool = False
+    identity_template_learning_guard_enable: bool = False
+    identity_similar_follow_enable: bool = False
+    identity_similar_follow_entry_threshold: float = 0.50
+    identity_similar_follow_retain_threshold: float = 0.55
+    identity_similar_follow_max_gap_sec: float = 0.50
     identity_appearance_region_safety_enable: bool = False
     identity_template_recent_sec: float = 30.0
     identity_template_archive_sec: float = 120.0
@@ -321,6 +327,14 @@ class RKNNVisionConfig:
     @classmethod
     def from_env(cls) -> "RKNNVisionConfig":
         return cls(
+            identity_similar_follow_enable=os.environ.get(
+                "Y8_IDENTITY_SIMILAR_FOLLOW_ENABLE", "0").strip().lower() in {"1", "true", "yes"},
+            identity_similar_follow_entry_threshold=float(os.environ.get(
+                "Y8_IDENTITY_SIMILAR_FOLLOW_ENTRY_THRESHOLD", "0.50")),
+            identity_similar_follow_retain_threshold=float(os.environ.get(
+                "Y8_IDENTITY_SIMILAR_FOLLOW_RETAIN_THRESHOLD", "0.55")),
+            identity_similar_follow_max_gap_sec=float(os.environ.get(
+                "Y8_IDENTITY_SIMILAR_FOLLOW_MAX_GAP_SEC", "0.50")),
             yolo_model_path=os.environ.get("VISION_MODEL_PATH", "models/yolo11s.rknn").strip(),
             reid_model_path=os.environ.get("VISION_REID_MODEL_PATH", "models/deepsort.rknn").strip(),
             reid_enable=os.environ.get("VISION_REID_ENABLE", "1").strip() != "0",
@@ -394,6 +408,7 @@ class RKNNVisionConfig:
             identity_max_features=max(1, int(os.environ.get("Y8_IDENTITY_MAX_FEATURES", "20"))),
             identity_template_memory_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_MEMORY_ENABLE", "0").strip() == "1",
             identity_template_crosscheck_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_CROSSCHECK_ENABLE", "0").strip() == "1",
+            identity_template_learning_guard_enable=os.environ.get("Y8_IDENTITY_TEMPLATE_LEARNING_GUARD_ENABLE", "0").strip() == "1",
             identity_appearance_region_safety_enable=os.environ.get("Y8_IDENTITY_APPEARANCE_REGION_SAFETY_ENABLE", "0").strip() == "1",
             identity_template_recent_sec=max(1.0, float(os.environ.get("Y8_IDENTITY_TEMPLATE_RECENT_SEC", "30"))),
             identity_template_archive_sec=max(1.0, float(os.environ.get("Y8_IDENTITY_TEMPLATE_ARCHIVE_SEC", "120"))),
@@ -749,6 +764,11 @@ class RKNNVisionPipeline:
                 identity_max_features=self.config.identity_max_features,
                 identity_template_memory_enable=self.config.identity_template_memory_enable,
                 identity_template_crosscheck_enable=self.config.identity_template_crosscheck_enable,
+                identity_template_learning_guard_enable=self.config.identity_template_learning_guard_enable,
+                identity_similar_follow_enable=self.config.identity_similar_follow_enable,
+                identity_similar_follow_entry_threshold=self.config.identity_similar_follow_entry_threshold,
+                identity_similar_follow_retain_threshold=self.config.identity_similar_follow_retain_threshold,
+                identity_similar_follow_max_gap_sec=self.config.identity_similar_follow_max_gap_sec,
                 identity_appearance_region_safety_enable=self.config.identity_appearance_region_safety_enable,
                 identity_template_recent_sec=self.config.identity_template_recent_sec,
                 identity_template_archive_sec=self.config.identity_template_archive_sec,
@@ -1066,6 +1086,8 @@ class RKNNVisionPipeline:
                 color_features = None
             reid_end = time.perf_counter()
             color_kwargs = {} if color_features is None else {"color_features": color_features}
+            if getattr(self.config, "identity_template_learning_guard_enable", False):
+                color_kwargs["learning_detections"] = detections
             records = self.tracker.update(
                 persons, features, partial_features=partial_features,
                 partial_feature_sources=partial_feature_sources,
@@ -1249,6 +1271,8 @@ class RKNNVisionPipeline:
             if (
                 ordinary
                 and not assignment.get("bank_updated", False)
+                and not assignment.get("recent_bank_updated", False)
+                and not assignment.get("learning_written_tiers")
                 and observation["frame_index"] % self.config.reid_diagnostics_mapped_interval != 0
             ):
                 continue
@@ -1317,20 +1341,89 @@ class RKNNVisionPipeline:
         if not duplicate_uids:
             return records
 
+        # A successful current handoff can coexist with an old predicted
+        # record assembled earlier in this frame. The bank has already
+        # revoked that raw-track claim; it is not a second current person.
+        current_handoffs = {}
+        for uid in duplicate_uids:
+            owner = RKNNVisionPipeline._current_similar_handoff_owner(self, uid, records)
+            if owner is not None:
+                current_handoffs[uid] = owner
+
         if self.logger is not None:
             self.logger.info(
-                "identity_bank duplicate uid suppression: uids=%s tracks=%s",
+                "identity_bank duplicate uid suppression: uids=%s tracks=%s current_handoff_owners=%s",
                 sorted(duplicate_uids),
                 [
                     {"track_id": int(rec.track_id), "reid_uid": int(rec.reid_uid)}
                     for rec in records
                     if int(rec.reid_uid) in duplicate_uids
                 ],
+                current_handoffs,
             )
         return [
-            replace(rec, reid_uid=0) if int(rec.reid_uid) in duplicate_uids else rec
+            replace(rec, reid_uid=0)
+            if (int(rec.reid_uid) in duplicate_uids
+                and current_handoffs.get(int(rec.reid_uid)) != int(rec.track_id)) else rec
             for rec in records
         ]
+
+    def _current_similar_handoff_owner(self, uid, records):
+        """Resolve only an accepted new capture versus revoked predictions.
+
+        Never choose between two fresh claims, use a retained mapping as
+        identity proof, or grant a UID which IdentityBank did not publish.
+        """
+        if not getattr(getattr(self, 'config', None), 'identity_similar_follow_enable', False):
+            return None
+        owned = [r for r in records if int(r.reid_uid) == uid]
+        fresh = [r for r in owned if r.time_since_update == 0]
+        if len(fresh) != 1 or fresh[0].class_id != self.config.person_class_id:
+            return None
+        current = fresh[0]
+        bank = self.tracker.identity_bank
+        if bank.track_to_uid.get(int(current.track_id)) != uid:
+            return None
+        others = [r for r in owned if r is not current]
+        if (not others or any(r.time_since_update <= 0
+                or int(r.track_id) == int(current.track_id)
+                or bank.track_to_uid.get(int(r.track_id)) == uid for r in others)):
+            return None
+        context = self._frame_context
+        cap, stamp = context.get('capture_frame_id'), context.get('capture_timestamp')
+        try:
+            valid_capture = (not isinstance(cap, bool) and int(cap) == cap and cap > 0
+                             and not isinstance(stamp, bool) and math.isfinite(stamp) and stamp > 0)
+        except (TypeError, ValueError, OverflowError):
+            valid_capture = False
+        if not valid_capture:
+            return None
+        observations = [o for o in self.tracker.last_identity_observations
+            if o.get('raw_track_id') == int(current.track_id)
+            and o.get('uid') == uid
+            and (o.get('sample_metadata') or {}).get('capture_frame_id') == cap
+            and (o.get('sample_metadata') or {}).get('capture_timestamp') == stamp
+            and (o.get('sample_metadata') or {}).get('is_fresh') is True]
+        if len(observations) != 1:
+            return None
+        observation = observations[0]
+        for assignment in (observation.get('assignment') or {},
+                           bank.last_assignments.get(int(current.track_id), {})):
+            proof = assignment.get('similar_follow') or {}
+            if (assignment.get('uid') != uid or assignment.get('match_source') != 'similar_follow'
+                    or proof.get('status') != 'follow' or proof.get('capture_frame_id') != cap
+                    or assignment.get('bbox_quality_ok') is not True
+                    or assignment.get('identity_control_rejected')
+                    or assignment.get('search_excluded')
+                    or assignment.get('search_contradiction_retained')
+                    or assignment.get('reacquire_geometry_ok') is False
+                    or (assignment.get('reacquire_geometry') or {}).get('ok') is False
+                    or (assignment.get('identity_competition') or {}).get('passed') is False):
+                return None
+        superseded = [int(r.track_id) for r in others]
+        for assignment in (observation['assignment'], bank.last_assignments[int(current.track_id)]):
+            assignment['superseded_predicted_track_ids'] = superseded
+        return int(current.track_id)
 
     def _verify_predicted_records(self, packet: FramePacket, records: List[TrackRecord], frame_format: str):
         predicted = [

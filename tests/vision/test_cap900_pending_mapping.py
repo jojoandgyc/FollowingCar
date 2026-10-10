@@ -110,14 +110,15 @@ def test_repeated_capture_cannot_finish_pending_confirmation():
     assert bank._reacquire_search_anchors[1] == PROTECTED
 
 
-@pytest.mark.parametrize("kind", ["contradiction", "suspect", "revoked"])
+@pytest.mark.parametrize("kind", ["contradiction", "suspect", "torso_recheck", "revoked"])
 def test_waiting_candidate_cannot_erase_known_identity_rejection(kind):
     bank = before_seed()
     if kind == "contradiction":
         bank._mapped_geometry_conflicts[3] = dict(uid=1, search_contradiction=True,
             reference=deepcopy(PROTECTED), rejected_capture=883, rejected_frame=361)
-    elif kind == "suspect":
-        bank._reacquire_control_suspects[1] = dict(track_id=3, reason="partial_conflict",
+    elif kind in ("suspect", "torso_recheck"):
+        bank._reacquire_control_suspects[1] = dict(track_id=3,
+            reason="partial_conflict" if kind == "torso_recheck" else "appearance_conflict",
             streak=0, capture=896, timestamp=ROWS[896][1])
     else:
         bank._geometry_revoked_uids[1] = 361
@@ -127,7 +128,7 @@ def test_waiting_candidate_cannot_erase_known_identity_rejection(kind):
         assert bank.last_assignments[3]["reason"] != "preferred_search_mapped_late_wait"
     if kind == "contradiction":
         assert bank._mapped_geometry_conflicts[3]["rejected_capture"] == 883
-    elif kind == "suspect":
+    elif kind in ("suspect", "torso_recheck"):
         assert 1 in bank._reacquire_control_suspects
     else:
         # This artificial mapped+revoked combination is not manufactured by
@@ -135,13 +136,19 @@ def test_waiting_candidate_cannot_erase_known_identity_rejection(kind):
         # it reaches the observation-only exit, demotion must not erase it.
         assert 1 in bank._geometry_revoked_uids
     assert bank._reacquire_search_anchors[1] == PROTECTED
-    # A waiting frame alone is not enough: the following soft candidate must
-    # not bind and silently remove negative evidence via late confirmation.
-    assert send(bank, 900) == 0
+    # Generic/spatial rejection cannot vanish through late confirmation. A
+    # torso-only suspicion now has its own two-current-proof recovery route;
+    # it retains quarantine/anchors, rather than silently rebinding/learning.
+    assert send(bank, 900) == (1 if kind == "torso_recheck" else 0)
+    if kind == "torso_recheck":
+        assert bank.last_assignments[3]["reacquire_control_recovery_source"] == "partial_conflict_recheck"
+        assert bank.last_assignments[3]["reacquire_control_recovered"]
+        assert bank._reacquire_quarantine.is_held(1)
+        assert bank._reacquire_search_anchors[1] == PROTECTED
     assert not bank.last_assignments[3]["bank_updated"]
     if kind == "contradiction":
         assert bank._mapped_geometry_conflicts[3]["rejected_capture"] == 883
-    elif kind == "suspect":
+    elif kind in ("suspect", "torso_recheck"):
         assert 1 in bank._reacquire_control_suspects
     else:
         assert 1 in bank._geometry_revoked_uids

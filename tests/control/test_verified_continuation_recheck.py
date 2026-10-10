@@ -4,10 +4,13 @@ Constructor/hardware endpoints are fakes. The identity recheck, longitudinal
 withdrawal and normal/missing-target dispatch paths are the runtime methods.
 """
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 import request_0513_modular as runtime
+from car_control_modular.search_brake_observation import provisional_reacquire_direction
+from car_control_modular.search_identity_evidence import confirmed_search_candidate_uid
 from test_cap1307_boundary_recheck import prepare
 from test_search_observation_arbitration import owner, _record, NOW
 
@@ -72,6 +75,55 @@ def test_next_new_confirmed_continuation_returns_to_normal_controller(owner):
     assert [event[0] for event in owner._events] == ["normal"]
     # A newly confirmed identity alone has not fabricated a depth grant.
     assert owner._depth30_linear_snapshot is None
+
+
+def test_bounded_pose_follow_uses_normal_dispatch_without_recheck_zero(owner):
+    prepare(owner)
+    owner._active_capture_frame_id = 233
+    owner._assignments[3] = dict(uid=7, mapped_uid=7, bbox_quality_ok=True,
+        bbox_quality_tier="strong", reason="mapped_verified_continuation", bank_updated=False,
+        reacquire_partial_state="mismatch", template_update_quarantined=True,
+        identity_continuation=dict(status="accept", reason="pose_follow_continuation",
+                                   source="partial", reference_cap=231),
+        identity_pose_continuation=dict(status="continue", origin_cap=231,
+                                       deadline=NOW+1.5))
+    owner._consume_track_records([_record(uid=7)], 640, 480, "test")
+    assert [event[0] for event in owner._events] == ["normal"]
+    assert owner._deferred_timeout == []
+
+
+@pytest.mark.parametrize("reason", ["similar_follow_reacquire", "mapped_similar_follow"])
+def test_similar_follow_uid_uses_normal_dispatch_without_new_zero(owner, reason):
+    prepare(owner)
+    prior_depth = owner._depth30_linear_snapshot
+    owner._active_capture_frame_id = 233
+    owner._assignments[3] = dict(uid=7, mapped_uid=7, bbox_quality_ok=True,
+        bbox_quality_tier="strong", reason=reason, bank_updated=False,
+        match_source="similar_follow", distance=.46,
+        reacquire_partial_state="unavailable", template_update_quarantined=True,
+        similar_follow=dict(status="follow", reference_cap=231),
+        template_learning=dict(status="frozen", reason="similar_follow"))
+    owner._consume_track_records([_record(uid=7)], 640, 480, "test")
+    assert [event[0] for event in owner._events] == ["normal"]
+    assert owner._deferred_timeout == []
+    # Identity proof neither fabricates nor needlessly revokes existing depth.
+    assert owner._depth30_linear_snapshot == prior_depth
+
+
+def test_similar_follow_current_geometry_crosses_search_interface_without_strict_recheck():
+    assignment = dict(uid=7, mapped_uid=7, bbox_quality_ok=True,
+        reason="similar_follow_reacquire", match_source="similar_follow", distance=.46,
+        similar_follow=dict(status="follow"), reacquire_geometry_ok=True,
+        reacquire_geometry=dict(ok=True, reference=dict(capture_frame_id=334)),
+        template_update_quarantined=True, template_quarantine_reason="armed",
+        template_quarantine_streak=0, protected_search_anchor_cap=19)
+    record = SimpleNamespace(track_id=3, reid_uid=7, class_id=0, time_since_update=0)
+    observation = dict(raw_track_id=3, uid=7, assignment=assignment,
+        sample_metadata=dict(capture_frame_id=336, capture_timestamp=200., is_fresh=True))
+    assert confirmed_search_candidate_uid(active_uid=7, raw_track_id=3,
+        capture_frame_id=336, capture_timestamp=200., records=[record],
+        observations=[observation]) == 7
+    assert not provisional_reacquire_direction(assignment)
 
 
 @pytest.mark.parametrize("case", ["expired", "wrong_cap", "wrong_uid", "predicted",

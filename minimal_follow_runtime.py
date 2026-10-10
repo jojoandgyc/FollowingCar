@@ -284,6 +284,11 @@ class MinimalFollowRuntime:
             min_area_px=_float_env("MINIMAL_REID_MIN_AREA_PX", 8000.0),
             edge_margin_ratio=_float_env("MINIMAL_REID_EDGE_MARGIN_RATIO", 0.015),
             freeze_after_first_enrollment=_bool_env("MINIMAL_REID_FREEZE_AFTER_FIRST_ENROLLMENT", False),
+            bootstrap_enabled=_bool_env("MINIMAL_REID_BOOTSTRAP_ENABLE", True),
+            bootstrap_interval_sec=max(0.05, _float_env("MINIMAL_REID_BOOTSTRAP_INTERVAL_SEC", 0.20)),
+            bootstrap_required_views=max(1, _int_env("MINIMAL_REID_BOOTSTRAP_REQUIRED_VIEWS", 4)),
+            freeze_after_bootstrap=_bool_env("MINIMAL_REID_FREEZE_AFTER_BOOTSTRAP", True),
+            allow_partial_enrollment=_bool_env("MINIMAL_REID_ALLOW_PARTIAL_ENROLLMENT", True),
         )
         if not cfg.reid_enabled:
             LOG.info("minimal ReID v2 disabled")
@@ -540,6 +545,7 @@ class MinimalFollowRuntime:
             "reid_full_templates": appearance_decision.full_templates,
             "reid_torso_templates": appearance_decision.torso_templates,
             "reid_profile_frozen": appearance_decision.profile_frozen,
+            "reid_enrollment_status": appearance_decision.enrollment_status,
             "reid_view_templates": appearance_decision.view_templates,
             "reid_probe_candidates": appearance_decision.probe_candidates,
             "reid_probe_attempts": appearance_decision.probe_attempts,

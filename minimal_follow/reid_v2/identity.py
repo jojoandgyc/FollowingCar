@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from .association import BBox, ReidCandidate, associate, iou
 from .profile import Match, TargetProfile
 from .worker import ReidRequest, ReidResult, ReidWorker
+
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -34,9 +38,16 @@ class ReidConfig:
     min_height_px: float = 120.0
     min_area_px: float = 8000.0
     edge_margin_ratio: float = 0.015
-    # Test mode: preserve the first accepted target descriptor exactly as it
-    # was captured. No normal-follow sample may later update the gallery.
+    # Deprecated A/B-test mode retained for launch compatibility.
     freeze_after_first_enrollment: bool = False
+    # Bootstrap is the only time the target gallery may change. It samples at
+    # a bounded high rate until all requested visual views have evidence, then
+    # freezes permanently for the remainder of this process.
+    bootstrap_enabled: bool = True
+    bootstrap_interval_sec: float = 0.20
+    bootstrap_required_views: int = 4
+    freeze_after_bootstrap: bool = True
+    allow_partial_enrollment: bool = True
     view_capture_enabled: bool = True
     view_change_threshold: float = 0.90
     max_templates_per_view: int = 2
@@ -58,6 +69,7 @@ class ReidDecision:
     probe_attempts: int = 0
     view_templates: Optional[dict] = None
     profile_frozen: bool = False
+    enrollment_status: str = "idle"
 
 
 class ReidPolicy:
@@ -82,6 +94,7 @@ class ReidPolicy:
         self._probe_candidates = 0
         self._enroll_view_index = 0
         self._profile_frozen = False
+        self._enrollment_status = "idle"
 
     def _enrollment_view(self, feature) -> str:
         """Assign samples to an ordered four-view capture session.
@@ -123,7 +136,7 @@ class ReidPolicy:
         if x1 <= margin_x or y1 <= margin_y or x2 >= frame_width - margin_x or y2 >= frame_height - margin_y:
             # A partial person entering from an edge is useless for building a
             # full-body gallery, but its torso is often enough for search.
-            if purpose == "enroll":
+            if purpose == "enroll" and not self.config.allow_partial_enrollment:
                 return None
             return quality * 0.70, False
         return quality, True
@@ -139,18 +152,30 @@ class ReidPolicy:
 
     def _submit(self, *, frame, candidate: ReidCandidate, frame_id: int, now: float, purpose: str, frame_width: int, frame_height: int) -> bool:
         if self.worker is None:
+            if purpose == "enroll":
+                self._enrollment_status = "worker_unavailable"
             return False
         quality_evidence = self._quality(candidate, frame_width, frame_height, purpose=purpose)
         if quality_evidence is None:
+            if purpose == "enroll":
+                self._enrollment_status = "quality_rejected"
             return False
         quality, allow_full = quality_evidence
         crop = self._crop(frame, candidate.bbox)
         if crop is None:
+            if purpose == "enroll":
+                self._enrollment_status = "crop_rejected"
             return False
-        interval = self.config.enroll_interval_sec if purpose == "enroll" else self.config.reacquire_interval_sec
-        return self.worker.submit(
+        interval = self.config.reacquire_interval_sec
+        if purpose == "enroll":
+            interval = (self.config.bootstrap_interval_sec if self.config.bootstrap_enabled and not self._profile_frozen
+                        else self.config.enroll_interval_sec)
+        submitted = self.worker.submit(
             ReidRequest(frame_id, now, purpose, candidate.bbox, quality, crop, frame_width, allow_full), min_interval_sec=interval,
         )
+        if purpose == "enroll":
+            self._enrollment_status = "submitted" if submitted else "rate_limited"
+        return submitted
 
     def _consume(self, now: float) -> None:
         if self.worker is None:
@@ -170,7 +195,10 @@ class ReidPolicy:
                 self._latest_match = None
                 return
             view_bin = self._view_bin(result.bbox, result.frame_width)
-            view = self._enrollment_view(result.full_feature)
+            # A clipped person does not enter the full-body gallery, but its
+            # torso feature is still valid evidence for a bootstrap view.
+            view_feature = result.full_feature if result.full_feature is not None else result.torso_feature
+            view = self._enrollment_view(view_feature)
             full_added = self.profile.add(result.full_feature, source="full", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
             torso_added = self.profile.add(result.torso_feature, source="torso", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
             # Advance only after a distinct view has been stored. This avoids
@@ -183,6 +211,13 @@ class ReidPolicy:
                     pass
             if self.config.freeze_after_first_enrollment and (full_added or torso_added):
                 self._profile_frozen = True
+                self._enrollment_status = "frozen_first_template"
+            elif (self.config.bootstrap_enabled and self.config.freeze_after_bootstrap
+                    and self.profile.covered_view_count() >= max(1, int(self.config.bootstrap_required_views))):
+                self._profile_frozen = True
+                self._enrollment_status = "frozen_bootstrap_complete"
+            else:
+                self._enrollment_status = "bootstrap_collecting"
             self._latest_match = None
             return
         age = max(0.0, now - result.submitted_at)
@@ -199,7 +234,8 @@ class ReidPolicy:
             None if match is None else match.score,
             None if match is None else match.source,
             age_ms, self._last_worker_timing, self.profile.full_count, self.profile.torso_count,
-            self._probe_candidates, self._probe_attempts, self.profile.view_counts(), self._profile_frozen,
+            self._probe_candidates, self._probe_attempts, self.profile.combined_view_counts(), self._profile_frozen,
+            self._enrollment_status,
         )
 
     def _same_result_candidate(self, evidence_bbox: BBox, candidate: ReidCandidate, frame_width: int) -> bool:

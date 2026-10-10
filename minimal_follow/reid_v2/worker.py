@@ -109,6 +109,7 @@ class ReidWorker:
             from rk_vision.reid import OSNetConfig, OSNetRKNNExtractor
             from rk_vision.yolo11 import Detection
 
+            self.logger.info("reid_v2_worker starting model=%s core_mask=%s", self.config.model_path, self.config.core_mask)
             extractor = OSNetRKNNExtractor(OSNetConfig(
                 model_path=self.config.model_path, enabled=True,
                 input_width=self.config.input_width, input_height=self.config.input_height,
@@ -118,6 +119,7 @@ class ReidWorker:
                 # V2 deliberately keeps colour evidence out of the embedding.
                 color_fusion_enable=False, partial_appearance_enable=True, partial_osnet_enable=True,
             ))
+            self.logger.info("reid_v2_worker ready; waiting for enrollment/reacquire crops")
             while not self._stop.is_set():
                 try:
                     request = self._requests.get(timeout=0.10)
@@ -166,6 +168,7 @@ class ReidWorker:
                     )
                 self._results.put(result)
         except Exception as exc:
+            self.logger.exception("reid_v2_worker startup failed")
             self._results.put(ReidResult(
                 -1, time.monotonic(), time.monotonic(), "worker_start", (0.0, 0.0, 0.0, 0.0),
                 0.0, None, None, {}, f"{type(exc).__name__}: {exc}",

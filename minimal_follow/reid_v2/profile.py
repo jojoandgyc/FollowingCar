@@ -116,6 +116,16 @@ class TargetProfile:
     def view_counts(self, *, source: str = "full") -> dict[str, int]:
         return {view: self.view_count(view, source=source) for view in self.VIEW_ORDER}
 
+    def combined_view_counts(self) -> dict[str, int]:
+        """Return coverage per view from either a full or torso descriptor."""
+        return {
+            view: self.view_count(view, source="full") + self.view_count(view, source="torso")
+            for view in self.VIEW_ORDER
+        }
+
+    def covered_view_count(self) -> int:
+        return sum(count > 0 for count in self.combined_view_counts().values())
+
     def best_view_similarity(self, feature: Optional[Iterable[float]], view: str, *, source: str = "full") -> Optional[float]:
         query = normalize(feature)
         if query is None:

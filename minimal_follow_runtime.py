@@ -99,6 +99,7 @@ class RuntimeConfig:
     search_fallback_direction: str
     search_directed_sec: float
     search_sweep_half_cycle_sec: float
+    search_sweep_cycles_before_spin: int
     search_timeout_sec: float
     search_turn_percent: int
     reid_enabled: bool
@@ -137,6 +138,7 @@ class RuntimeConfig:
             search_fallback_direction=os.environ.get("MINIMAL_SEARCH_FALLBACK_DIRECTION", "left").strip().lower(),
             search_directed_sec=max(0.0, _float_env("MINIMAL_SEARCH_DIRECTED_SEC", 2.0)),
             search_sweep_half_cycle_sec=max(0.1, _float_env("MINIMAL_SEARCH_SWEEP_HALF_CYCLE_SEC", 3.0)),
+            search_sweep_cycles_before_spin=max(0, _int_env("MINIMAL_SEARCH_SWEEP_CYCLES_BEFORE_SPIN", 2)),
             search_timeout_sec=max(0.0, _float_env("MINIMAL_SEARCH_TIMEOUT_SEC", 1.5)),
             search_turn_percent=max(0, _int_env("MINIMAL_SEARCH_TURN_PERCENT", 8)),
             reid_enabled=_bool_env("MINIMAL_REID_ENABLE", True),
@@ -241,6 +243,7 @@ class MinimalFollowRuntime:
                 fallback_direction=config.search_fallback_direction,
                 directed_search_sec=config.search_directed_sec,
                 sweep_half_cycle_sec=config.search_sweep_half_cycle_sec,
+                sweep_cycles_before_spin=config.search_sweep_cycles_before_spin,
                 timeout_sec=config.search_timeout_sec,
                 turn_percent=config.search_turn_percent,
             )
@@ -250,11 +253,12 @@ class MinimalFollowRuntime:
             self.motor = self._make_motor()
         LOG.info(
             "minimal follow ready motor_enabled=%s target=%.2fm deadband=%.2fm camera=%s %dx%d@%.1f "
-            "search(enabled=%s steer_memory=%.2fs target_memory=%.2fs fallback=%s directed=%.2fs sweep=%.2fs timeout=%.2fs turn=%d%%) motor_target_min_interval=%.3fs",
+            "search(enabled=%s steer_memory=%.2fs target_memory=%.2fs fallback=%s directed=%.2fs sweep=%.2fs cycles=%d timeout=%.2fs turn=%d%%) motor_target_min_interval=%.3fs",
             config.motor_enabled, config.target_distance_m, config.distance_deadband_m,
             config.camera_device, config.camera_width, config.camera_height, config.camera_fps,
             config.search_enabled, config.search_turn_memory_sec, config.search_target_memory_sec,
             config.search_fallback_direction, config.search_directed_sec, config.search_sweep_half_cycle_sec,
+            config.search_sweep_cycles_before_spin,
             config.search_timeout_sec, config.search_turn_percent, config.motor_target_min_interval_sec,
         )
 

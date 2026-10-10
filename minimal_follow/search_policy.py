@@ -24,6 +24,7 @@ class LostPersonSearchConfig:
     fallback_direction: str = "left"
     directed_search_sec: float = 2.0
     sweep_half_cycle_sec: float = 3.0
+    sweep_cycles_before_spin: int = 2
     timeout_sec: float = 1.5
     turn_percent: int = 8
 
@@ -119,6 +120,12 @@ class LostPersonSearchPolicy:
             return initial_direction, "directed"
         half_cycle = max(0.1, float(self.config.sweep_half_cycle_sec))
         phase = int((elapsed - directed) / half_cycle)
+        # A cycle is one left plus one right scan. Once these bounded sweeps
+        # have covered both sides, keep turning in the initial direction to
+        # complete a wider in-place scan instead of oscillating forever.
+        sweep_half_cycles = max(0, int(self.config.sweep_cycles_before_spin)) * 2
+        if phase >= sweep_half_cycles:
+            return initial_direction, "continuous_spin"
         direction = self._opposite(initial_direction) if phase % 2 == 0 else initial_direction
         return direction, f"sweep_{phase + 1}"
 

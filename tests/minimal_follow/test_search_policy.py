@@ -82,3 +82,7 @@ def test_search_reverses_after_directed_phase_and_then_sweeps():
     command, status = policy.target_missing(now=50.56, front_obstacle=False)
     assert command.reason == "search_rotate_left"
     assert status.state == "searching_sweep_2"
+
+    command, status = policy.target_missing(now=51.42, front_obstacle=False)
+    assert command.reason == "search_rotate_left"
+    assert status.state == "searching_continuous_spin"

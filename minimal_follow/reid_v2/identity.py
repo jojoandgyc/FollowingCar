@@ -26,6 +26,10 @@ class ReidConfig:
     # later views are retained and make matching progressively more robust.
     min_full_templates: int = 1
     min_torso_templates: int = 2
+    # A full descriptor is useful but may be unavailable at close range.
+    # Require the requested number of torso descriptors before lock when
+    # enabled; normal following remains allowed during ENROLLING.
+    require_torso_for_lock: bool = False
     max_full_templates: int = 8
     max_torso_templates: int = 4
     full_threshold: float = 0.70
@@ -38,6 +42,22 @@ class ReidConfig:
     min_height_px: float = 120.0
     min_area_px: float = 8000.0
     edge_margin_ratio: float = 0.015
+    # A close target frequently touches the top/bottom detector boundary.
+    # That alone must not permanently prohibit a full OSNet descriptor.
+    allow_vertical_edge_full: bool = True
+    # Short target-track discontinuities are common during steering, detector
+    # jitter and crossings.  This fast path is intentionally conservative:
+    # only a geometrically continuous, unambiguous new track may drive for a
+    # very short grace period while ReID confirms it in the background.
+    continuity_enabled: bool = True
+    continuity_grace_sec: float = 0.55
+    continuity_min_iou: float = 0.06
+    continuity_max_center_distance_ratio: float = 0.22
+    continuity_max_candidates: int = 1
+    continuity_full_threshold: float = 0.62
+    continuity_torso_threshold: float = 0.62
+    continuity_confirm_hits: int = 2
+    continuity_confirm_window: int = 3
     # Deprecated A/B-test mode retained for launch compatibility.
     freeze_after_first_enrollment: bool = False
     # Bootstrap is the only time the target gallery may change. It samples at
@@ -108,6 +128,8 @@ class ReidPolicy:
         # initialized, normal following may only use this ByteTrack ID.  A
         # different ID must pass asynchronous ReID confirmation in SEARCHING.
         self._target_track_id: Optional[int] = None
+        self._continuity_started_at: Optional[float] = None
+        self._continuity_track_id: Optional[int] = None
 
     def _enrollment_view(self, feature) -> str:
         """Assign samples to an ordered four-view capture session.
@@ -151,9 +173,21 @@ class ReidPolicy:
         ):
             return None
         quality = min(1.0, candidate.score) * min(1.0, area / (float(frame_width * frame_height) * 0.25))
-        if x1 <= margin_x or y1 <= margin_y or x2 >= frame_width - margin_x or y2 >= frame_height - margin_y:
-            # A partial person entering from an edge is useless for building a
-            # full-body gallery, but its torso is often enough for search.
+        touches_horizontal_edge = x1 <= margin_x or x2 >= frame_width - margin_x
+        touches_vertical_edge = y1 <= margin_y or y2 >= frame_height - margin_y
+        if touches_horizontal_edge:
+            # A person entering from the left/right has materially lost body
+            # appearance.  Keep only its torso evidence.
+            if purpose == "enroll" and not self.config.allow_partial_enrollment:
+                return None
+            return quality * 0.70, False
+        if touches_vertical_edge:
+            # At the follow distance a valid person box regularly touches
+            # image top/bottom.  The old all-edge rule caused every sample in
+            # the supplied run to become torso-only. Keep the full feature,
+            # but lower its quality so an interior frame wins eviction.
+            if self.config.allow_vertical_edge_full:
+                return quality * 0.82, True
             if purpose == "enroll" and not self.config.allow_partial_enrollment:
                 return None
             return quality * 0.70, False
@@ -292,7 +326,7 @@ class ReidPolicy:
             self._latest_match = None
             return
         age = max(0.0, now - result.submitted_at)
-        if result.purpose != "reacquire" or age > self.config.result_max_age_sec:
+        if result.purpose not in {"reacquire", "continuity"} or age > self.config.result_max_age_sec:
             self._latest_match = None
             return
         match = self.profile.match(result.full_feature, result.torso_feature)
@@ -327,6 +361,30 @@ class ReidPolicy:
         self._probe_bbox = None
         self._probe_attempts = 0
         self._probe_hits = 0
+
+    def _clear_continuity(self) -> None:
+        self._continuity_started_at = None
+        self._continuity_track_id = None
+
+    def _continuity_candidate(self, candidates: list[ReidCandidate], frame_width: int,
+                              frame_height: int) -> Optional[ReidCandidate]:
+        """Return a safe, nearby new track for the short no-stop hand-off."""
+        if not self.config.continuity_enabled or self._last_bbox is None:
+            return None
+        if len(candidates) > max(1, int(self.config.continuity_max_candidates)):
+            return None
+        return associate(
+            candidates, self._last_bbox, frame_width=frame_width, frame_height=frame_height,
+            min_iou=self.config.continuity_min_iou,
+            max_center_distance_ratio=self.config.continuity_max_center_distance_ratio,
+        )
+
+    def _accept_reidentified(self, candidate: ReidCandidate) -> None:
+        self.state = "LOCKED"
+        self._last_bbox = candidate.bbox
+        self._target_track_id = candidate.track_id
+        self._enrollment_owner_bbox = candidate.bbox
+        self._clear_continuity()
 
     @staticmethod
     def _ordered_candidates(candidates: list[ReidCandidate]) -> list[ReidCandidate]:
@@ -369,16 +427,23 @@ class ReidPolicy:
             self._reset_probe(advance=True)
             return None, match, age_ms, "reid_candidate_left"
         self._probe_attempts += 1
-        threshold = self.config.full_threshold if match.source == "full" else self.config.torso_threshold
+        continuity = evidence.purpose == "continuity"
+        threshold = (
+            self.config.continuity_full_threshold if match.source == "full" else self.config.continuity_torso_threshold
+        ) if continuity else (self.config.full_threshold if match.source == "full" else self.config.torso_threshold)
+        required_hits = self.config.continuity_confirm_hits if continuity else self.config.confirm_hits
+        confirmation_window = self.config.continuity_confirm_window if continuity else self.config.confirm_window
         hit = bool(match.score is not None and match.score >= threshold)
         if hit:
             self._probe_hits += 1
-            if self._probe_hits >= max(1, self.config.confirm_hits):
+            if self._probe_hits >= max(1, required_hits):
                 self._reset_probe()
-                return candidate, match, age_ms, "reid_confirmed"
-        if self._probe_attempts >= max(1, self.config.confirm_window):
+                return candidate, match, age_ms, "continuity_confirmed" if continuity else "reid_confirmed"
+        if self._probe_attempts >= max(1, confirmation_window):
             self._reset_probe(advance=True)
-            return None, match, age_ms, "reid_mismatch"
+            return None, match, age_ms, "continuity_mismatch" if continuity else "reid_mismatch"
+        if continuity:
+            return None, match, age_ms, "continuity_confirming" if hit else "continuity_probe_retry"
         return None, match, age_ms, "reid_confirming" if hit else "reid_probe_retry"
 
     def observe(self, *, frame, candidates: list[ReidCandidate], frame_id: int, now: float,
@@ -410,7 +475,12 @@ class ReidPolicy:
             self._last_bbox = associated.bbox
             self._stable_frames += 1
             if self._stable_frames >= self.config.stable_frames:
-                if self.profile.ready(min_full=self.config.min_full_templates, min_torso=self.config.min_torso_templates):
+                profile_ready = self.profile.ready(
+                    min_full=self.config.min_full_templates, min_torso=self.config.min_torso_templates,
+                )
+                if self.config.require_torso_for_lock:
+                    profile_ready = profile_ready and self.profile.torso_count >= self.config.min_torso_templates
+                if profile_ready:
                     self.state = "LOCKED"
                 else:
                     self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
@@ -420,6 +490,7 @@ class ReidPolicy:
 
         locked_candidate = self._candidate_with_target_track(candidates)
         if self.state == "LOCKED" and locked_candidate is not None:
+            self._clear_continuity()
             self._last_bbox = locked_candidate.bbox
             # Keep collecting a small number of views after lock. Otherwise a
             # target enrolled only front-facing would be very hard to recover
@@ -429,6 +500,51 @@ class ReidPolicy:
                              frame_width=frame_width, frame_height=frame_height, candidates=candidates)
             return self._decision(True, locked_candidate, state="LOCKED", reason="track_associated")
 
+        # Keep a nearby new track alive for a bounded interval while OSNet
+        # verifies it. This prevents a momentary ByteTrack ID reset from
+        # turning immediately into a long rotate-and-search episode.
+        if self.state == "CONTINUITY":
+            confirmed, match, age_ms, result_reason = self._consume_reacquire_result(candidates, frame_width)
+            if confirmed is not None:
+                self._accept_reidentified(confirmed)
+                return self._decision(True, confirmed, state="LOCKED", reason="continuity_confirmed", match=match, age_ms=age_ms)
+            candidate = next((item for item in candidates if item.track_id == self._continuity_track_id), None)
+            elapsed = float("inf") if self._continuity_started_at is None else now - self._continuity_started_at
+            if candidate is not None and elapsed <= max(0.0, self.config.continuity_grace_sec):
+                self._last_bbox = candidate.bbox
+                submitted = self._submit(
+                    frame=frame, candidate=candidate, frame_id=frame_id, now=now, purpose="continuity",
+                    frame_width=frame_width, frame_height=frame_height,
+                )
+                if submitted:
+                    self._probe_bbox = candidate.bbox
+                return self._decision(
+                    True, candidate, state="CONTINUITY",
+                    reason=result_reason or ("continuity_pending" if submitted else "continuity_rate_limited"),
+                    match=match, age_ms=age_ms,
+                )
+            self._clear_continuity()
+            self._reset_probe()
+            self.state = "SEARCHING"
+
+        if self.state == "LOCKED":
+            continuity_candidate = self._continuity_candidate(candidates, frame_width, frame_height)
+            if continuity_candidate is not None:
+                self.state = "CONTINUITY"
+                self._continuity_started_at = now
+                self._continuity_track_id = continuity_candidate.track_id
+                self._reset_probe()
+                self._probe_bbox = continuity_candidate.bbox
+                submitted = self._submit(
+                    frame=frame, candidate=continuity_candidate, frame_id=frame_id, now=now, purpose="continuity",
+                    frame_width=frame_width, frame_height=frame_height,
+                )
+                self._last_bbox = continuity_candidate.bbox
+                return self._decision(
+                    True, continuity_candidate, state="CONTINUITY",
+                    reason="continuity_pending" if submitted else "continuity_rate_limited",
+                )
+
         # No continuous target: probe every detected person in turn. A large
         # bystander gets at most one confirmation window before the next
         # candidate is sampled, while the normal control loop stays nonblocking.
@@ -437,10 +553,7 @@ class ReidPolicy:
         self.state = "SEARCHING"
         confirmed, match, age_ms, result_reason = self._consume_reacquire_result(candidates, frame_width)
         if confirmed is not None:
-            self.state = "LOCKED"
-            self._last_bbox = confirmed.bbox
-            self._target_track_id = confirmed.track_id
-            self._enrollment_owner_bbox = confirmed.bbox
+            self._accept_reidentified(confirmed)
             return self._decision(True, confirmed, state="LOCKED", reason="reid_confirmed", match=match, age_ms=age_ms)
         candidate = self._probe_candidate(candidates, frame_width)
         if candidate is None:

@@ -66,7 +66,7 @@ def test_profile_deduplicates_within_a_view_but_keeps_a_new_orientation():
     assert not profile.is_duplicate((.99, .01), source="full", similarity=.97, view="left")
 
 
-def test_locked_target_never_switches_to_a_different_bytetrack_id_without_reid():
+def test_locked_target_never_permanently_switches_to_a_different_bytetrack_id_without_reid():
     worker = _Worker()
     policy = ReidPolicy(ReidConfig(stable_frames=1, min_full_templates=1, min_torso_templates=1), worker)
     frame = _Frame()
@@ -76,7 +76,59 @@ def test_locked_target_never_switches_to_a_different_bytetrack_id_without_reid()
     locked = policy.observe(frame=frame, candidates=[target], frame_id=2, now=1.1, frame_width=640, frame_height=480)
     assert locked.accepted and locked.target_track_id == 1
     stranger = ReidCandidate((105.0, 85.0, 265.0, 405.0), 2, 51200.0, .99)
-    searching = policy.observe(frame=frame, candidates=[stranger], frame_id=3, now=1.2, frame_width=640, frame_height=480)
+    continuity = policy.observe(frame=frame, candidates=[stranger], frame_id=3, now=1.2, frame_width=640, frame_height=480)
+    assert continuity.accepted and continuity.state == "CONTINUITY"
+    assert continuity.target_track_id == 1
+
+
+def test_vertical_edge_keeps_full_feature_available_for_the_profile():
+    policy = ReidPolicy(ReidConfig(stable_frames=1), _Worker())
+    # Close following often produces y=0/image-height boxes. It should still
+    # permit a full OSNet embedding when neither side is clipped.
+    candidate = _candidate(160.0, 0.0, 390.0, 479.0)
+    quality = policy._quality(candidate, 640, 480, purpose="enroll")
+    assert quality is not None and quality[1] is True
+
+
+def test_nearby_new_track_uses_short_continuity_before_searching():
+    worker = _Worker()
+    policy = ReidPolicy(ReidConfig(
+        stable_frames=1, min_full_templates=1, min_torso_templates=1,
+        continuity_grace_sec=.55, continuity_confirm_hits=2,
+        continuity_torso_threshold=.62,
+    ), worker)
+    frame = _Frame()
+    target = _candidate()
+    policy.observe(frame=frame, candidates=[target], frame_id=1, now=1.0, frame_width=640, frame_height=480)
+    worker.results.append(ReidResult(1, 1.0, 1.01, "enroll", target.bbox, .9, (1.0, 0.0), (1.0, 0.0), {}))
+    locked = policy.observe(frame=frame, candidates=[target], frame_id=2, now=1.1, frame_width=640, frame_height=480)
+    assert locked.state == "LOCKED"
+
+    reset_track = ReidCandidate((110.0, 82.0, 270.0, 402.0), 2, 51200.0, .95)
+    handoff = policy.observe(frame=frame, candidates=[reset_track], frame_id=3, now=1.2, frame_width=640, frame_height=480)
+    assert handoff.accepted and handoff.state == "CONTINUITY"
+    assert worker.requests[-1].purpose == "continuity"
+
+    worker.results.append(ReidResult(3, 1.2, 1.21, "continuity", reset_track.bbox, .9, (1.0, 0.0), (1.0, 0.0), {}))
+    first_hit = policy.observe(frame=frame, candidates=[reset_track], frame_id=4, now=1.25, frame_width=640, frame_height=480)
+    assert first_hit.accepted and first_hit.state == "CONTINUITY"
+    worker.results.append(ReidResult(4, 1.25, 1.26, "continuity", reset_track.bbox, .9, (1.0, 0.0), (1.0, 0.0), {}))
+    confirmed = policy.observe(frame=frame, candidates=[reset_track], frame_id=5, now=1.30, frame_width=640, frame_height=480)
+    assert confirmed.accepted and confirmed.state == "LOCKED"
+    assert confirmed.target_track_id == 2
+
+
+def test_ambiguous_new_tracks_do_not_use_the_continuity_drive_path():
+    worker = _Worker()
+    policy = ReidPolicy(ReidConfig(stable_frames=1, min_full_templates=1, min_torso_templates=1), worker)
+    frame = _Frame()
+    target = _candidate()
+    policy.observe(frame=frame, candidates=[target], frame_id=1, now=1.0, frame_width=640, frame_height=480)
+    worker.results.append(ReidResult(1, 1.0, 1.01, "enroll", target.bbox, .9, (1.0, 0.0), None, {}))
+    policy.observe(frame=frame, candidates=[target], frame_id=2, now=1.1, frame_width=640, frame_height=480)
+    left = ReidCandidate((108.0, 82.0, 268.0, 402.0), 2, 51200.0, .95)
+    right = ReidCandidate((310.0, 82.0, 470.0, 402.0), 3, 51200.0, .95)
+    searching = policy.observe(frame=frame, candidates=[left, right], frame_id=3, now=1.2, frame_width=640, frame_height=480)
     assert not searching.accepted and searching.state == "SEARCHING"
 
 

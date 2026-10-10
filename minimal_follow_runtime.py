@@ -289,6 +289,12 @@ class MinimalFollowRuntime:
             bootstrap_required_views=max(1, _int_env("MINIMAL_REID_BOOTSTRAP_REQUIRED_VIEWS", 4)),
             freeze_after_bootstrap=_bool_env("MINIMAL_REID_FREEZE_AFTER_BOOTSTRAP", True),
             allow_partial_enrollment=_bool_env("MINIMAL_REID_ALLOW_PARTIAL_ENROLLMENT", True),
+            enrollment_min_aspect_ratio=_float_env("MINIMAL_REID_ENROLL_MIN_ASPECT_RATIO", 0.22),
+            enrollment_max_aspect_ratio=_float_env("MINIMAL_REID_ENROLL_MAX_ASPECT_RATIO", 0.95),
+            enrollment_max_competitor_overlap=_float_env("MINIMAL_REID_ENROLL_MAX_COMPETITOR_OVERLAP", 0.12),
+            enrollment_duplicate_similarity=_float_env("MINIMAL_REID_ENROLL_DUPLICATE_SIMILARITY", 0.97),
+            enrollment_owner_min_iou=_float_env("MINIMAL_REID_ENROLL_OWNER_MIN_IOU", 0.20),
+            enrollment_owner_max_center_distance_ratio=_float_env("MINIMAL_REID_ENROLL_OWNER_MAX_CENTER_RATIO", 0.10),
         )
         if not cfg.reid_enabled:
             LOG.info("minimal ReID v2 disabled")

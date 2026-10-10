@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from .association import BBox, ReidCandidate, associate, iou
+from .association import BBox, ReidCandidate, associate, center_distance_ratio, iou
 from .profile import Match, TargetProfile
 from .worker import ReidRequest, ReidResult, ReidWorker
 
@@ -48,6 +48,12 @@ class ReidConfig:
     bootstrap_required_views: int = 4
     freeze_after_bootstrap: bool = True
     allow_partial_enrollment: bool = True
+    enrollment_min_aspect_ratio: float = 0.22
+    enrollment_max_aspect_ratio: float = 0.95
+    enrollment_max_competitor_overlap: float = 0.12
+    enrollment_duplicate_similarity: float = 0.97
+    enrollment_owner_min_iou: float = 0.20
+    enrollment_owner_max_center_distance_ratio: float = 0.10
     view_capture_enabled: bool = True
     view_change_threshold: float = 0.90
     max_templates_per_view: int = 2
@@ -81,6 +87,7 @@ class ReidPolicy:
         self.profile = TargetProfile(
             max_full=config.max_full_templates, max_torso=config.max_torso_templates,
             max_templates_per_view=config.max_templates_per_view,
+            duplicate_similarity=config.enrollment_duplicate_similarity,
         )
         self.state = "INIT"
         self._last_bbox: Optional[BBox] = None
@@ -95,6 +102,7 @@ class ReidPolicy:
         self._enroll_view_index = 0
         self._profile_frozen = False
         self._enrollment_status = "idle"
+        self._enrollment_owner_bbox: Optional[BBox] = None
 
     def _enrollment_view(self, feature) -> str:
         """Assign samples to an ordered four-view capture session.
@@ -128,9 +136,14 @@ class ReidPolicy:
         width = max(0.0, x2 - x1)
         height = max(0.0, y2 - y1)
         area = width * height
+        aspect_ratio = width / max(1.0, height)
         margin_x = float(frame_width) * self.config.edge_margin_ratio
         margin_y = float(frame_height) * self.config.edge_margin_ratio
         if candidate.score < self.config.min_confidence or height < self.config.min_height_px or area < self.config.min_area_px:
+            return None
+        if purpose == "enroll" and not (
+            self.config.enrollment_min_aspect_ratio <= aspect_ratio <= self.config.enrollment_max_aspect_ratio
+        ):
             return None
         quality = min(1.0, candidate.score) * min(1.0, area / (float(frame_width * frame_height) * 0.25))
         if x1 <= margin_x or y1 <= margin_y or x2 >= frame_width - margin_x or y2 >= frame_height - margin_y:
@@ -142,6 +155,40 @@ class ReidPolicy:
         return quality, True
 
     @staticmethod
+    def _overlap_ratio(left: BBox, right: BBox) -> float:
+        intersection = max(0.0, min(left[2], right[2]) - max(left[0], right[0])) * max(
+            0.0, min(left[3], right[3]) - max(left[1], right[1])
+        )
+        left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+        right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+        return intersection / max(1.0, min(left_area, right_area))
+
+    def _enrollment_allowed(self, candidate: ReidCandidate, candidates: list[ReidCandidate], *, frame_width: int,
+                            frame_height: int) -> bool:
+        """Protect the immutable target gallery from nearby/ambiguous people."""
+        if self._profile_frozen:
+            self._enrollment_status = "profile_frozen"
+            return False
+        if self._enrollment_owner_bbox is not None:
+            continuous = (
+                iou(self._enrollment_owner_bbox, candidate.bbox) >= self.config.enrollment_owner_min_iou
+                or center_distance_ratio(
+                    self._enrollment_owner_bbox, candidate.bbox, frame_width, frame_height,
+                ) <= self.config.enrollment_owner_max_center_distance_ratio
+            )
+            if not continuous:
+                self._enrollment_status = "owner_geometry_rejected"
+                return False
+        for other in candidates:
+            if other is candidate or other.bbox == candidate.bbox:
+                continue
+            if self._overlap_ratio(candidate.bbox, other.bbox) > self.config.enrollment_max_competitor_overlap:
+                self._enrollment_status = "overlapping_person_rejected"
+                return False
+        self._enrollment_owner_bbox = candidate.bbox
+        return True
+
+    @staticmethod
     def _crop(frame, bbox: BBox):
         height, width = frame.shape[:2]
         x1 = max(0, min(width - 1, int(round(bbox[0]))))
@@ -150,10 +197,15 @@ class ReidPolicy:
         y2 = max(0, min(height, int(round(bbox[3]))))
         return None if x2 <= x1 or y2 <= y1 else frame[y1:y2, x1:x2].copy()
 
-    def _submit(self, *, frame, candidate: ReidCandidate, frame_id: int, now: float, purpose: str, frame_width: int, frame_height: int) -> bool:
+    def _submit(self, *, frame, candidate: ReidCandidate, frame_id: int, now: float, purpose: str, frame_width: int,
+                frame_height: int, candidates: Optional[list[ReidCandidate]] = None) -> bool:
         if self.worker is None:
             if purpose == "enroll":
                 self._enrollment_status = "worker_unavailable"
+            return False
+        if purpose == "enroll" and not self._enrollment_allowed(
+            candidate, candidates or [candidate], frame_width=frame_width, frame_height=frame_height,
+        ):
             return False
         quality_evidence = self._quality(candidate, frame_width, frame_height, purpose=purpose)
         if quality_evidence is None:
@@ -198,6 +250,13 @@ class ReidPolicy:
             # A clipped person does not enter the full-body gallery, but its
             # torso feature is still valid evidence for a bootstrap view.
             view_feature = result.full_feature if result.full_feature is not None else result.torso_feature
+            source = "full" if result.full_feature is not None else "torso"
+            if self.profile.is_duplicate(
+                view_feature, source=source, similarity=self.config.enrollment_duplicate_similarity,
+            ):
+                self._enrollment_status = "duplicate_rejected"
+                self._latest_match = None
+                return
             view = self._enrollment_view(view_feature)
             full_added = self.profile.add(result.full_feature, source="full", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
             torso_added = self.profile.add(result.torso_feature, source="torso", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
@@ -328,7 +387,7 @@ class ReidPolicy:
                     self.state = "LOCKED"
                 else:
                     self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
-                                 frame_width=frame_width, frame_height=frame_height)
+                                 frame_width=frame_width, frame_height=frame_height, candidates=candidates)
                     self.state = "ENROLLING"
             return self._decision(True, associated, state=self.state, reason="initial_target")
 
@@ -339,7 +398,7 @@ class ReidPolicy:
             # after the vehicle rotates during a loss episode.
             if not self._profile_frozen:
                 self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
-                             frame_width=frame_width, frame_height=frame_height)
+                             frame_width=frame_width, frame_height=frame_height, candidates=candidates)
             return self._decision(True, associated, state="LOCKED", reason="geometry_associated")
 
         # No continuous target: probe every detected person in turn. A large

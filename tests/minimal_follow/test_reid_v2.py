@@ -59,6 +59,13 @@ def test_profile_keeps_one_or_more_templates_for_each_enrollment_view():
     assert profile.view_counts() == {"front": 1, "left": 1, "right": 1, "back": 1}
 
 
+def test_profile_rejects_a_near_duplicate_even_if_it_would_use_another_view_slot():
+    profile = TargetProfile(max_full=8, max_torso=8, duplicate_similarity=.97)
+    assert profile.add((1.0, 0.0), source="full", quality=.9, captured_at=1.0, view_bin=1, view="front")
+    assert profile.is_duplicate((.99, .01), source="full", similarity=.97)
+    assert not profile.is_duplicate((0.0, 1.0), source="full", similarity=.97)
+
+
 def test_reacquire_requires_repeated_fresh_reid_evidence():
     worker = _Worker()
     policy = ReidPolicy(ReidConfig(
@@ -108,6 +115,21 @@ def test_bootstrap_profile_freezes_after_all_requested_views_are_captured():
     request_count = len(worker.requests)
     policy.observe(frame=frame, candidates=[candidate], frame_id=5, now=1.4, frame_width=640, frame_height=480)
     assert len(worker.requests) == request_count
+
+
+def test_enrollment_rejects_an_overlapping_second_person_before_worker_submission():
+    worker = _Worker()
+    policy = ReidPolicy(ReidConfig(stable_frames=1), worker)
+    frame = _Frame()
+    target = _candidate()
+    overlapping_other = _candidate(120.0, 90.0, 280.0, 410.0)
+    decision = policy.observe(
+        frame=frame, candidates=[target, overlapping_other], frame_id=1, now=1.0,
+        frame_width=640, frame_height=480,
+    )
+    assert decision.accepted
+    assert decision.enrollment_status == "overlapping_person_rejected"
+    assert not worker.requests
 
 
 def test_search_round_robins_after_one_candidate_uses_its_confirmation_window():

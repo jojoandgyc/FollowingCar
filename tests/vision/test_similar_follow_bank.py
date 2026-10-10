@@ -193,7 +193,7 @@ def test_one_strong_frame_after_uid_zero_cannot_erase_learning_fence():
     assert not bank.last_assignments[3]['bank_updated']
 
 
-def test_independent_existing_pair_releases_learning_without_stopping_or_writing_release_frame():
+def test_independent_existing_pair_commits_on_release_without_stopping_follow():
     bank = make_bank()
     activate(bank)
     before = gallery_snapshot(bank)
@@ -202,10 +202,14 @@ def test_independent_existing_pair_releases_learning_without_stopping_or_writing
     for cap, timestamp in ((22, 3.35), (23, 3.6), (24, 3.85), (25, 4.1)):
         assert send(bank, cap, timestamp, full=.1, part=.1, track=3, extra=quality) == 1
         assert bank.last_assignments[3]['reason'] == 'mapped_similar_follow'
-        assert not bank.last_assignments[3]['bank_updated']
-        assert gallery_snapshot(bank) == before
         if cap < 25:
+            assert not bank.last_assignments[3]['bank_updated']
+            assert gallery_snapshot(bank) == before
             assert 1 in bank._similar_learning_fences
+        else:
+            assert bank.last_assignments[3]['bank_updated']
+            assert bank.last_assignments[3]['learning_written_tiers'] == ['recent_strong', 'recent_partial']
+            assert bank.last_assignments[3]['template_learning']['parent_caps'] == [1]
     assert 1 not in bank._similar_learning_fences
     assert not bank._reacquire_quarantine.is_held(1)
     assert bank.last_assignments[3]['similar_follow']['independent_verification_recovered']

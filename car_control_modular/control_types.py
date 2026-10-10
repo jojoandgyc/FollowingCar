@@ -170,6 +170,24 @@ class DistanceState:
 
 
 @dataclass(frozen=True)
+class SearchReacquireDepth:
+    """One accepted search sample awaiting its same-capture normal owner.
+
+    This carries the complete immutable measurement, not a new sensor sample
+    or a motion lease. The consumer still checks identity and physical age.
+    """
+
+    target: PersonTarget
+    distance_state: DistanceState
+    width: int
+    height: int
+    frame_index: int
+    capture_frame_id: int
+    capture_timestamp: float
+    scheduler_epoch: Optional[int] = None
+
+
+@dataclass(frozen=True)
 class SteeringFeedback:
     timestamp: float
     left_position_deg: int = 0

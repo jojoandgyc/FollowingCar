@@ -159,14 +159,18 @@ def test_preview_demand_does_not_bypass_safety_or_provenance(parked, monkeypatch
     assert not a.backend.pairs
 
 
-def test_non_outward_preview_cannot_skip_normal_dwell(parked):
+def test_non_outward_preview_does_not_wait_for_an_arbitrary_normal_dwell(parked):
     a = parked
     current, decision = preview(a)
     a.evidence.sent_at = a.clock.now-.1
+    a.evidence.current_released_at = a.clock.now-.06
     a.controller._braking_range_rate = 0.
-    assert not release(a, current, decision)
+    assert release(a, current, decision)
     assert a.evidence.forward_resume_until == 0
-    assert a.evidence.reason == 'minimum_normal_hold_500ms'
+    assert a.evidence.reason == 'qualified_motion_to_wheel_guard'
+    assert a.owner._near_yaw_park_request is None
+    assert a.owner._depth30_linear_snapshot is None
+    assert not a.backend.pairs  # Release is not motor authorization or a write.
 
 
 def test_original_positive_forward_release_path_unchanged(parked):

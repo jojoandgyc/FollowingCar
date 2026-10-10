@@ -150,9 +150,20 @@ def test_saved_recording_reproduces_baseline_and_follows_without_gallery_mutatio
     assert all((r['uid'], r['reason']) == (r['recorded_uid'], r['recorded_reason'])
                for r in baseline['rows'])
     assert baseline['accepted_caps'] == []
-    # Three recorded weak crops still fail current quality. The next strong
-    # observation must seed a new two-frame proof; do not invent strong flags.
+    # The new bounded edge-only policy retains the accepted candidate through
+    # these three substantial crops. It does not promote raw quality or learn.
     assert current['accepted_caps'] == [r['cap'] for r in current['rows']
+        if r['cap'] != 334]
+    crop_rows = [r for r in current['rows']
+                 if (r['similar_follow'] or {}).get('crop_continuation')]
+    assert [r['cap'] for r in crop_rows] == [343, 345, 346]
+    assert all(events[r['cap']]['sample_metadata']['quality_bbox_ok'] is False
+               and r['similar_follow']['original_quality_reason'] == 'edge_touch>2'
+               for r in crop_rows)
+    from unittest.mock import patch
+    with patch('rk_vision.identity_bank.cropped_follow_continuous', return_value=False):
+        before_crop_fix = replay.replay(config, events, logged_context=logged_context)
+    assert before_crop_fix['accepted_caps'] == [r['cap'] for r in current['rows']
         if r['cap'] not in (334, 343, 345, 346, 348)]
     assert current['gallery_write_caps'] == baseline['gallery_write_caps'] == []
     assert current['gallery_after'] == current['gallery_before']

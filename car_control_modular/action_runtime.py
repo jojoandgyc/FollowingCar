@@ -14,6 +14,7 @@ from .control_types import SteeringFeedback
 from .sample_braking import SampleBrakingAssessment
 from .depth_authority_timing import MAX_FORWARD_DEPTH_TTL_SEC
 from .detector_identity_lease import motion_identity_live, ValidatedVisualObservation
+from .low_quality_lateral import limited_yaw_identity_live
 from .action_queue_policy import should_drop_queued_action
 from .mssd_motor import MssdMotorBackend, MotorSpeedReceipt, MotorSpeedWrite
 from .steering_pid import encoder_yaw_rate_right_dps
@@ -47,6 +48,7 @@ from .predictive_turn_brake import pulse_feedback_qualified, MAX_PULSE_SEC
 from .action_command import ActionCommandSnapshot, SearchReacquireBrakeRequest
 from .search_reacquire_braking import (
     limit_handoff_yaw, moving_handoff_yaw, handoff_straight_allowed, note_handoff_zero_write,
+    note_observation_zero, observation_zero_handoff,
 )
 
 
@@ -239,6 +241,10 @@ class MotionActionRuntime:
                          "wheel_demand_increase=False lease_extended=False",
                          getattr(config, "follow_turn_response_assist_enable", False))
         self._steering_feedback: Optional[SteeringFeedback] = None
+        # Capture-aligned heading is advisory geometry only. A tuple of frozen
+        # samples lets visual readers interpolate without the serial/feedback
+        # locks, an extra encoder read, or any renewal of motion evidence.
+        self._steering_heading_history: tuple[SteeringFeedback, ...] = ()
         self._steering_feedback_thread: Optional[threading.Thread] = None
         self._steering_feedback_integrated_yaw_deg = 0.0
         self._steering_feedback_last_ts: Optional[float] = None
@@ -279,6 +285,7 @@ class MotionActionRuntime:
         self._search_reacquire_resume_context = None
         self._search_reacquire_resume_request = None
         self._search_reacquire_resume_released_request = None
+        self._search_observation_zero_evidence = None
         self._distance_brake_episode = None
         self._distance_brake_sample_floor = 0.0
         self._distance_brake_stop_generation = None
@@ -373,6 +380,8 @@ class MotionActionRuntime:
         self._steering_feedback_last_ts = None
         self._steering_feedback_high_yaw_sign = 0
         self._steering_feedback_high_yaw_count = 0
+        with self._steering_feedback_lock:
+            self._steering_heading_history = ()
         owner.action_thread = threading.Thread(target=self.run_loop, daemon=True)
         owner.action_thread.start()
         if self.config.visible_steering_pid_enable:
@@ -406,6 +415,75 @@ class MotionActionRuntime:
         with self._steering_feedback_lock:
             return self._steering_feedback
 
+    @staticmethod
+    def _steering_heading_sample_valid(feedback) -> bool:
+        try:
+            return bool(
+                feedback.trustworthy and feedback.yaw_rate_confirmed
+                and feedback.left_error == 0 and feedback.right_error == 0
+                and not isinstance(feedback.timestamp, bool)
+                and math.isfinite(feedback.timestamp) and feedback.timestamp > 0
+                and math.isfinite(feedback.integrated_yaw_right_deg)
+                and math.isfinite(feedback.yaw_rate_right_dps)
+                and abs(feedback.yaw_rate_right_dps) <= 90.0
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _record_steering_heading_feedback(self, feedback) -> None:
+        """Copy-on-write under the existing feedback publication lock.
+
+        Bad or out-of-order samples break the interpolation chain rather than
+        allowing geometry to bridge an encoder fault. This never changes the
+        published feedback or its qualification for existing motor readers.
+        """
+        history = getattr(self, "_steering_heading_history", ())
+        if not self._steering_heading_sample_valid(feedback):
+            self._steering_heading_history = ()
+            return
+        if history:
+            previous = history[-1]
+            dt = feedback.timestamp - previous.timestamp
+            delta = feedback.integrated_yaw_right_deg - previous.integrated_yaw_right_deg
+            # Headings are cumulative/unwrapped, not compass angles. Do not
+            # interpret a reset or a +/-360-degree jump as actual body motion.
+            if dt <= 0 or abs(delta) > 90.0 * dt + 1e-6:
+                self._steering_heading_history = ()
+                return
+        self._steering_heading_history = (*history[-63:], feedback)
+
+    def get_steering_heading_at(self, capture_timestamp: float) -> Optional[float]:
+        """Interpolate the already-published heading at actual image capture.
+
+        Exact samples are usable; otherwise two qualified encoder samples
+        must surround the capture within 150 ms. Never extrapolate, poll the
+        serial port, take the motor lock, or treat a prediction as authority.
+        Missing history simply leaves the caller's uncompensated geometry.
+        """
+        try:
+            if isinstance(capture_timestamp, bool):
+                return None
+            stamp = float(capture_timestamp)
+            if not math.isfinite(stamp) or stamp <= 0:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        history = getattr(self, "_steering_heading_history", ())
+        for index, sample in enumerate(history):
+            if stamp == sample.timestamp:
+                return float(sample.integrated_yaw_right_deg)
+            if stamp < sample.timestamp:
+                if index == 0:
+                    return None
+                previous = history[index - 1]
+                dt = sample.timestamp - previous.timestamp
+                if not 0.0 < dt <= .150 + 1e-9:
+                    return None
+                weight = (stamp - previous.timestamp) / dt
+                return float(previous.integrated_yaw_right_deg + weight * (
+                    sample.integrated_yaw_right_deg - previous.integrated_yaw_right_deg))
+        return None
+
     def _publish_steering_feedback(self, feedback):
         """Publish one precomputed immutable sample between motor commits.
 
@@ -417,6 +495,7 @@ class MotionActionRuntime:
         with self.owner.motor_io_lock:
             with self._steering_feedback_lock:
                 self._steering_feedback = feedback
+                self._record_steering_heading_feedback(feedback)
         self._observe_executed_speed_response(feedback)
 
     def get_recording_feedback(self) -> Optional[SteeringFeedback]:
@@ -2531,6 +2610,32 @@ class MotionActionRuntime:
         )
         return False
 
+    def search_observation_zero_handoff(self, *, uid):
+        """Reuse completed soft-zero progress; never grant follow motion.
+
+        Unlike parking release, this has no current/mode transaction and no
+        extra wait. A failed check simply leaves the existing brake decision
+        unchanged. The ordinary wheel writer still checks new Depth/reversal.
+        """
+        with self.owner.motor_io_lock:
+            if self.hard_stop_check(getattr(self.owner, "current_command", None)):
+                self._search_observation_zero_evidence = None
+                return False
+            feedback = self.get_steering_feedback()
+            now = time.monotonic()
+            evidence = observation_zero_handoff(self, uid=uid, feedback=feedback, now=now)
+            if evidence is None:
+                return False
+            details = (uid, evidence.episode[0], evidence.receipt.sequence,
+                (now-evidence.completed_at)*1000., (now-feedback.timestamp)*1000.,
+                feedback.left_forward_rpm, feedback.right_forward_rpm,
+                feedback.raw_yaw_rate_right_dps)
+        self.logger.info("search_observation_low_residual_handoff uid=%s search_epoch=%s "
+                         "zero_receipt=%s zero_age_ms=%.1f feedback_age_ms=%.1f "
+                         "left_rpm=%.1f right_rpm=%.1f raw_yaw_dps=%.2f "
+                         "quiet_claim=False parking_requested=False motion_authorized=False", *details)
+        return True
+
     def request_search_reacquire_brake(self, capture_id, capture_timestamp, reason):
         """Publish a brake intent. Only the execution thread writes NORMAL."""
         owner = self.owner
@@ -2801,9 +2906,10 @@ class MotionActionRuntime:
                 request, self._search_reacquire_brake_sent_at, require_current_release=True)
             owner._last_brake_hold_send_ts = time.time()
             self._search_reacquire_brake_applied = request
-            self.logger.info("search_reacquire_brake_applied capture_frame_id=%d mode=%s minimum_hold_ms=%.0f "
+            self.logger.info("search_reacquire_brake_applied capture_frame_id=%d mode=%s minimum_hold_ms=0 "
+                             "settlement_policy=feedback current_hold_timeout_ms=%.0f "
                              "request_age_ms=%.1f capture_to_stop_ms=%.1f next_dispatch_allowance_ms=%.1f",
-                             request.capture_frame_id, owner._brake_hold_stop_mode, ParkSettlingEvidence.MIN_HOLD_SEC * 1000,
+                             request.capture_frame_id, owner._brake_hold_stop_mode, ParkSettlingEvidence.MAX_CURRENT_HOLD_SEC * 1000,
                              (self._search_reacquire_brake_sent_at-request.requested_at)*1000,
                              (self._search_reacquire_brake_sent_at-request.capture_timestamp)*1000,
                              self._search_brake_dispatch_delay_sec*1000)
@@ -2936,9 +3042,10 @@ class MotionActionRuntime:
                 self._forward_coast_snapshot = None
                 self.logger.info(
                     "near_yaw_park_applied capture_frame_id=%s uid=%s reason=%s "
-                    "mode=%s minimum_hold_ms=%.0f request_age_ms=%.1f stop_sent_ts=%.6f",
+                    "mode=%s minimum_hold_ms=0 settlement_policy=feedback "
+                    "current_hold_timeout_ms=%.0f request_age_ms=%.1f stop_sent_ts=%.6f",
                     request.capture_frame_id, request.uid, request.reason, owner._brake_hold_stop_mode,
-                    ParkSettlingEvidence.MIN_HOLD_SEC * 1000,
+                    ParkSettlingEvidence.MAX_CURRENT_HOLD_SEC * 1000,
                     max(0., time.monotonic() - request.requested_at) * 1000.,
                     self._near_yaw_park_settling.sent_at,
                 )
@@ -2992,9 +3099,10 @@ class MotionActionRuntime:
                              "target_visible", "target_visible_depth_valid"}
                          and owner._follow_controller.search_state == "none"
                          and owner._follow_controller.active_target_id == evidence.request.uid)
-        if not early_forward and not evidence.minimum_hold_complete(now):
-            return
         if evidence.current_released_at is None:
+            if not early_forward and not evidence.current_release_ready(self.get_steering_feedback(), now):
+                return
+            release_reason = "qualified_forward_resume" if early_forward else evidence.reason
             failure_reason = "current_release_failed"
             try:
                 if self.hard_stop_check(getattr(owner, "current_command", None)):
@@ -3020,11 +3128,11 @@ class MotionActionRuntime:
                 # starts the fresh feedback/image boundary. The ordinary hold
                 # remains latched; its periodic service must not replay FREE.
                 evidence.mark_current_released(time.monotonic())
-                self.logger.info("ordinary_park_current_released cap=%s label=%s hold_ms=%.1f "
+                self.logger.info("ordinary_park_current_released cap=%s label=%s hold_ms=%.1f reason=%s "
                                  "current_a=0 zero_rpm=False speed_write=False motion_authorized=False "
                                  "exit_stop_mode=free",
                                  evidence.request.capture_frame_id, label,
-                                 (evidence.current_released_at-evidence.sent_at)*1000)
+                                 (evidence.current_released_at-evidence.sent_at)*1000, release_reason)
             except Exception:
                 self.logger.exception("ordinary park current/free-stop release failed")
                 self._ordinary_park_exit_fault(evidence, failure_reason)
@@ -5253,7 +5361,18 @@ class MotionActionRuntime:
         self._follow_base_contraction_reject_reason = "not_checked"
         if self._near_yaw_park_blocks_write(label):
             return False
-        if not self._periodic_follow_writing and self._periodic_follow_active():
+        if label == "LIMITED_YAW_HANDOFF":
+            uid = getattr(self.owner._follow_controller, "active_target_id", None)
+            now = time.monotonic()
+            intent = self._current_limited_yaw_intent(uid, now)
+            ls = self.backend.wheel_raw_state_to_target("left", 1, 0x01)
+            rs = self.backend.wheel_raw_state_to_target("right", 1, 0x01)
+            if (intent is None or not limited_yaw_identity_live(self.owner, uid, now, intent)
+                    or left * ls != -right * rs or left == 0
+                    or abs(left) > intent.correction_limit_rpm):
+                return False
+        if (not self._periodic_follow_writing and self._periodic_follow_active()
+                and label != "LIMITED_YAW_HANDOFF"):
             # Producers only update canonical axes. Do not remember this
             # packet: a later tick must reconstruct BOTH current axes.
             return False
@@ -6426,7 +6545,9 @@ class MotionActionRuntime:
                         yaw_invalid = not self.owner._has_fresh_lateral_yaw(uid)
                 if (not wheel_feedback_valid(commit_feedback, commit_now)
                         or self.owner._follow_controller.active_target_id != uid
-                        or not motion_identity_live(self.owner, uid, commit_now)
+                        or not (motion_identity_live(self.owner, uid, commit_now)
+                            or (sum(applied) == 0 and limited_yaw_identity_live(
+                                self.owner, uid, commit_now, commit_intent)))
                         or not self._visible_wheel_control_active()
                         or revision != getattr(self.owner, "_lateral_yaw_revision", None)
                         or self._follow_intent_snapshot(commit_store) is not commit_intent
@@ -6798,6 +6919,45 @@ class MotionActionRuntime:
                 and self.owner._has_fresh_lateral_yaw(uid)):
             return intent
         return None
+
+    def _write_limited_yaw_successor(self):
+        """Replace a retired paired plan by a freshly admitted yaw-only pair.
+
+        Called by the old owner under its lock and motor I/O ownership. No
+        permission is created here: the usual wheel, feedback, reversal and
+        terminal checks execute before the successor is considered installed.
+        """
+        uid = getattr(self.owner._follow_controller, "active_target_id", None)
+        now = time.monotonic()
+        intent = self._current_limited_yaw_intent(uid, now)
+        if (intent is None or not limited_yaw_identity_live(self.owner, uid, now, intent)
+                or not self._periodic_follow_scope_active()
+                or self.hard_stop_check(getattr(self.owner, "current_command", None))):
+            return False
+        # Legacy/disabled owners need not expose canonical axes. A handoff
+        # must first exist and qualify before invoking its optional reader.
+        axes = self._read_follow_axes(now)
+        if axes is None or axes[0] != uid or axes[2] != 0 or axes[3] == 0:
+            return False
+        yaw = int(round(axes[3]))
+        if yaw == 0:
+            return False
+        before = getattr(self.backend, "last_speed_receipt", None)
+        ls = self.backend.wheel_raw_state_to_target("left", 1, 0x01)
+        rs = self.backend.wheel_raw_state_to_target("right", 1, 0x01)
+        self._send_follow_wheel_targets(yaw * ls, -yaw * rs, "LIMITED_YAW_HANDOFF",
+            max_target_override=int(self.config.motor_forward_max_target_rpm), visible_required=True)
+        receipt = getattr(self.backend, "last_speed_receipt", None)
+        if (receipt is None or receipt is before or receipt.left_rpm * ls == 0
+                or receipt.left_rpm * ls != -receipt.right_rpm * rs):
+            return False
+        self._follow_wheel_clock.sent(time.monotonic(), axes)
+        self._follow_wheel_last_receipt = receipt
+        self._follow_wheel_last_stop_generation = self.backend.stop_write_generation
+        self.logger.info("limited_yaw_owner_handoff uid=%s capture_frame_id=%s "
+            "pair=%s stop_preface=False forward_authorized=False", uid, intent.capture_frame_id,
+            (receipt.left_rpm * ls, receipt.right_rpm * rs))
+        return True
 
     def can_handoff_limited_yaw(self, uid, capture_frame_id):
         """Queue interruption is not a stop when the sole writer has new yaw.
@@ -7485,9 +7645,10 @@ class MotionActionRuntime:
             if p > 0 and getattr(self.owner, "_detector_identity_lease", None) is not None:
                 # The percent writer has no detector identity deadline gate.
                 return False
+            previous_receipt = getattr(self.backend, "last_speed_receipt", None)
             self.backend.send_diff(p, state, p, state, "DRIVE")
             if p <= 0:
-                self._note_search_retry_zero_sent()
+                self._note_search_retry_zero_sent(previous_receipt=previous_receipt)
             self._forward_coast_snapshot = (p, bool(allow_below_min)) if p > 0 else None
         return True
 
@@ -7794,11 +7955,15 @@ class MotionActionRuntime:
             self._forward_coast_snapshot = None
             return True
 
-    def _note_search_retry_zero_sent(self) -> None:
+    def _note_search_retry_zero_sent(self, *, previous_receipt=None) -> None:
         """Acknowledge only a successful zero write, once per retry window."""
         requested = float(getattr(self.owner, "_search_retry_zero_requested_at", 0.0))
-        if requested > 0 and getattr(self.owner, "_search_retry_zero_sent_at", None) is None:
-            self.owner._search_retry_zero_sent_at = time.monotonic()
+        first_ack = requested > 0 and getattr(self.owner, "_search_retry_zero_sent_at", None) is None
+        now = time.monotonic()
+        note_observation_zero(self, now=now, first_ack=first_ack,
+                              previous_receipt=previous_receipt)
+        if first_ack:
+            self.owner._search_retry_zero_sent_at = now
             self.logger.info(
                 "search_observation_zero_sent requested_at=%.6f sent_at=%.6f",
                 requested, self.owner._search_retry_zero_sent_at,
@@ -7809,8 +7974,9 @@ class MotionActionRuntime:
         with self.owner.motor_io_lock:
             if self._near_yaw_park_blocks_write("TURN_ZERO"):
                 return
+            previous_receipt = getattr(self.backend, "last_speed_receipt", None)
             self.backend.send_targets(0, 0, "TURN_ZERO")
-            self._note_search_retry_zero_sent()
+            self._note_search_retry_zero_sent(previous_receipt=previous_receipt)
         self.backend.motion_armed = False
 
     def send_rotate_transition_hold(self, ended_action: int) -> None:

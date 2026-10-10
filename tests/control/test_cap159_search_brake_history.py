@@ -125,7 +125,10 @@ def test_real_runtime_and_tracker_hold_uid0_then_retire_old_left(owner, monkeypa
     owner._rknn_pipeline.tracker.last_identity_observations[0]["assignment"]["best_uid"]=1
     consume(owner,[r])
     assert rt._search_reacquire_brake_request is not None
-    assert driver.stops == [1, 0] and driver.pairs == [(0,0)]
+    # Quiet feedback already releases current/FREE before 500ms; UID0 still
+    # cannot turn that release into motion or restore the old left turn.
+    assert rt._search_reacquire_settling.current_released_at == pytest.approx(100.10)
+    assert driver.stops == [1, 0, 2] and driver.pairs == [(0,0)]
     # The observation veto must expire, not rearm on every new central crop.
     # Remaining physically quiet is established by motor ticks throughout.
     for t in (100.50,100.51,100.56,100.60,100.65,100.70):

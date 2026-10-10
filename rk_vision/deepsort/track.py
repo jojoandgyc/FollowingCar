@@ -32,6 +32,8 @@ class Track:
         self.features = []
         self.last_feature = feature
         self.source_detection_index = source_detection_index
+        self.low_score_continuation = False
+        self.low_score_anchor = None
         if feature is not None:
             self.features.append(feature)
         self._n_init = int(n_init)
@@ -58,6 +60,7 @@ class Track:
         self.mean, self.covariance = kf.update(self.mean, self.covariance, detection.to_xyah())
         self.last_feature = detection.feature
         self.source_detection_index = detection.source_detection_index
+        self.low_score_continuation = bool(getattr(detection, "low_score_continuation", False))
         if detection.feature is not None and (not was_confirmed or bool(getattr(detection, "store_feature", True))):
             self.features.append(detection.feature)
         self.cls = int(detection.cls)

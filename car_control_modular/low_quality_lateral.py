@@ -13,6 +13,61 @@ from typing import Any, Mapping, Optional, Sequence
 
 
 @dataclass(frozen=True)
+class LimitedYawSource:
+    """Already-qualified mapped crop; never full identity or forward authority.
+
+    Created only by the existing mapped-crop admission path. Binding the
+    immutable identity publication prevents a later rejection from inheriting
+    this observation merely because its rejected lease is also ``False``.
+    """
+    uid: int
+    track_id: int
+    capture: int
+    timestamp: float
+    bbox: tuple
+    identity_publication: object
+
+
+@dataclass(frozen=True)
+class LimitedYawEvidence:
+    source: LimitedYawSource
+    intent: object
+    expires_at: float
+
+
+def limited_yaw_identity_live(owner, uid, now, intent=None):
+    """Narrow substitute for yaw only, never for any longitudinal reader."""
+    proof = getattr(owner, "_limited_yaw_evidence", None)
+    if not isinstance(proof, LimitedYawEvidence):
+        return False
+    source = proof.source
+    store = getattr(owner, "_lateral_intent_store", None)
+    current = store.snapshot() if store is not None else None
+    if intent is None:
+        intent = current
+    controller = getattr(owner, "_follow_controller", None)
+    return bool(
+        source.uid == uid and source.capture > 0 and source.track_id > 0
+        and math.isfinite(now) and 0 < source.timestamp <= now < proof.expires_at
+        and source.identity_publication is not None
+        and source.identity_publication is getattr(owner, "_visual_identity_evidence", None)
+        and intent is proof.intent and current is intent
+        and intent.target_id == uid and intent.capture_frame_id == source.capture
+        and intent.capture_timestamp == source.timestamp and intent.valid(now)
+        and intent.mode == "yaw_only" and intent.bbox_quality == "limited"
+        and not intent.hold_zero and not intent.park_requested
+        and getattr(owner, "_lateral_intent_zero_sequence", -1) != intent.sequence
+        and getattr(controller, "active_target_id", None) == uid
+        and getattr(controller, "search_state", "none") == "none"
+        and getattr(owner, "search_state", None) == "none"
+        and getattr(owner, "_vision_control_state", "") == "target_visible_low_quality"
+        and getattr(owner, "running", False)
+        and not any(getattr(owner, key, False) for key in (
+            "_explicit_stop_requested", "_runtime_shutdown_requested", "_brake_hold_active"))
+        and getattr(owner, "_near_yaw_park_request", None) is None)
+
+
+@dataclass(frozen=True)
 class MultiPersonLateralDecision:
     track_id: Optional[int]
     reason: str

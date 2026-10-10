@@ -52,6 +52,11 @@ class ShortFollowExecutor:
         self._turn_responses = ()
         self._park_tail_until = float("-inf")
         self._park_tail_reverse_seen = False
+        # Same visual observation may taper an executed turn, but falling
+        # rate feedback must not repeatedly restore that old turn request.
+        # This is an output bound, not an observation/permission deadline.
+        self._yaw_limit_key = None
+        self._yaw_delta_limit = None
 
     def controller(self):
         controller = getattr(self.owner, "_short_follow", None)
@@ -196,6 +201,7 @@ class ShortFollowExecutor:
         """
         generation = self.backend.stop_write_generation
         if generation != self._motion_generation:
+            self._yaw_limit_key = self._yaw_delta_limit = None
             self._motion_receipt = self._motion_pair = None
             self._turn_responses = ()
             self._park_tail_until = float("-inf")
@@ -377,6 +383,58 @@ class ShortFollowExecutor:
             return min(limit, 40, prior)
         return min(limit, 40) if self._feedback(now) is None else limit
 
+    @staticmethod
+    def _yaw_feedback(sample):
+        """Optional anti-overshoot evidence, never an extra motion gate.
+
+        The caller supplies already qualified cached encoder feedback. Missing,
+        stale or unconfirmed yaw leaves the existing lawful pair unchanged;
+        it does not insert STOP or wait for a second feedback sample.
+        """
+        if sample is None or getattr(sample, "yaw_rate_confirmed", False) is not True:
+            return None, None
+        yaw = getattr(sample, "integrated_yaw_right_deg", None)
+        rate = getattr(sample, "yaw_rate_right_dps", None)
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+               or not math.isfinite(value) for value in (yaw, rate)):
+            return None, None
+        return yaw, rate
+
+    @staticmethod
+    def _yaw_key(plan):
+        if plan.yaw_capture_id <= 0 or plan.yaw_capture_timestamp <= 0:
+            return None
+        return plan.uid, plan.epoch, plan.yaw_capture_id, plan.yaw_capture_timestamp
+
+    def _limit_retained_yaw(self, plan):
+        key = self._yaw_key(plan)
+        delta = plan.left_rpm-plan.right_rpm
+        if (key is None or key != self._yaw_limit_key
+                or self._yaw_delta_limit is None or abs(delta) <= self._yaw_delta_limit):
+            return plan
+        bound = max(0, int(self._yaw_delta_limit))
+        if plan.base_rpm > 0:
+            outer = max(plan.left_rpm, plan.right_rpm)
+            left, right = ((outer, outer-bound) if delta > 0 else (outer-bound, outer))
+            reason = plan.reason if bound else "forward"
+        else:
+            pivot = bound // 2
+            left, right = ((pivot, -pivot) if delta > 0 else (-pivot, pivot))
+            reason = plan.reason if pivot else plan.longitudinal_reason
+        return replace(plan, left_rpm=left, right_rpm=right, reason=reason,
+                       yaw_adjustment_reason="retained_yaw_taper")
+
+    def _remember_executed_yaw(self, plan, left_rpm, right_rpm):
+        # Only called after a completed pair/STOP. Failed or partially sent
+        # output must never count as a physical centering intervention.
+        key = self._yaw_key(plan)
+        if key is None:
+            return
+        delta = abs(left_rpm-right_rpm)
+        self._yaw_delta_limit = (min(self._yaw_delta_limit, delta)
+            if key == self._yaw_limit_key and self._yaw_delta_limit is not None else delta)
+        self._yaw_limit_key = key
+
     def _entry_ready(self, now):
         if self._entry_stop_at is None:
             return True
@@ -412,6 +470,7 @@ class ShortFollowExecutor:
                 "external_stop_generation", "stop_during_prepare", "identity_not_live",
                 "identity_or_search_changed", "feedback_reverse", "feedback_overspeed",
                 "feedback_motor_error", "feedback_invalid", "invalid_wheel_pair", "external_brake_hold"}:
+            self._yaw_limit_key = self._yaw_delta_limit = None
             if controller.snapshot().plan is not None:
                 controller.revoke(reason, now)
             epoch = controller.snapshot().epoch
@@ -559,6 +618,25 @@ class ShortFollowExecutor:
                             # Re-enabling also needs a new activation/observation.
                             mailbox.deactivate("ownership_exit", time.monotonic())
                             latest = mailbox.snapshot()
+                        # A mapped crop can already have an independently
+                        # admitted bounded yaw successor. Install that pair
+                        # through the canonical guard before retiring this
+                        # owner, instead of inserting a STOP then the yaw.
+                        transferred = False
+                        if (controller is not None and latest.reason == "identity_or_search_handoff"
+                                and self._hard_reason() is None
+                                and self.backend.stop_write_generation == self._generation):
+                            self._owned = False
+                            try:
+                                transferred = self.runtime._write_limited_yaw_successor()
+                            finally:
+                                self._owned = not transferred
+                        if transferred:
+                            self._entry_stop_at = None
+                            self._entry_stop_acknowledged = False
+                            self._last_write_at = float("-inf")
+                            self._next_write_due = None
+                            return True
                         if self._completed_stop_still_current():
                             self.runtime.logger.info(
                                 "short_follow_ownership_exit epoch=%s reuse_completed_stop=True generation=%s",
@@ -635,7 +713,32 @@ class ShortFollowExecutor:
                     if reason is not None:
                         self._stop_locked(reason, latest.epoch, now)
                         return True
-                    plan = latest.plan
+                    source_plan = latest.plan
+                    feedback_snapshot = self._feedback(now)  # Cached data; no serial read.
+                    current_yaw, yaw_rate = self._yaw_feedback(feedback_snapshot)
+                    plan = controller.execution_plan(source_plan, now,
+                        current_yaw_deg=current_yaw, yaw_rate_deg_s=yaw_rate)
+                    plan = self._limit_retained_yaw(plan)
+                    if not plan.moving:
+                        # Only a previously legal pivot can become all-zero
+                        # here. A forward arc becomes straight, not stopped.
+                        # Reuse the normal distance-hold stop lifecycle: no
+                        # additional brake hold or quiet-feedback barrier.
+                        self.runtime.logger.info(
+                            "short_follow_yaw_center cap=%s yaw_cap=%s epoch=%s sequence=%s "
+                            "source_pair=%s applied_pair=%s yaw_age_ms=%s "
+                            "control_center=%s yaw_adjustment=%s",
+                            plan.capture_id, getattr(plan, "yaw_capture_id", None),
+                            plan.epoch, plan.sequence,
+                            (source_plan.left_rpm, source_plan.right_rpm),
+                            (plan.left_rpm, plan.right_rpm),
+                            None if getattr(plan, "yaw_capture_timestamp", None) is None else
+                                (now-plan.yaw_capture_timestamp)*1000.,
+                            getattr(plan, "yaw_control_center_x_ratio", None),
+                            getattr(plan, "yaw_adjustment_reason", "none"))
+                        self._stop_locked(plan.reason, latest.epoch, now)
+                        self._remember_executed_yaw(plan, 0, 0)
+                        return True
                     feedback_cap = self._feedback_speed_cap(now)
                     limit = max(0, min(controller.config.max_rpm,
                                        int(self.backend.config.max_target), feedback_cap))
@@ -650,10 +753,10 @@ class ShortFollowExecutor:
                         "left", abs(left_rpm), 0x02 if left_rpm < 0 else 0x01)
                     right = self.backend.wheel_raw_state_to_target(
                         "right", abs(right_rpm), 0x02 if right_rpm < 0 else 0x01)
-                    feedback_snapshot = self._feedback(now)  # Cached encoder data, no serial read.
                     send_started_at = time.monotonic()
                     self.backend.send_targets(left, right, "SHORT_FOLLOW", max_target_override=limit,
                                               history_uid=plan.uid)
+                    self._remember_executed_yaw(plan, left_rpm, right_rpm)
                     # Only a successfully completed wheel pair can feed back
                     # the output ceiling. Actual encoder lag is NOT windup.
                     applied_base = 0 if plan.pivot else max(left_rpm, right_rpm)
@@ -685,7 +788,9 @@ class ShortFollowExecutor:
                     self.runtime.logger.info("short_follow_write cap=%s uid=%s epoch=%s sequence=%s "
                         "left_rpm=%s right_rpm=%s pi_request_rpm=%.2f p_rpm=%.2f i_rpm=%.2f "
                         "speed_cap_rpm=%.2f feedback_speed_cap=%s depth_age_ms=%.1f expires_in_ms=%.1f "
-                        "motion_kind=%s command_delta_rpm=%s feedback_delta_rpm=%s feedback_age_ms=%s",
+                        "motion_kind=%s command_delta_rpm=%s feedback_delta_rpm=%s feedback_age_ms=%s "
+                        "yaw_cap=%s yaw_age_ms=%s yaw_observed_center=%s yaw_control_center=%s "
+                        "yaw_capture_deg=%s yaw_current_deg=%s yaw_rate_dps=%s yaw_adjustment=%s",
                         plan.capture_id, plan.uid, plan.epoch, plan.sequence,
                         left_rpm, right_rpm, plan.base_request_rpm, plan.p_rpm, plan.i_rpm,
                         min(plan.speed_cap_rpm, float(limit)), feedback_cap,
@@ -694,5 +799,12 @@ class ShortFollowExecutor:
                         "pivot" if plan.pivot else "arc" if left_rpm != right_rpm else "straight",
                         left_rpm - right_rpm,
                         None if feedback_snapshot is None else feedback_snapshot.left_forward_rpm - feedback_snapshot.right_forward_rpm,
-                        None if feedback_snapshot is None else (send_started_at-feedback_snapshot.timestamp)*1000.)
+                        None if feedback_snapshot is None else (send_started_at-feedback_snapshot.timestamp)*1000.,
+                        getattr(plan, "yaw_capture_id", None),
+                        None if getattr(plan, "yaw_capture_timestamp", None) is None else
+                            (now-plan.yaw_capture_timestamp)*1000.,
+                        getattr(plan, "yaw_center_x_ratio", None),
+                        getattr(plan, "yaw_control_center_x_ratio", None),
+                        getattr(plan, "yaw_capture_yaw_deg", None), current_yaw, yaw_rate,
+                        getattr(plan, "yaw_adjustment_reason", "none"))
             return True

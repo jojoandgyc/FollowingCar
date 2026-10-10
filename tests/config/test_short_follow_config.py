@@ -26,6 +26,7 @@ def test_production_ini_selects_paired_pi_with_shared_tuning_and_motor_ceiling(m
     assert cfg.depth_ttl_sec == .35 and cfg.visual_ttl_sec == .50
     assert cfg.max_integral_gap_sec == .30
     assert cfg.yaw_max_delta_rpm == 16 and cfg.yaw_full_error_ratio == .30
+    assert cfg.yaw_camera_hfov_deg == 60 and cfg.yaw_damping_sec == .10
     assert cfg.pivot_max_rpm == 8 and cfg.center_deadband_ratio == .08
     assert os.environ["DISTANCE_CONTROL_MODE"] == "distance_pi"
     assert "SHORT_FOLLOW_MIN_RPM" not in os.environ
@@ -127,3 +128,12 @@ def test_production_delivery_trial_can_be_overridden_to_original_watchdog(monkey
     load_config_to_env(str(CONFIG))
     cfg = ShortFollowConfig.from_env()
     assert cfg.depth_ttl_sec == .30
+
+
+def test_yaw_damping_override_does_not_change_rpm_or_deadlines(monkeypatch):
+    monkeypatch.setattr(os, "environ", {"SHORT_FOLLOW_YAW_DAMPING_SEC": "0"})
+    load_config_to_env(str(CONFIG))
+    cfg = ShortFollowConfig.from_env()
+    assert cfg.yaw_damping_sec == 0
+    assert cfg.yaw_max_delta_rpm == 16 and cfg.pivot_max_rpm == 8
+    assert cfg.depth_ttl_sec == .35 and cfg.visual_ttl_sec == .50

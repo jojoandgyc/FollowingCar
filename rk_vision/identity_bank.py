@@ -15,9 +15,14 @@ from .template_learning import TemplateLearningGuard, TemplatePair
 from .candidate_observation import CandidateObservationMemory
 from .initial_enrollment import InitialEnrollment
 from .crop_continuity import mapped_crop_continuous
+from .edge_exit_observation import outward_edge_crop, continued_edge_crop
 from .verified_continuation import evaluate_continuation, evaluate_pose_continuation
-from .similar_follow import evaluate_similar_follow
+from .similar_follow import (evaluate_similar_follow, cropped_follow_continuous,
+                             observe_low_score_position, candidate_motion_geometry,
+                             cropped_visibility_geometry, crop_reverification_eligible,
+                             formal_detection_continuous)
 from .camera_geometry import horizontal_center_displacement
+from .detector_continuation import DetectorProof, MAX_FULL_RESULT_AGE_SEC
 
 logger = logging.getLogger("PersonTracker")
 
@@ -599,6 +604,8 @@ class PendingLateHandoff:
     capture_timestamp: Optional[float] = None
     partial_feature: Optional[Any] = None
     integrated_yaw_deg: Optional[float] = None
+    independent_recovery_origin: Optional[Tuple[Any, ...]] = None
+    capture_frame_id: Optional[float] = None
 
 
 class IdentityBank:
@@ -631,6 +638,9 @@ class IdentityBank:
         # track returns to trusted geometry, rather than aging it into a match.
         self._mapped_geometry_conflicts: Dict[int, dict] = {}
         self._geometry_revoked_uids: Dict[int, int] = {}
+        # Accepted positions explain a short edge exit; they never authorize
+        # identity, update the protected anchor, or survive a contradictory UID.
+        self._mapped_position_observations: Dict[int, dict] = {}
         self._identity_exclusion = IdentityExclusionMemory(
             camera_hfov_deg=self.config.camera_hfov_deg,
         )
@@ -665,6 +675,7 @@ class IdentityBank:
         self.last_assignments.clear()
         self._mapped_geometry_conflicts.clear()
         self._geometry_revoked_uids.clear()
+        self._mapped_position_observations.clear()
         self._identity_exclusion.reset()
         self._reacquire_quarantine.prune([])
         self._quarantine_decisions.clear()
@@ -704,6 +715,7 @@ class IdentityBank:
             if bbox is not None and width and height:
                 x1, y1, x2, y2 = bbox
                 metadata.update(
+                    track_id=track_id, image_width=width, image_height=height,
                     detector_center_x_ratio=(x1 + x2) / (2.0 * width),
                     detector_area_ratio=(x2 - x1) * (y2 - y1) / (width * height),
                 )
@@ -847,6 +859,82 @@ class IdentityBank:
                         "rejected_frame=%s", frame_index, metadata.get("capture_frame_id"),
                         track_id, uid, matches[-1].get("rejected_frame"))
 
+    def _remember_mapped_position(self, uid, track_id, metadata, assignment):
+        """Keep at most two accepted detector positions, separate from trust."""
+        memory = self._mapped_position_observations
+        entry = self.identities.get(int(uid))
+        geometry = assignment.get('reacquire_geometry') or {}
+        current = geometry.get('current')
+        competition = metadata.get('identity_competition') or {}
+        distance = _finite_float((assignment.get('match_evidence') or {}).get('distance'))
+        if (entry is None or int(uid) <= 0 or int(track_id) <= 0
+                or self.track_to_uid.get(int(track_id)) != int(uid)
+                or metadata.get('is_fresh') is not True
+                or metadata.get('quality_bbox_ok') is not True
+                or metadata.get('bbox_quality_tier') != 'strong'
+                or geometry.get('ok') is not True or not current
+                or any(assignment.get(k) for k in ('identity_control_rejected',
+                    'identity_recheck_pending', 'search_excluded'))
+                or competition.get('passed') is not True
+                or competition.get('uid') != uid
+                or competition.get('frame_index') != metadata.get('frame_index')
+                or distance is None or not 0 <= distance <= .30
+                or int(track_id) in self._mapped_geometry_conflicts
+                or int(uid) in self._geometry_revoked_uids):
+            return
+        stamp = template_timestamp(current)
+        cap = _finite_float(current.get('capture_frame_id'))
+        if stamp is None or cap is None:
+            return
+        for raw, item in tuple(memory.items()):
+            crop_stamp = template_timestamp((item.get('edge_exit') or {}).get('last'))
+            recent_crop = crop_stamp is not None and 0 <= stamp-crop_stamp <= .35
+            if (item['entry'] is not self.identities.get(item['uid'])
+                    or (stamp-item['last']['capture_timestamp'] > 1. and not recent_crop)):
+                memory.pop(raw, None)
+        previous = memory.get(int(track_id))
+        if previous and (previous['uid'] != uid or previous['entry'] is not entry):
+            previous = None
+        if previous and (cap <= previous['last']['capture_frame_id']
+                         or stamp <= previous['last']['capture_timestamp']):
+            return
+        earlier = (previous['last'] if previous
+                   and stamp-previous['last']['capture_timestamp'] <= .35 else None)
+        memory[int(track_id)] = dict(uid=int(uid), entry=entry,
+            earlier=earlier, last=dict(current))
+
+    def _mapped_edge_exit_observation(self, uid, track_id, metadata, geometry):
+        remembered = self._mapped_position_observations.get(track_id)
+        m = metadata or {}
+        competition = m.get('identity_competition') or {}
+        current_distance = _finite_float(competition.get('distance'))
+        if (remembered is None or not remembered.get('earlier')
+                or remembered['uid'] != uid or remembered['entry'] is not self.identities.get(uid)
+                or self.track_to_uid.get(track_id) != uid
+                or m.get('track_id', m.get('raw_track_id')) != track_id
+                or uid in self._geometry_revoked_uids or track_id in self._mapped_geometry_conflicts
+                or m.get('is_fresh') is not True
+                or m.get('identity_swap') or m.get('duplicate')
+                or competition.get('passed') is False
+                or (current_distance is not None and current_distance > .55)
+                or any('identity_center_jump>' in str(m.get(k, ''))
+                       or 'identity_swap_competing_track' in str(m.get(k, ''))
+                       for k in ('quality_bbox_reason', 'bbox_quality_reason'))
+                or self.search_exclusion_for(track_id, uid,
+                    frame_index=(geometry.get('current') or {}).get('frame_index', 0),
+                    capture_timestamp=m.get('capture_timestamp')) is not None):
+            return None
+        current = geometry.get('current') or {}
+        cropped = remembered.get('edge_exit')
+        if cropped and continued_edge_crop(current, cropped['last'], remembered['last'],
+                side=cropped['proof']['side'], width=m.get('image_width'), height=m.get('image_height'),
+                hfov=self.config.camera_hfov_deg):
+            return dict(cropped['proof'], observation_chain=True,
+                age_sec=current['capture_timestamp']-remembered['last']['capture_timestamp'])
+        return outward_edge_crop(current, remembered['last'],
+            remembered['earlier'], width=m.get('image_width'), height=m.get('image_height'),
+            hfov=self.config.camera_hfov_deg)
+
     def review_mapped_geometry(
         self, track_id: int, metadata: Optional[dict], frame_index: int, *,
         commit: bool = False,
@@ -884,6 +972,15 @@ class IdentityBank:
         reasons = set(str(geometry.get("reason", "")).split(","))
         new_search_conflict = self._search_geometry_contradiction(geometry, metadata)
         severe = {"center_jump", "area_change"}.issubset(reasons) or new_search_conflict
+        crop = (self._mapped_edge_exit_observation(uid, track_id, metadata, geometry)
+                if severe and not new_search_conflict and held is None else None)
+        if crop is not None:
+            severe = False
+            # Keep geometry.ok=False and its original residuals. A recent
+            # exit explains why the OLD reference is inconclusive, not why
+            # this crop should receive identity or a new motion lease.
+            geometry['mapped_geometry_observation_only'] = True
+            geometry['edge_exit_observation'] = crop
         blocked = bool(severe or search_conflict or (held is not None and geometry.get("ok") is not True))
         geometry["search_contradiction_retained"] = bool(search_conflict or new_search_conflict)
         if held is not None:
@@ -897,6 +994,15 @@ class IdentityBank:
         geometry["mapped_geometry_uid"] = uid
         if not commit:
             return geometry
+        if crop is not None:
+            self._mapped_position_observations[track_id]['edge_exit'] = dict(
+                last=dict(geometry['current']), proof=dict(crop))
+            logger.info('mapped_geometry_edge_observation capture=%s track=%s uid=%s '
+                'reference_capture=%s local_capture=%s age_sec=%.3f '
+                'identity_authorized=False uid_revoked=False',
+                (metadata or {}).get('capture_frame_id'), track_id, uid,
+                (geometry.get('reference') or {}).get('capture_frame_id'),
+                crop['reference_capture_frame_id'], crop['age_sec'])
         if blocked:
             reference = geometry.get("reference") or (held or {}).get("reference") or {}
             if held is None:
@@ -1273,6 +1379,7 @@ class IdentityBank:
         sample_metadata: Optional[dict] = None,
         preferred_uid: Optional[int] = None,
         preferred_candidate_ok: bool = False,
+        detector_position_bridge: Optional[dict] = None,
     ) -> int:
         sample_metadata = dict(sample_metadata or {})
         sample_metadata["track_id"] = int(track_id)
@@ -1412,6 +1519,7 @@ class IdentityBank:
             preferred_uid=preferred_uid,
             preferred_candidate_ok=preferred_candidate_ok,
             diagnostics=diagnostics,
+            detector_position_bridge=detector_position_bridge,
         )
         timer.mark("decision")
         # This cache is consumed only inside _assign. Accepted paths already
@@ -1420,9 +1528,35 @@ class IdentityBank:
         diagnostics.pop("_identity_continuation_geometry", None)
         assignment = self.last_assignments[int(track_id)]
         similar = diagnostics.get('similar_follow') or {}
+        low_position_observation = bool(sample_metadata.get('low_score_continuation') is True
+            and sample_metadata.get('association_reason') == 'low_score_existing_track'
+            and (assignment.get('reason') == 'low_score_observation_only'
+                 or similar.get('reason') == 'low_score_position_only'))
         if uid > 0 and diagnostics.pop('_similar_normal_handoff', False):
             self._similar_follow_states.pop((int(uid), int(track_id)), None)
-        if uid == 0 and similar.get('status') not in ('observe', 'ignore'):
+        # A predicted box is not a new identity observation. Keep only the
+        # previous bounded candidate memory, never refresh its capture/lease.
+        prior_similar = self._similar_follow_states.get((int(comparison_uid), int(track_id)))
+        sample_stamp = template_timestamp(sample_metadata)
+        missing_observation = bool(prior_similar and feature is None
+            and sample_metadata.get('is_fresh') is False and sample_stamp is not None
+            and 0 <= sample_stamp-prior_similar['last_timestamp'] <= .5
+            and self.track_to_uid.get(int(track_id)) in (None, comparison_uid)
+            and (not prior_similar.get('position_only') or sample_stamp
+                 - prior_similar['last_qualified_timestamp'] <= .75)
+            and not explicit_identity_reject and not diagnostics.get('search_excluded')
+            and (sample_metadata.get('identity_competition') or {}).get('passed') is not False
+            and int(track_id) not in self._mapped_geometry_conflicts
+            and int(comparison_uid) not in self._geometry_revoked_uids)
+        inconclusive_crop = bool(prior_similar and similar.get('observation_retained') is True
+            and assignment.get('reason') == 'secondary_evidence_unavailable'
+            and sample_stamp is not None and 0 < sample_stamp-prior_similar['last_timestamp'] <= .35
+            and not explicit_identity_reject and not diagnostics.get('search_excluded')
+            and (sample_metadata.get('identity_competition') or {}).get('passed') is not False
+            and int(track_id) not in self._mapped_geometry_conflicts
+            and int(comparison_uid) not in self._geometry_revoked_uids)
+        if (uid == 0 and similar.get('status') not in ('observe', 'ignore')
+                and not missing_observation and not inconclusive_crop):
             self._similar_follow_states.pop((int(comparison_uid), int(track_id)), None)
         self._remember_follow_reference(uid, track_id, feature, sample_metadata, assignment, diagnostics)
         # This is observation memory, not a gallery or motor lease. Rejected
@@ -1473,7 +1607,7 @@ class IdentityBank:
             if pose and (diagnostics.get('reacquire_recent_partial_evidence', {}).get('pose_bridge_caps')
                          or (prior and prior.get('pose_started') is not None)):
                 self._appearance_verified[int(uid)].update(pose)
-        elif uid == 0 and not diagnostics.get("identity_recheck_pending"):
+        elif uid == 0 and not diagnostics.get("identity_recheck_pending") and not low_position_observation:
             blocked = self._pose_retention_blocked.get(int(comparison_uid))
             if blocked is not None or (prior and prior.get('pose_started') is not None):
                 previous = (prior or {}).get('metadata') or {}
@@ -1489,7 +1623,7 @@ class IdentityBank:
                                      if k in self.identities}
         self._pose_retention_blocked = {k: v for k, v in self._pose_retention_blocked.items()
                                         if k in self.identities}
-        if self._update_pose_learning_fence(uid, comparison_uid, track_id, frame_index,
+        if not low_position_observation and self._update_pose_learning_fence(uid, comparison_uid, track_id, frame_index,
                 feature, partial_feature, sample_metadata, diagnostics, pose_follow):
             self._appearance_verified.get(int(uid), {}).pop('pose_follow_episode', None)
         observed = self._candidate_observations.rows.get((int(uid or comparison_uid), int(track_id)))
@@ -1499,7 +1633,7 @@ class IdentityBank:
                 observed["late_confirmed_source"] = assignment.get("match_source")
             elif uid > 0 and assignment.get("match_source") == "partial" and self._observed_crossing(uid, sample_metadata):
                 observed["confirmed"] = _geometry_observation(sample_metadata, frame_index)
-            elif uid == 0:
+            elif uid == 0 and not low_position_observation:
                 observed.pop("confirmed", None)
         verified = self._appearance_verified.get(int(uid)) if uid > 0 else None
         if verified is not None:
@@ -1523,7 +1657,7 @@ class IdentityBank:
         # recovery verifier. Such a rejection cannot leave a qualified local
         # proof alive. Missing secondary evidence is unknown, not a conflict;
         # its old proof remains bounded by the original capture timestamp.
-        if uid == 0 and assignment.get("reason") not in (
+        if uid == 0 and not low_position_observation and assignment.get("reason") not in (
             "reacquire_control_verify_reject", "secondary_evidence_unavailable",
         ):
             suspect = self._reacquire_control_suspects.get(int(comparison_uid))
@@ -1607,6 +1741,7 @@ class IdentityBank:
         assignment.update(diagnostics)
         if int(uid) <= 0:
             assignment["instant_reacquire_allowed"] = False
+        self._remember_mapped_position(uid, track_id, sample_metadata, assignment)
         routine = assignment.get("reason") in {
             "mapped", "updated_diverse", "skip_update_redundant", "skip_update_distance",
             "mapped_weak_observed", "mapped_weak_no_feature", "no_feature",
@@ -2323,9 +2458,141 @@ class IdentityBank:
         del rows[:-6]
         diagnostics['follow_reference_updated'] = dict(capture_frame_id=cap, permission='follow_only', count=len(rows))
 
+    def _similar_follow_handoff_candidate(self, identity, track_id, metadata, candidate_count,
+                                         feature=None):
+        """Find one recent accepted owner, not a new identity from a raw ID.
+
+        This is only a proposed handoff. Current appearance, local geometry,
+        exclusion and competition still have to pass before moving ownership.
+        No historical capture metadata or trusted anchor is rewritten.
+        """
+        now = template_timestamp(metadata)
+        cap = _finite_float(metadata.get('capture_frame_id'))
+        if (now is None or cap is None or metadata.get('is_fresh') is not True
+                or candidate_count != 1 or metadata.get('candidate_count', 1) != 1
+                or metadata.get('quality_bbox_ok') is not True
+                or metadata.get('bbox_quality_tier') != 'strong'):
+            return None
+        owners = []
+        for (owner_uid, old_track), state in self._similar_follow_states.items():
+            if (old_track == track_id or (identity and owner_uid != identity)
+                    or owner_uid not in self.identities or not state.get('active')
+                    or self.track_to_uid.get(old_track) != owner_uid
+                    or owner_uid in self._geometry_revoked_uids
+                    or old_track in self._mapped_geometry_conflicts
+                    or not 0 < now-state['last_timestamp'] <= .50
+                    or cap <= state['last_cap']):
+                continue
+            if now-state['last_timestamp'] > .35:
+                # A newly confirmed raw track can arrive one detector cycle
+                # late. Only CURRENT independent gallery support may bridge
+                # that extra interval, not the candidate's follow references.
+                distance = (_finite_float(self.identities[owner_uid].distance(feature))
+                            if feature is not None else None)
+                if distance is None or not 0 <= distance <= .30:
+                    continue
+            owners.append((owner_uid, old_track, state))
+        return owners[0] if len(owners) == 1 else None
+
+    def _mapped_crop_follow_seed(self, uid, track_id, metadata, geometry):
+        """Ordinary trusted ownership can enter the SAME follow-only crop path.
+
+        A raw ID alone is not proof: require the recent independently accepted
+        geometry and exclude every unresolved identity/learning transition.
+        Current appearance and competition are checked by the common evaluator.
+        """
+        entry = self.identities.get(uid)
+        reference = None if entry is None else entry.last_strong_observation
+        if (not reference or reference.get('track_id') != track_id
+                or self.track_to_uid.get(track_id) != uid
+                or metadata.get('search_reacquire_context_active')
+                or self._reacquire_quarantine.is_held(uid)
+                or uid in self._reacquire_control_suspects
+                or uid in self._similar_learning_fences or uid in self._pose_learning_fences
+                or track_id in self._mapped_geometry_conflicts
+                or uid in self._geometry_revoked_uids):
+            return None
+        cap, stamp = reference.get('capture_frame_id'), reference.get('capture_timestamp')
+        if cap is None or stamp is None:
+            return None
+        seed = dict(uid=uid, track_id=track_id, count=2, active=True,
+                    entry_direction_compatible=True, origin_cap=cap, origin_timestamp=stamp,
+                    last_cap=cap, last_timestamp=stamp, last_strong_timestamp=stamp,
+                    last_qualified_cap=cap, last_qualified_timestamp=stamp,
+                    observation=dict(reference), independent_verified=True)
+        return seed if cropped_follow_continuous(metadata, seed, geometry) else None
+
+    def _similar_detector_position_state(self, uid, track_id, feature, metadata, bridge):
+        """Consume a committed detector position for this independent FULL only.
+
+        No old descriptor/capture is retimed. The current FULL capture must be
+        within the original proof's fixed lease; its processing may complete
+        later under the normal fresh-FULL age limit. An ephemeral local state
+        bridges geometry only, never learning or old motor authorization.
+        """
+        if not isinstance(bridge, dict):
+            return None
+        proof = bridge.get('proof')
+        entry = self.identities.get(uid)
+        state = self._similar_follow_states.get((uid, track_id))
+        assignment = self.last_assignments.get(track_id)
+        stamp = template_timestamp(metadata)
+        cap = _finite_float(metadata.get('capture_frame_id'))
+        now = _finite_float(bridge.get('now'))
+        if (not isinstance(proof, DetectorProof) or proof.permission != 'similar_follow'
+                or proof.uid != uid or proof.track_id != track_id or proof.fast_count < 1
+                or proof.full_count != 2 or entry is None or state is None or assignment is None
+                or bridge.get('identity') is not entry or bridge.get('state') is not state
+                or bridge.get('assignment') is not assignment
+                or self.track_to_uid.get(track_id) != uid
+                or track_id in self._mapped_geometry_conflicts or uid in self._geometry_revoked_uids
+                or uid in self._reacquire_control_suspects
+                or state.get('active') is not True or state.get('position_only')
+                or state.get('last_cap') != proof.verified.capture
+                or state.get('last_timestamp') != proof.verified.timestamp
+                or tuple(state.get('observation', {}).get('detector_bbox', ())) != proof.verified.bbox
+                or metadata.get('is_fresh') is not True
+                or metadata.get('low_score_continuation') or metadata.get('observation_only')
+                or metadata.get('candidate_count', 1) != 1
+                or bridge.get('capture_frame_id') != cap or bridge.get('capture_timestamp') != stamp
+                or stamp is None or cap is None or cap <= 0 or not cap.is_integer()
+                or now is None or not 0 <= now-stamp < MAX_FULL_RESULT_AGE_SEC
+                or not proof.verified.timestamp < proof.previous.timestamp < stamp < proof.deadline
+                or not proof.verified.capture < proof.previous.capture < cap
+                or proof.previous.width != proof.verified.width
+                or proof.previous.height != proof.verified.height
+                or proof.verified.width != state['observation'].get('image_width')
+                or proof.verified.height != state['observation'].get('image_height')
+                or metadata.get('image_width') != proof.verified.width
+                or metadata.get('image_height') != proof.verified.height
+                or not isinstance(proof.previous.bbox, (tuple, list))
+                or len(proof.previous.bbox) != 4
+                or any(_finite_float(v) is None for v in proof.previous.bbox)):
+            return None
+        details = assignment.get('similar_follow') or {}
+        gallery = _finite_float(details.get('gallery_distance'))
+        current_gallery = _finite_float(entry.distance(feature)) if feature is not None else None
+        if (assignment.get('uid') != uid or assignment.get('match_source') != 'similar_follow'
+                or assignment.get('identity_control_rejected') or assignment.get('identity_recheck_pending')
+                or details.get('status') != 'follow' or details.get('capture_frame_id') != proof.verified.capture
+                or gallery is None or not 0 <= gallery <= .30
+                or current_gallery is None or not 0 <= current_gallery <= .30):
+            return None
+        prior = dict(state['observation'])
+        position = proof.previous
+        x1, y1, x2, y2 = position.bbox
+        prior.update(capture_frame_id=position.capture, capture_timestamp=position.timestamp,
+            detector_bbox=position.bbox, bbox=position.bbox, quality_bbox=position.bbox,
+            detector_center_x_ratio=(x1+x2)/(2*position.width),
+            detector_area_ratio=(x2-x1)*(y2-y1)/(position.width*position.height),
+            integrated_yaw_deg=position.yaw, detector_confidence=position.score,
+            image_width=position.width, image_height=position.height, is_fresh=True)
+        return dict(state, last_cap=position.capture, last_timestamp=position.timestamp,
+                    observation=prior)
+
     def _evaluate_similar_follow(self, *, uid, preferred_uid, track_id, feature, partial_feature,
                                  metadata, frame_index, candidate_count, confidence, area,
-                                 diagnostics):
+                                 diagnostics, detector_position_bridge=None):
         """One follow-only route across search, crossing and mapped continuation.
 
         Returns None to retain the normal policy, or a current assignment UID.
@@ -2334,18 +2601,37 @@ class IdentityBank:
         if not self.config.similar_follow_enable or feature is None:
             return None
         identity = int(uid or preferred_uid or 0)
+        handoff = None
+        if (identity, track_id) not in self._similar_follow_states:
+            handoff = self._similar_follow_handoff_candidate(
+                identity, track_id, metadata, candidate_count, feature)
+            if handoff is not None:
+                identity = handoff[0]
         entry = self.identities.get(identity)
         if entry is None:
             return None
         now = template_timestamp(metadata)
+        detector_state = (self._similar_detector_position_state(
+            identity, track_id, feature, metadata, detector_position_bridge)
+            if handoff is None and candidate_count == 1 else None)
         # Bounded state, keyed by the actual raw track, never by screen side.
         for key, old in list(self._similar_follow_states.items()):
+            if key == (identity, track_id) and detector_state is not None:
+                continue
             if key[0] not in self.identities or (now is not None and now-old['last_timestamp'] > .5):
                 self._similar_follow_states.pop(key, None)
         self._similar_learning_fences.intersection_update(self.identities)
         key = (identity, track_id)
-        state = self._similar_follow_states.get(key)
+        state = handoff[2] if handoff is not None else detector_state or self._similar_follow_states.get(key)
+        if handoff is not None and self._reject_identity_exclusion(
+                track_id, identity, frame_index, metadata, diagnostics):
+            return 0
         searching = metadata.get('search_reacquire_context_active') is True
+        trusted_geometry = self._handoff_geometry(identity, metadata, frame_index)
+        mapped_crop_seed = None
+        if state is None and uid == identity:
+            mapped_crop_seed = self._mapped_crop_follow_seed(uid, track_id, metadata, trusted_geometry)
+            state = mapped_crop_seed
         if state is None and not searching and identity not in self._similar_learning_fences:
             return None
         full = gallery_full = _finite_float(entry.distance(feature))
@@ -2369,7 +2655,6 @@ class IdentityBank:
                 and reliable.get('distance') is not None
                 and reliable['distance'] <= self.config.partial_confirm_threshold):
             return None
-        trusted_geometry = self._handoff_geometry(identity, metadata, frame_index)
         explicit_conflict = self._search_geometry_contradiction(trusted_geometry, metadata)
         if explicit_conflict:
             self._mapped_geometry_conflicts.setdefault(track_id, dict(
@@ -2379,10 +2664,56 @@ class IdentityBank:
         local = (self._handoff_geometry(identity, metadata, frame_index,
                     reference_override=_geometry_observation(state['observation'],
                         state['observation'].get('frame_index', frame_index-1))) if state else None)
+        if mapped_crop_seed is not None:
+            # last_strong_observation is already normalized geometry, whereas
+            # ordinary candidate states hold raw detector metadata.
+            local = trusted_geometry
         competition_ok, _ = self._reacquire_competition(identity, frame_index,
             max(candidate_count, int(metadata.get('candidate_count', candidate_count))), metadata)
+        blocked = bool(explicit_conflict or track_id in self._mapped_geometry_conflicts
+                       or identity in self._geometry_revoked_uids)
+        reliable_partial_conflict = bool(reliable.get('distance') is not None
+            and reliable['distance'] > max(.55, self.config.partial_match_threshold+.10))
+        if metadata.get('low_score_continuation') is True:
+            retained = observe_low_score_position(uid=identity, track_id=track_id,
+                current=metadata, state=state, geometry=local, competition_ok=competition_ok,
+                blocked=bool(blocked or reliable_partial_conflict), full_distance=full)
+            if retained is not None:
+                self._similar_follow_states[key] = retained
+                diagnostics.update(similar_follow=dict(status='observe', reason='low_score_position_only',
+                    count=retained['count'], capture_frame_id=metadata.get('capture_frame_id'),
+                    full_distance=full, learning_allowed=False, position_only=True,
+                    last_qualified_capture_frame_id=retained['last_qualified_cap']),
+                    template_learning=dict(status='frozen', reason='low_score_position_only'),
+                    _template_observation_evaluated=True, identity_control_rejected=True)
+                self.last_assignments[track_id] = dict(uid=0, mapped_uid=identity,
+                    reason='similar_follow_observe', match_source='similar_follow', bank_updated=False,
+                    bbox_quality_ok=False, bbox_quality_tier='weak', identity_control_rejected=True)
+                return 0
+            # Low confidence is NEVER an alternate route to UID/template writes.
+            self._similar_follow_states.pop(key, None)
+            self.last_assignments[track_id] = dict(uid=0, mapped_uid=identity,
+                reason='low_score_observation_rejected', bank_updated=False,
+                bbox_quality_ok=False, bbox_quality_tier='weak', identity_control_rejected=True)
+            diagnostics['identity_control_rejected'] = True
+            return 0
+        motion_geometry = candidate_motion_geometry(metadata, state, local,
+                                                    camera_hfov_deg=self.config.camera_hfov_deg)
+        if motion_geometry is not None and not blocked and not reliable_partial_conflict:
+            local = motion_geometry
+            diagnostics['similar_follow_motion_geometry'] = motion_geometry['candidate_motion_prediction']
+        standard_quality = self._quality_ok(confidence, area)
+        formal_recheck = bool(not standard_quality and handoff is None
+            and detector_state is None and candidate_count == 1
+            and competition_ok and not blocked and not reliable_partial_conflict
+            and self._quality_ok(confidence, area, min_confidence=.50)
+            and formal_detection_continuous(metadata, state, local,
+                confidence=confidence, gallery_distance=gallery_full))
         pair = memory.paired_recent_evidence(feature, partial_feature, metadata) if memory else {}
-        if (state and state.get('independent_verified') and not searching and pair.get('qualified')
+        if (motion_geometry is None and handoff is None and detector_state is None
+                and standard_quality
+                and metadata.get('quality_bbox_ok') is True
+                and state and state.get('independent_verified') and not searching and pair.get('qualified')
                 and competition_ok and not explicit_conflict and local.get('ok') is True
                 and track_id not in self._mapped_geometry_conflicts
                 and identity not in self._geometry_revoked_uids
@@ -2391,27 +2722,63 @@ class IdentityBank:
             return None
         current = dict(metadata)
         current['quality_bbox_ok'] = bool(current.get('quality_bbox_ok') is True
-                                          and self._quality_ok(confidence, area))
+                                          and (standard_quality or formal_recheck))
+        crop_recheck = bool(handoff is None and self._quality_ok(confidence, area)
+                            and not blocked and not reliable_partial_conflict and competition_ok
+                            and crop_reverification_eligible(current, state, local))
+        # Only the untouched identity gallery can support the extended route.
+        # ``full`` may have been reduced by a follow-only reference above; it
+        # must not turn a candidate's own recent appearance into trusted proof.
+        crop_reverified = bool(crop_recheck and 0 <= gallery_full <= .30)
+        crop_continuation = bool(handoff is None and self._quality_ok(confidence, area)
+                                 and (cropped_follow_continuous(current, state, local)
+                                      or crop_reverified))
+        if crop_continuation:
+            # Only the follow-only evaluator sees the qualified permission;
+            # raw quality diagnostics and all gallery metadata stay unchanged.
+            current.update(quality_bbox_ok=True, bbox_quality_tier='strong')
+            local = cropped_visibility_geometry(current, state, local)
         decision = evaluate_similar_follow(
             uid=identity, track_id=track_id, current=current, geometry=local,
             competition_ok=competition_ok,
-            blocked=bool(explicit_conflict or track_id in self._mapped_geometry_conflicts
-                         or identity in self._geometry_revoked_uids),
+            blocked=blocked,
             full_distance=full,
             direction_compatible=metadata.get('search_direction_compatible') if searching else True,
-            partial_conflict=bool(reliable.get('distance') is not None
-                                  and reliable['distance'] > max(.55, self.config.partial_match_threshold+.10)),
+            partial_conflict=reliable_partial_conflict,
             state=state, entry_limit=self.config.similar_follow_entry_threshold,
             retain_limit=self.config.similar_follow_retain_threshold,
-            max_gap=self.config.similar_follow_max_gap_sec)
+            max_gap=self.config.similar_follow_max_gap_sec,
+            handoff_from_track_id=handoff[1] if handoff is not None else None,
+            handoff_gallery_distance=gallery_full if handoff is not None else None)
         diagnostics['similar_follow'] = dict(status=decision.status, reason=decision.reason,
             full_distance=full, reference_cap=reference_cap, gallery_distance=_finite_float(entry.distance(feature)),
             learning_allowed=False, capture_frame_id=metadata.get('capture_frame_id'),
             count=(decision.state or {}).get('count', 0))
-        if decision.state is None:
+        if detector_state is not None:
+            diagnostics['similar_follow']['detector_position_bridge'] = dict(
+                verified_capture=detector_position_bridge['proof'].verified.capture,
+                position_capture=state['last_cap'], current_capture=metadata.get('capture_frame_id'),
+                original_deadline=detector_position_bridge['proof'].deadline,
+                learning_allowed=False)
+        retain_crop_observation = bool(decision.status == 'reject'
+            and decision.reason == 'observation_unverified' and crop_recheck
+            and gallery_full <= self.config.similar_follow_retain_threshold)
+        if retain_crop_observation:
+            # Inconclusive current crop: preserve the already observed local
+            # candidate only, without advancing CAP/time or granting identity.
+            # The existing bounded missing-observation cleanup still applies.
+            diagnostics['similar_follow']['observation_retained'] = True
+        elif decision.state is None:
             self._similar_follow_states.pop(key, None)
         else:
             self._similar_follow_states[key] = decision.state
+            if decision.status in ('observe', 'follow'):
+                # Keep independent-gallery provenance separate from ``full``,
+                # which may include weaker follow-only candidate references.
+                decision.state['gallery_distance'] = gallery_full
+                decision.state['last_strong_timestamp'] = (
+                    state.get('last_strong_timestamp', state['last_timestamp'])
+                    if crop_continuation else now)
         if decision.status == 'reject':
             if explicit_conflict:
                 diagnostics['identity_control_rejected'] = True
@@ -2430,9 +2797,31 @@ class IdentityBank:
                 identity_control_rejected=True)
             diagnostics['identity_control_rejected'] = True
             return 0
+        if handoff is not None:
+            self._similar_follow_states.pop((identity, handoff[1]), None)
+            diagnostics['similar_follow']['handoff_from_track_id'] = handoff[1]
+            diagnostics['similar_follow']['handoff_reference_cap'] = state['last_cap']
+            diagnostics['similar_follow']['handoff_gap_ms'] = 1000.*(now-state['last_timestamp'])
+            diagnostics['similar_follow']['handoff_gallery_distance'] = gallery_full
+        if formal_recheck:
+            diagnostics['similar_follow']['formal_detection_reverified'] = True
+            diagnostics['similar_follow']['detector_confidence'] = float(confidence)
+        if crop_continuation:
+            diagnostics['similar_follow']['crop_continuation'] = True
+            diagnostics['similar_follow']['original_quality_reason'] = metadata.get('quality_bbox_reason')
+            if crop_reverified:
+                diagnostics['similar_follow'].update(
+                    crop_current_reverified=True, crop_gallery_distance=gallery_full,
+                    crop_reference_age_ms=1000.*(now-state.get('last_strong_timestamp', state['last_timestamp'])),
+                    crop_observation_gap_ms=1000.*(now-state['last_timestamp']))
+            if mapped_crop_seed is not None:
+                diagnostics['similar_follow']['mapped_crop_origin_cap'] = mapped_crop_seed['last_cap']
         # No old suspect or stored geometry may turn this weaker claim into
         # a learning parent. Keep the independently trusted anchor unchanged.
-        verified_bridge = bool(state and state.get('independent_verified') and pair.get('qualified')
+        verified_bridge = bool(not crop_continuation and not formal_recheck
+                               and motion_geometry is None and handoff is None
+                               and detector_state is None
+                               and state and state.get('independent_verified') and pair.get('qualified')
                                and not self._reacquire_quarantine.is_held(identity))
         if not verified_bridge:
             self._similar_learning_fences.add(identity)
@@ -2443,8 +2832,11 @@ class IdentityBank:
                 identity, track_id, metadata.get('capture_frame_id'), now, frame_index)
         # Regain learning eligibility only from independently approved paired
         # templates, through the existing quarantine proof. Following itself
-        # never pauses while that proof is accumulated; this frame never writes.
-        independent_pair = bool(pair.get('qualified') and competition_ok and local.get('ok') is True)
+        # never pauses while that proof is accumulated.
+        independent_pair = bool(not crop_continuation and not formal_recheck
+                                and motion_geometry is None and handoff is None
+                                and detector_state is None and pair.get('qualified')
+                                and competition_ok and local.get('ok') is True)
         self._observe_template_quarantine(uid=identity, track_id=track_id, feature=feature,
             confidence=confidence, area=area, frame_index=frame_index,
             bbox_quality_ok=independent_pair, bbox_quality_tier='strong', metadata=metadata,
@@ -2458,6 +2850,10 @@ class IdentityBank:
             self._reacquire_control_suspects.pop(identity, None)
             entry.last_strong_observation = dict(local['current'])
             diagnostics['similar_follow']['independent_verification_recovered'] = True
+        if self.config.template_learning_guard_enable:
+            self._observe_independent_follow_learning(
+                entry, feature, partial_feature, frame_index, metadata, diagnostics,
+                independently_verified=independent_pair)
         for other_track, other_uid in list(self.track_to_uid.items()):
             if other_track != track_id and other_uid == identity:
                 self.track_to_uid.pop(other_track, None)
@@ -2471,6 +2867,11 @@ class IdentityBank:
         self._set_geometry_diagnostics(diagnostics, local)
         diagnostics.update(identity_control_rejected=False, similar_follow_active=True,
                            template_update_quarantined=True)
+        # The runtime may consume this current completed two-capture proof;
+        # it must not restart confirmation merely because the reason changed.
+        # Position-only / probe / observe results never receive this right.
+        diagnostics['similar_follow'].update(completed_confirmation=True,
+            capture_timestamp=now, raw_track_id=track_id)
         metadata['similar_follow_active'] = True
         self.last_assignments[track_id] = dict(uid=identity, mapped_uid=identity,
             reason='mapped_similar_follow' if uid == identity else 'similar_follow_reacquire',
@@ -2502,6 +2903,7 @@ class IdentityBank:
         preferred_uid: Optional[int],
         preferred_candidate_ok: bool,
         diagnostics: dict,
+        detector_position_bridge: Optional[dict] = None,
     ) -> int:
         track_id = int(track_id)
         if not self.config.enabled:
@@ -2516,6 +2918,13 @@ class IdentityBank:
         geometry_review = self.review_mapped_geometry(
             track_id, metadata, frame_index, commit=True,
         )
+        if geometry_review.get('mapped_geometry_observation_only'):
+            self._set_geometry_diagnostics(diagnostics, geometry_review)
+            diagnostics['identity_control_rejected'] = True
+            self.last_assignments[track_id] = dict(uid=0, mapped_uid=uid,
+                reason='mapped_edge_observation_only', bank_updated=False,
+                bbox_quality_ok=False, bbox_quality_tier='weak', identity_control_rejected=True)
+            return 0
         if geometry_review.get("mapped_geometry_blocked"):
             self._set_geometry_diagnostics(diagnostics, geometry_review)
             self.last_assignments[track_id] = {
@@ -2589,9 +2998,20 @@ class IdentityBank:
         similar_uid = self._evaluate_similar_follow(uid=uid, preferred_uid=preferred_uid,
             track_id=track_id, feature=feature, partial_feature=partial_feature, metadata=metadata,
             frame_index=frame_index, candidate_count=candidate_count, confidence=confidence,
-            area=area, diagnostics=diagnostics)
+            area=area, diagnostics=diagnostics, detector_position_bridge=detector_position_bridge)
         if similar_uid is not None:
             return similar_uid
+        if metadata.get('low_score_continuation') is True:
+            # The detector's secondary association can observe an existing
+            # raw track only; neither legacy mapped nor enrollment paths may
+            # turn that match into a current identity/motion permission.
+            self.last_assignments[track_id] = dict(uid=0, mapped_uid=uid,
+                reason='low_score_observation_only', bank_updated=False,
+                bbox_quality_ok=False, bbox_quality_tier='weak', identity_control_rejected=True)
+            diagnostics.update(identity_control_rejected=True,
+                _template_observation_evaluated=True,
+                template_learning=dict(status='frozen', reason='low_score_observation_only'))
+            return 0
         if self._reject_archive_only_reacquire(
             track_id, uid, preferred_uid, feature, partial_feature, metadata,
             diagnostics, candidate_count=candidate_count,
@@ -3838,6 +4258,70 @@ class IdentityBank:
         diagnostics["reacquire_geometry_ok"] = geometry["ok"]
         diagnostics["reacquire_geometry_reason"] = geometry["reason"]
 
+    def _independent_revoked_owner_evidence(
+        self, uid, track_id, frame_index, metadata, full_feature, partial_feature,
+        *, match_source, candidate_count, bbox_quality_ok,
+    ):
+        """Recheck a new source against approved appearance after geometry loss.
+
+        A crop/position failure is not an everlasting ban on the owner. This
+        entrance needs two current descriptors against comparable approved
+        templates; it never uses the candidate itself as an identity anchor.
+        Measured person contradictions and their raw-ID aliases remain held.
+        """
+        cfg = self.config
+        entry = self.identities.get(uid)
+        memory = None if entry is None else entry.template_memory
+        conflicts = [(track, held) for track, held in self._mapped_geometry_conflicts.items()
+                     if held.get("uid") == uid]
+        origins = [(track, held) for track, held in conflicts
+                   if held.get("search_contradiction") is False
+                   and held.get("origin_geometry_reason") == "center_jump,area_change"
+                   and (held.get("reference") or {}).get("frame_index")
+                       == self._geometry_revoked_uids.get(uid)]
+        proof = {"verified": False, "reason": "independent_source_required",
+                 "learning_allowed": False}
+        if (not origins or track_id in self._mapped_geometry_conflicts
+                or any(self._same_conflicted_candidate(uid, held, metadata, frame_index)
+                       for _, held in conflicts)
+                or uid in self._reacquire_control_suspects):
+            return proof
+        if not (cfg.template_memory_enable and cfg.template_crosscheck_enable
+                and cfg.appearance_region_safety_enable and cfg.partial_appearance_enable
+                and memory is not None and full_feature is not None and partial_feature is not None
+                and metadata.get("search_reacquire_context_active") is True
+                and metadata.get("is_fresh") is True and bbox_quality_ok
+                and metadata.get("quality_bbox_ok") is True
+                and metadata.get("bbox_quality_tier") == "strong"
+                and not metadata.get("search_observation_only")
+                and not metadata.get("preferred_search_low_confidence")
+                and _finite_float(metadata.get("capture_frame_id")) is not None
+                and template_timestamp(metadata) is not None
+                and _finite_float(metadata.get("integrated_yaw_deg")) is not None
+                and not str(match_source or "").startswith("soft_")
+                and TemplateMemory.partial_usable(metadata)
+                and TemplateMemory.crop_sides(metadata) == (False, False)
+                and metadata.get("identity_competition")
+                and self._reacquire_competition(uid, frame_index, candidate_count, metadata)[0]):
+            proof["reason"] = "current_paired_evidence_required"
+            return proof
+        full = self._authorization_full_distance(entry, full_feature, metadata)
+        recent = memory.evidence(full_feature, metadata)
+        partial = memory.evidence(partial_feature, metadata, "partial",
+                                  reliable_only=True, comparable_only=True)
+        full_limit = min(.20, cfg.preferred_search_reacquire_threshold)
+        partial_limit = min(.40, cfg.partial_match_threshold, cfg.partial_confirm_threshold)
+        verified = bool(self._match_source(uid, full_feature) == "strong"
+            and math.isfinite(full) and 0 <= full <= full_limit
+            and recent["distance"] is not None and recent["distance"] <= full_limit
+            and partial["distance"] is not None and partial["distance"] <= partial_limit)
+        proof.update(verified=verified,
+            reason="independent_paired_appearance" if verified else "paired_appearance_rejected",
+            full_distance=_finite_float(full), recent_full_distance=recent["distance"],
+            partial_distance=partial["distance"], partial_comparable_caps=partial["comparable_caps"],
+            origin=tuple(sorted((track, held.get("rejected_frame")) for track, held in origins)))
+        return proof
+
     def _observe_late_search_candidate(
         self,
         *,
@@ -3869,6 +4353,7 @@ class IdentityBank:
                 "late_candidate_rejection": "search_candidate_excluded",
                 "old_anchor_ignored": False,
             }
+        independent_recovery = None
         if uid in self._geometry_revoked_uids:
             # A revoked mapping is not a permanent ban on the correct owner.
             # However, the candidate's OWN two-frame continuity cannot erase
@@ -3918,12 +4403,18 @@ class IdentityBank:
                 full_distance=full, capture_delta_sec=age, yaw_delta_deg=turn,
                 yaw_compensated_center_jump_ratio=jump, area_similarity=similarity))
             if not verified:
-                self._clear_late_handoff_for_uid(uid)
-                return 0, 0, {
-                    **geometry, "ok": False, "reason": "revoked_owner_candidate_unqualified",
-                    "late_candidate_rejection": "revoked_owner_requires_trusted_geometry",
-                    "old_anchor_ignored": False,
-                }
+                independent_recovery = self._independent_revoked_owner_evidence(
+                    uid, track_id, frame_index, metadata, full_feature, partial_feature,
+                    match_source=match_source, candidate_count=candidate_count,
+                    bbox_quality_ok=bbox_quality_ok)
+                geometry["independent_recovery_evidence"] = independent_recovery
+                if not independent_recovery["verified"]:
+                    self._clear_late_handoff_for_uid(uid)
+                    return 0, 0, {
+                        **geometry, "ok": False, "reason": "revoked_owner_candidate_unqualified",
+                        "late_candidate_rejection": "revoked_owner_requires_trusted_geometry",
+                        "old_anchor_ignored": False,
+                    }
         cfg = self.config
         current = geometry.get("current")
         # A stale anchor is expected after a sweep.  During an active search,
@@ -4005,11 +4496,19 @@ class IdentityBank:
             return None
 
         pending = self.pending_late_handoffs.get(int(track_id))
+        if independent_recovery and pending is not None:
+            # A weak observation, another origin, or a repeated capture cannot
+            # supply the first of this independent two-capture appearance pair.
+            capture = _finite_float(metadata.get("capture_frame_id"))
+            if (pending.independent_recovery_origin != independent_recovery["origin"]
+                    or pending.capture_frame_id is None or capture <= pending.capture_frame_id):
+                self.pending_late_handoffs.pop(int(track_id), None)
+                pending = None
         previous_track_id = int(track_id)
         # Weak (edge/partial) evidence and a later strong observation belong
         # to one confirmation chain.  Promote a continuous weak sample into
         # the late-candidate state instead of restarting at 1/2.
-        if pending is None:
+        if pending is None and not independent_recovery:
             for other_track_id, weak_pending in list(self.pending_weak_handoffs.items()):
                 if int(weak_pending.uid) != uid:
                     continue
@@ -4044,7 +4543,7 @@ class IdentityBank:
                     int(weak_pending.streak),
                 )
                 break
-        if pending is None:
+        if pending is None and not independent_recovery:
             for other_track_id, other_pending in list(self.pending_late_handoffs.items()):
                 if int(other_pending.uid) != uid or int(other_track_id) == int(track_id):
                     continue
@@ -4063,6 +4562,7 @@ class IdentityBank:
                     break
 
         local_gap = None if pending is None else int(frame_index) - int(pending.last_frame)
+        previous_capture = None if pending is None else pending.capture_frame_id
         local_capture_delta = None
         local_center_jump = None
         local_area_similarity = None
@@ -4099,6 +4599,10 @@ class IdentityBank:
                 and compensated_center_jump <= float(cfg.handoff_geometry_max_center_jump_ratio)
                 and local_area_similarity >= float(cfg.handoff_geometry_min_area_similarity)
             )
+            if independent_recovery:
+                local_ok = bool(local_ok and local_gap == 1
+                    and compensated_center_jump <= min(.15, cfg.handoff_geometry_max_center_jump_ratio)
+                    and local_area_similarity >= max(.65, cfg.handoff_geometry_min_area_similarity))
 
         if not local_ok:
             self._clear_late_handoff_for_uid(uid)
@@ -4118,6 +4622,9 @@ class IdentityBank:
                     None if partial_feature is None else _normalize_feature(partial_feature)
                 ),
                 integrated_yaw_deg=current_yaw,
+                independent_recovery_origin=(None if independent_recovery is None
+                                             else independent_recovery["origin"]),
+                capture_frame_id=_finite_float(metadata.get("capture_frame_id")),
             )
         else:
             aggregate_partial_distance = None
@@ -4211,6 +4718,7 @@ class IdentityBank:
             pending.area = float(current_area)
             pending.capture_timestamp = current_timestamp
             pending.integrated_yaw_deg = current_yaw
+            pending.capture_frame_id = _finite_float(metadata.get("capture_frame_id"))
             self.pending_late_handoffs.pop(previous_track_id, None)
         self.pending_late_handoffs[int(track_id)] = pending
 
@@ -4250,10 +4758,33 @@ class IdentityBank:
                 aggregate_partial_distance
             )
         if confirmed:
+            if independent_recovery:
+                late_geometry["independent_recovery_confirmation"] = dict(
+                    uid=uid, raw_track_id=int(track_id),
+                    capture_frame_id=metadata["capture_frame_id"],
+                    capture_timestamp=current_timestamp, frame_index=int(frame_index),
+                    count=int(pending.streak), completed_confirmation=True,
+                    learning_allowed=False)
             for other_track_id, other_uid in list(self.track_to_uid.items()):
                 if int(other_track_id) != int(track_id) and int(other_uid) == uid:
                     self.track_to_uid.pop(int(other_track_id), None)
             self._bind_reacquired_identity(uid, track_id, frame_index, sample_metadata)
+            if independent_recovery and cfg.similar_follow_enable:
+                # Continue the completed independent pair on the existing
+                # follow-only path. No descriptor is stored as a gallery or
+                # follow reference; every later frame still checks the gallery.
+                self._similar_follow_states[(uid, int(track_id))] = dict(
+                    uid=uid, track_id=int(track_id), count=2, active=True,
+                    entry_direction_compatible=True, origin_cap=previous_capture,
+                    origin_timestamp=previous_timestamp,
+                    last_cap=metadata["capture_frame_id"], last_timestamp=current_timestamp,
+                    last_qualified_cap=metadata["capture_frame_id"],
+                    last_qualified_timestamp=current_timestamp,
+                    last_strong_timestamp=current_timestamp,
+                    full_distance=independent_recovery["full_distance"],
+                    gallery_distance=independent_recovery["full_distance"],
+                    observation=deepcopy(metadata), independent_recovery=True)
+                self._similar_learning_fences.add(uid)
             self._remember_track_seen(track_id, uid, frame_index)
             self.pending_late_handoffs.pop(int(track_id), None)
             self._clear_late_handoff_for_uid(uid, keep_track_id=int(track_id))
@@ -5362,12 +5893,62 @@ class IdentityBank:
             diagnostics['template_learning'] = dict(status='frozen', reason=(
                 'similar_follow_only' if entry.uid in self._similar_learning_fences else 'pose_recovery_pending'))
             return False
+        return self._observe_paired_learning(entry, feature, partial_feature, frame_index,
+                                             metadata, diagnostics,
+                                             commit_allowed=self._should_update(frame_index))
+
+    def _observe_independent_follow_learning(self, entry, feature, partial_feature,
+                                             frame_index, metadata, diagnostics,
+                                             *, independently_verified):
+        """Retain learning proof while the separate identity quarantine runs.
+
+        Only an already accepted current follow observation reaches here. Its
+        independent proof excludes candidate references, crop/position bridges
+        and handoffs. The existing learning guard still checks immutable mature
+        full/torso parents and adjacent appearance; pending pairs never match.
+        """
+        risk = metadata.get('template_learning_risk') or {}
+        full_distance = (_finite_float(self._authorization_full_distance(entry, feature, metadata))
+                         if feature is not None else None)
+        eligible = bool(independently_verified
+            and full_distance is not None and full_distance <= float(self.config.update_threshold)
+            and metadata.get('is_fresh') is True
+            and metadata.get('quality_bbox_ok') is True
+            and metadata.get('bbox_quality_tier') == 'strong'
+            and risk.get('observed') is True and risk.get('risky') is False
+            and not metadata.get('search_reacquire_context_active')
+            and not metadata.get('appearance_pose_retention')
+            and entry.uid not in self._pose_learning_fences
+            and entry.uid not in self._reacquire_control_suspects
+            and entry.uid not in self._geometry_revoked_uids
+            and metadata.get('track_id') not in self._mapped_geometry_conflicts)
+        # Review completion need not coincide with frame % interval == 0.
+        # Measure the same write budget from the actual last pair commit so a
+        # one-frame independently verified window is not lost to phase alone.
+        allowed = bool(eligible and not self._reacquire_quarantine.is_held(entry.uid)
+            and entry.uid not in self._similar_learning_fences
+            and frame_index-entry.last_frame >= max(1, int(self.config.update_interval)))
+        review = {}
+        changed = self._observe_paired_learning(entry, feature, partial_feature, frame_index,
+            metadata, review, commit_allowed=allowed, eligible_override=eligible)
+        diagnostics['independent_learning_review'] = dict(
+            eligible=eligible, commit_allowed=allowed,
+            **review.get('template_learning', {}))
+        if changed:
+            diagnostics.update(review)
+            diagnostics['similar_follow']['learning_permission'] = 'independent_gallery_pair'
+        return changed
+
+    def _observe_paired_learning(self, entry, feature, partial_feature, frame_index,
+                                 metadata, diagnostics, *, commit_allowed,
+                                 eligible_override=True):
+        """Shared transactional writer; callers supply only learning authority."""
         metadata = dict(metadata or {})
         risk = metadata.get("template_learning_risk") or {}
         partial_ok = bool(self.config.partial_appearance_enable and partial_feature is not None
                           and TemplateMemory.partial_usable(metadata))
         partial_distance = entry.partial_distance(partial_feature) if partial_ok else None
-        eligible = bool(entry.template_memory is not None and partial_ok
+        eligible = bool(eligible_override and entry.template_memory is not None and partial_ok
                         and risk.get("observed") is not False
                         and metadata.get("quality_bbox_ok") is not False
                         and metadata.get("bbox_quality_tier") not in ("weak", "reject")
@@ -5381,7 +5962,7 @@ class IdentityBank:
             capture_timestamp=template_timestamp(metadata), full_feature=feature,
             partial_feature=partial_feature, mature_pairs=self._learning_pairs(entry),
             eligible=eligible, is_fresh=metadata.get("is_fresh") is True,
-            commit_allowed=self._should_update(frame_index),
+            commit_allowed=commit_allowed,
             risk_reasons=(str(risk.get("reason") or "overlapping_people"),) if risk.get("risky") is True else ())
         diagnostics["template_learning"] = dict(
             status="accepted" if decision.allow else "frozen" if decision.risk_active

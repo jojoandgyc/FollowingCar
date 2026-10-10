@@ -25,6 +25,106 @@ class HistoricalDirectionCandidate:
     score: float
     frame_width: int
     candidate_count: int = 1
+    source: str = ""
+    vehicle_yaw_deg: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class AssociatedDirectionChain:
+    """Anchor-associated POSITION only, never identity or motion permission."""
+    uid: int
+    loss_capture_frame_id: int
+    anchor_capture_frame_id: int
+    anchor_timestamp: float
+    anchor_bbox: tuple
+    captures: Tuple[int, ...]
+    first_timestamp: float
+    last_timestamp: float
+    direction: str
+
+
+def associate_direction_chain(candidates, *, anchor, uid, loss_capture_frame_id,
+                              selected_capture_frame_ids, now, max_age_sec=.70,
+                              max_capture_gap=6, max_center_jump_ratio=.30,
+                              min_area_similarity=.45, camera_hfov_deg=60.):
+    """Qualify a complete independent detector chain against a trusted anchor.
+
+    The weaker legacy evaluator may skip ambiguous frames or lack an anchor.
+    Such a result remains fallback-only. Upgrading its priority requires all
+    intervening available slots to be formal, unique and geometrically linked.
+    """
+    def finite(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    try:
+        ids = tuple(selected_capture_frame_ids)
+        if (anchor is None or anchor.state != "visible" or anchor.target_id != uid
+                or not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0
+                or len(ids) < 2 or any(not isinstance(cap, int) or isinstance(cap, bool) for cap in ids)
+                or tuple(sorted(set(ids))) != ids
+                or not anchor.capture_frame_id < ids[0] <= ids[-1] < loss_capture_frame_id
+                or not finite(now) or not finite(anchor.timestamp)
+                or not finite(camera_hfov_deg) or not 1. <= camera_hfov_deg <= 180.):
+            return None
+        # Include unknown/competing slots; filtering them out would allow a
+        # plausible stranger after an ambiguous crossing to claim continuity.
+        window = sorted((item for item in candidates
+            if anchor.capture_frame_id < item.capture_frame_id <= ids[-1]),
+            key=lambda item: item.capture_frame_id)
+        if tuple(item.capture_frame_id for item in window) != ids:
+            return None
+        ax1, ay1, ax2, ay2 = anchor.bbox  # X normalized, Y in image pixels.
+        if (not all(finite(v) for v in (ax1, ay1, ax2, ay2))
+                or not 0 <= ax1 < ax2 <= 1 or ay1 < 0 or ay2 <= ay1):
+            return None
+        previous_cap, previous_stamp = anchor.capture_frame_id, anchor.timestamp
+        previous_center = (ax1 + ax2) * .5
+        previous_area = (ax2-ax1)*(ay2-ay1)
+        previous_yaw = anchor.vehicle_yaw_deg
+        if previous_yaw is not None and not finite(previous_yaw):
+            return None
+        width = None
+        for item in window:
+            if (not isinstance(item, HistoricalDirectionCandidate)
+                    or item.source != "detector_formal_person_side"
+                    or item.state != "visible" or item.candidate_count != 1
+                    or isinstance(item.candidate_count, bool)
+                    or not finite(item.timestamp) or not finite(item.score)
+                    or not .50 <= item.score <= 1.
+                    or not 0 < item.capture_frame_id-previous_cap <= max_capture_gap
+                    or not 0 < item.timestamp-previous_stamp <= .25
+                    or not 0 <= now-item.timestamp <= max_age_sec
+                    or not finite(item.frame_width) or item.frame_width <= 0):
+                return None
+            if item.vehicle_yaw_deg is not None and not finite(item.vehicle_yaw_deg):
+                return None
+            if width is not None and item.frame_width != width:
+                return None
+            width = item.frame_width
+            x1, y1, x2, y2 = item.bbox
+            if (not all(finite(v) for v in (x1,y1,x2,y2))
+                    or not 0 <= x1 < x2 <= width or y1 < 0 or y2 <= y1):
+                return None
+            center, area = (x1+x2)/(2.*width), (x2-x1)*(y2-y1)/width
+            predicted_center = previous_center
+            if previous_yaw is not None and item.vehicle_yaw_deg is not None:
+                if not finite(previous_yaw) or not finite(item.vehicle_yaw_deg):
+                    return None
+                yaw_delta = item.vehicle_yaw_deg - previous_yaw
+                if abs(yaw_delta) > 30.:
+                    return None
+                predicted_center -= yaw_delta/camera_hfov_deg
+            if (abs(center-predicted_center) > max_center_jump_ratio
+                    or min(area,previous_area)/max(area,previous_area) < min_area_similarity):
+                return None
+            previous_cap, previous_stamp = item.capture_frame_id, item.timestamp
+            previous_center, previous_area, previous_yaw = center, area, item.vehicle_yaw_deg
+        return AssociatedDirectionChain(uid, loss_capture_frame_id,
+            anchor.capture_frame_id, anchor.timestamp, tuple(anchor.bbox), ids,
+            window[0].timestamp, window[-1].timestamp,
+            "left" if previous_center < .5 else "right")
+    except (AttributeError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
 
 
 @dataclass(frozen=True)

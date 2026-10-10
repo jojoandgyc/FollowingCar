@@ -28,6 +28,123 @@ class HandoffZeroEvidence:
     quiet_samples: tuple = ()
 
 
+# This is a low-residual handoff, NOT proof of a stationary chassis. It only
+# avoids upgrading an already-applied observation zero into a second parking
+# cycle; fresh identity, Depth and wheel-reversal checks remain independent.
+OBSERVATION_ZERO_HANDOFF_MAX_SEC = .30
+OBSERVATION_ZERO_HANDOFF_FEEDBACK_SEC = .10
+OBSERVATION_ZERO_HANDOFF_MAX_WHEEL_RPM = 3.
+OBSERVATION_ZERO_HANDOFF_MAX_YAW_DPS = 10.
+
+
+@dataclass(frozen=True)
+class ObservationZeroEvidence:
+    episode: tuple
+    receipt: object
+    stop_generation: int
+    completed_at: float
+
+
+def observation_zero_episode(runtime, previous=None):
+    """Only the existing finite search-observation episode can supply zero."""
+    owner, backend = runtime.owner, runtime.backend
+    controller = getattr(owner, "_follow_controller", None)
+    uid = getattr(controller, "active_target_id", None)
+    requested = getattr(owner, "_search_retry_zero_requested_at", None)
+    epoch = getattr(owner, "_search_epoch", None)
+    # Confirmed identity releases the detector's timer before it asks the
+    # brake gate about residual motion. That release is not a new motor
+    # action: retain the immutable completed-zero origin, never invent one.
+    if requested == 0. and previous is not None:
+        requested = previous.episode[2]
+    if (uid is None or not isinstance(epoch, int) or isinstance(epoch, bool)
+            or not _finite_values(requested) or requested <= 0
+            or not getattr(owner, "running", False)
+            or getattr(owner, "search_state", None) != "searching"
+            or getattr(controller, "search_state", None) != "searching"
+            or any(getattr(owner, name, False) for name in (
+                "_explicit_stop_requested", "_runtime_shutdown_requested",
+                "_near_yaw_park_request", "_brake_hold_active",
+                "stop_action_execution", "person_detected_flag"))
+            or getattr(runtime, "_search_reacquire_brake_request", None) is not None
+            or any(getattr(backend, name, False) for name in (
+                "motion_write_fault", "parking_release_fault", "normal_zero_hold",
+                "parking_current_a", "_parking_current_uncertain"))):
+        return None
+    return epoch, uid, requested
+
+
+def note_observation_zero(runtime, *, now, first_ack, previous_receipt):
+    """Bind successful observation zeros, never an arbitrary historical zero.
+
+    Caller holds motor_io_lock after a completed speed write. Repeated zero
+    receipts may continue the chain, but cannot move its original time limit.
+    An intervening nonzero, STOP, in-flight/failed write breaks it permanently
+    for this observation; only a genuinely new observation may create one.
+    """
+    previous = getattr(runtime, "_search_observation_zero_evidence", None)
+    runtime._search_observation_zero_evidence = None
+    episode = observation_zero_episode(runtime, previous if not first_ack else None)
+    backend = runtime.backend
+    receipt = getattr(backend, "last_speed_receipt", None)
+    submission = getattr(backend, "last_speed_write", None)
+    completed = getattr(receipt, "completed_at", None)
+    generation = getattr(backend, "stop_write_generation", None)
+    if (episode is None or receipt is None or submission is None
+            or getattr(submission, "completed_receipt", None) is not receipt
+            or (getattr(receipt, "left_rpm", None), getattr(receipt, "right_rpm", None)) != (0, 0)
+            or not _finite_values(completed, now, generation)
+            or not episode[2] <= completed <= now
+            or getattr(submission, "stop_generation", None) != generation):
+        return
+    if first_ack:
+        runtime._search_observation_zero_evidence = ObservationZeroEvidence(
+            episode, receipt, generation, completed)
+    elif (previous is not None and previous.episode == episode
+            and previous.stop_generation == generation
+            and previous_receipt is previous.receipt
+            and receipt.sequence == previous.receipt.sequence + 1):
+        runtime._search_observation_zero_evidence = ObservationZeroEvidence(
+            episode, receipt, generation, previous.completed_at)
+
+
+def observation_zero_handoff(runtime, *, uid, feedback, now):
+    """Current low residual after our zero, not stillness or motion permission."""
+    evidence = getattr(runtime, "_search_observation_zero_evidence", None)
+    backend = runtime.backend
+    episode = observation_zero_episode(runtime, evidence)
+    if (evidence is None or episode != evidence.episode or uid != episode[1]
+            or getattr(backend, "last_speed_receipt", None) is not evidence.receipt
+            or getattr(backend, "stop_write_generation", None) != evidence.stop_generation
+            or getattr(getattr(backend, "last_speed_write", None), "completed_receipt", None)
+                is not evidence.receipt):
+        runtime._search_observation_zero_evidence = None
+        return None
+    if not _finite_values(now) or not 0 <= now-evidence.completed_at <= OBSERVATION_ZERO_HANDOFF_MAX_SEC:
+        runtime._search_observation_zero_evidence = None
+        return None
+    if (feedback is None or not getattr(feedback, "trustworthy", False)
+            or not getattr(feedback, "yaw_rate_confirmed", False)
+            or getattr(feedback, "left_error", None) != 0
+            or getattr(feedback, "right_error", None) != 0):
+        return None
+    values = tuple(getattr(feedback, name, None) for name in (
+        "timestamp", "left_read_started", "left_read_finished", "right_read_started",
+        "right_read_finished", "left_forward_rpm", "right_forward_rpm",
+        "raw_yaw_rate_right_dps"))
+    if not _finite_values(*values):
+        return None
+    stamp, ls, lf, rs, rf, left, right, yaw = values
+    # Use actual post-write encoder reads, not image age, filter lag or the
+    # time at which this producer happened to inspect the cached sample.
+    if not (evidence.completed_at < ls <= lf <= rs <= rf <= stamp <= now
+            and now-stamp <= OBSERVATION_ZERO_HANDOFF_FEEDBACK_SEC
+            and max(abs(left), abs(right)) <= OBSERVATION_ZERO_HANDOFF_MAX_WHEEL_RPM
+            and abs(yaw) <= OBSERVATION_ZERO_HANDOFF_MAX_YAW_DPS):
+        return None
+    return evidence
+
+
 def _finite_values(*values):
     return all(isinstance(v, (int, float)) and math.isfinite(v) for v in values)
 

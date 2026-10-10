@@ -89,7 +89,7 @@ def test_real_producer_calls_real_controller_on_park_and_release(owner, setup, m
     owner._request_near_yaw_park(_intent(owner), 'center_hold')
     assert c._distance_pid._distance_pi._normal_parking
     request = owner._near_yaw_park_request
-    evidence = ParkSettlingEvidence(request, NOW+.01)
+    evidence = ParkSettlingEvidence(request, NOW+.01, require_current_release=True)
     fb = SimpleNamespace(timestamp=NOW+.45, trustworthy=True,
                          left_forward_rpm=-15., right_forward_rpm=15.)
     owner._action_runtime = SimpleNamespace(near_yaw_park_motion_ready=
@@ -97,7 +97,12 @@ def test_real_producer_calls_real_controller_on_park_and_release(owner, setup, m
     monkeypatch.setattr(runtime.time, 'monotonic', lambda: NOW+.46)
     assert not owner._release_near_yaw_park(capture_id=577, capture_timestamp=NOW+.44,
         reason='qualified_motion', target_id=1, qualified=True, translation_requested=True)
-    monkeypatch.setattr(runtime.time, 'monotonic', lambda: NOW+.52)
+    assert evidence.reason == 'await_current_release'
+    assert c._distance_pid._distance_pi._normal_parking
+    # The completed current/FREE transaction, not an arbitrary 500ms dwell,
+    # unblocks this qualified translation handoff to the independent wheel guard.
+    evidence.mark_current_released(NOW+.46)
+    monkeypatch.setattr(runtime.time, 'monotonic', lambda: NOW+.48)
     assert owner._release_near_yaw_park(capture_id=577, capture_timestamp=NOW+.44,
         reason='qualified_motion', target_id=1, qualified=True, translation_requested=True)
     assert not c._distance_pid._distance_pi._normal_parking

@@ -10,6 +10,8 @@ from typing import Any, List, Optional, Sequence, Set, Tuple
 
 from .deepsort import DeepSort, DeepSortConfig
 from .deepsort.track import TrackState
+from .deepsort.provisional import ProvisionalAssociationCache, capture_clock
+from .similar_follow import cropped_follow_continuous
 from .identity_bank import IdentityBank, IdentityBankConfig
 from .candidate_competition import competition_evidence
 from .competition_eligibility import anchored_competitor_exclusions
@@ -19,6 +21,7 @@ from .deepsort.detection import Detection as DeepSortDetection
 from .detector_continuation import (
     DetectorProof, DetectorBackgroundProof, DetectorContinuationPlan,
     FULL_PROOF_TTL_SEC, MAX_FULL_RESULT_AGE_SEC, separated_observations,
+    SIMILAR_MAX_GALLERY_DISTANCE,
     capture_observation, color_signature,
     color_matches, geometry_matches, continuation_reason, finite_number,
 )
@@ -240,6 +243,7 @@ class DeepSortTracker:
                 nn_budget=config.nn_budget,
                 max_bbox_age=config.max_bbox_age,
                 feature_update_interval=config.feature_update_interval,
+                camera_hfov_deg=config.hfov_deg,
             )
         )
         self.identity_bank = IdentityBank(
@@ -335,15 +339,27 @@ class DeepSortTracker:
         self._current_detections = ()
         self._identity_competition = {}
         self.last_identity_observations: List[dict] = []
+        self._provisional_association = ProvisionalAssociationCache()
         self._detector_proof = None
+        self._detector_full_bridge = None
+        self._current_detector_position_bridge = None
         self._detector_epoch = 0
         self._detector_active_uid = 0
+        self._low_score_position_anchor = None
+        self._low_score_position_last = None
+        self._follow_only_position_anchor = None
+        self._follow_only_position_last = None
         self._detector_bank_binding = None
         self._detector_control_assignments = {}
         self.last_detector_continuation_reason = "no_full_verification"
 
     def _clear_detector_continuation(self, reason):
         self._detector_proof = None
+        # A consumed detector position can still link the *next full* frame
+        # captured before its fixed deadline. This does not keep a motion lease
+        # alive after expiry, and negative evidence invalidates it immediately.
+        if reason not in {"detection_gap", "detection_stale", "verification_expired"}:
+            self._detector_full_bridge = None
         self._detector_bank_binding = None
         self._detector_control_assignments.clear()
         self._detector_epoch += 1
@@ -354,6 +370,13 @@ class DeepSortTracker:
         uid = int(uid) if uid is not None and uid > 0 and uid.is_integer() else 0
         if uid != self._detector_active_uid:
             self._clear_detector_continuation("active_uid_changed")
+            self._low_score_position_anchor = None
+            self._low_score_position_last = None
+            anchor = getattr(self, "_follow_only_position_anchor", None)
+            if anchor is not None and uid != anchor["uid"] and (
+                    uid > 0 or self._search_reacquire_uid != anchor["uid"]):
+                self._follow_only_position_anchor = None
+                self._follow_only_position_last = None
             self._detector_active_uid = uid
         return uid
 
@@ -398,8 +421,67 @@ class DeepSortTracker:
                     competition.get("eligibility_reference_cap"))
         return None
 
-    def _detector_identity_block(self, uid, track_id, stamp, backgrounds=()):
+    def _similar_detector_qualified(self, uid, track_id, observation):
+        """Current independent-gallery evidence, never a learning permission.
+
+        An accepted follow-only state already represents two observed captures.
+        Require the current FULL frame's gallery support, not its optional
+        self-reference distance, and preserve its exact raw-track provenance.
+        """
         bank = self.identity_bank
+        assignment = bank.last_assignments.get(track_id, {})
+        detail = assignment.get("similar_follow") or {}
+        state = bank._similar_follow_states.get((uid, track_id))
+        gallery = finite_number(detail.get("gallery_distance"))
+        crop_origin = finite_number((state or {}).get("last_strong_timestamp"))
+        competition = assignment.get("identity_competition") or {}
+        return bool(self.config.identity_similar_follow_enable and observation is not None
+            and assignment.get("reason") == "mapped_similar_follow"
+            and assignment.get("match_source") == "similar_follow"
+            and assignment.get("identity_permission") == "similar_follow"
+            and assignment.get("bank_updated") is False
+            and assignment.get("reacquire_geometry_ok") is True
+            and detail.get("status") == "follow"
+            and detail.get("learning_allowed") is False
+            and detail.get("capture_frame_id") == observation.capture
+            and not detail.get("handoff_from_track_id")
+            and (not detail.get("crop_continuation") or detail.get("crop_current_reverified") is True
+                 or (crop_origin is not None and observation.timestamp < crop_origin + .75))
+            and gallery is not None and 0 <= gallery <= SIMILAR_MAX_GALLERY_DISTANCE
+            and competition.get("passed") is True and competition.get("candidate_count") == 1
+            and isinstance(state, dict) and state.get("active") is True and state.get("count") == 2
+            and state.get("uid") == uid and state.get("track_id") == track_id
+            and state.get("entry_direction_compatible") is True
+            and not state.get("position_only")
+            and state.get("last_cap") == observation.capture
+            and state.get("last_timestamp") == observation.timestamp
+            and tuple((state.get("observation") or {}).get("detector_bbox", ())) == observation.bbox)
+
+    def _detector_edge_mask(self, observation):
+        margin = max(0., float(self.config.identity_edge_margin_ratio))
+        x1, y1, x2, y2 = observation.bbox
+        return (x1 <= observation.width*margin, y1 <= observation.height*margin,
+                observation.width-x2 <= observation.width*margin,
+                observation.height-y2 <= observation.height*margin)
+
+    def _detector_quality_allowed(self, observation, proof=None):
+        if observation.score < max(self.config.min_confidence, self.config.identity_min_confidence):
+            return False
+        good, reason = self._bbox_quality(observation.bbox, observation.width, observation.height)
+        if proof is None or proof.permission != "similar_follow":
+            return good
+        # A new clipping boundary is an event requiring full appearance. Only
+        # an already FULL-accepted same-edge crop can keep its weaker lane.
+        if self._detector_edge_mask(observation) != proof.crop_edge_mask:
+            return False
+        return good or (reason == "edge_touch>2" and sum(proof.crop_edge_mask) == 3
+                        and proof.crop_edge_mask[0] != proof.crop_edge_mask[2])
+
+    def _detector_identity_block(self, uid, track_id, stamp, backgrounds=(), *, follow_observation=None):
+        bank = self.identity_bank
+        follow_only = follow_observation is not None
+        if follow_only and (backgrounds or not self._similar_detector_qualified(uid, track_id, follow_observation)):
+            return "similar_full_support_unavailable"
         if (not bank.config.enabled or uid <= 0 or self._detector_active_uid != uid
                 or self._search_reacquire_uid > 0
                 or bank.track_to_uid.get(track_id) != uid):
@@ -407,7 +489,7 @@ class DeepSortTracker:
         if (uid not in bank.identities or uid in bank._geometry_revoked_uids
                 or uid in bank._reacquire_control_suspects
                 or track_id in bank._mapped_geometry_conflicts
-                or bank._reacquire_quarantine.is_held(uid)):
+                or (not follow_only and bank._reacquire_quarantine.is_held(uid))):
             return "identity_blocked"
         if any(track_id in pending for pending in (
             bank.pending_new, bank.pending_handoffs,
@@ -418,7 +500,8 @@ class DeepSortTracker:
         assignment = bank.last_assignments.get(track_id, {})
         if (assignment.get("uid") != uid or any(assignment.get(key) for key in (
                 "identity_control_rejected", "identity_recheck_pending", "search_excluded",
-                "template_update_quarantined", "appearance_pose_retention"))
+                "appearance_pose_retention"))
+                or (not follow_only and assignment.get("template_update_quarantined"))
                 or assignment.get("bbox_quality_ok") is not True
                 or assignment.get("bbox_quality_tier") != "strong"
                 or assignment.get("reacquire_geometry_ok") is False
@@ -515,10 +598,9 @@ class DeepSortTracker:
                 self._clear_detector_continuation("background_detection_ambiguous")
                 return None
         observation = observations[source_index]
-        reason = self._detector_identity_block(uid, proof.track_id, observation.timestamp, proof.backgrounds)
-        if reason is None and (observation.score < max(self.config.min_confidence,
-                self.config.identity_min_confidence) or not self._bbox_quality(
-                    observation.bbox, image_width, image_height)[0]):
+        reason = self._detector_identity_block(uid, proof.track_id, observation.timestamp, proof.backgrounds,
+            follow_observation=proof.verified if proof.permission == "similar_follow" else None)
+        if reason is None and not self._detector_quality_allowed(observation, proof):
             reason = "detector_quality"
         if reason is None:
             reason = continuation_reason(proof, observation, now, self.config.hfov_deg)
@@ -554,7 +636,8 @@ class DeepSortTracker:
             self.last_detector_continuation_reason = "plan_superseded"
             return None
         proof, observation = plan.proof, plan.observation
-        reason = self._detector_identity_block(proof.uid, proof.track_id, observation.timestamp, proof.backgrounds)
+        reason = self._detector_identity_block(proof.uid, proof.track_id, observation.timestamp, proof.backgrounds,
+            follow_observation=proof.verified if proof.permission == "similar_follow" else None)
         if reason is None:
             reason = continuation_reason(proof, observation, now, self.config.hfov_deg)
         if reason is None:
@@ -600,6 +683,9 @@ class DeepSortTracker:
         self._detector_epoch += 1
         self._detector_proof = replace(proof, previous=observation, fast_count=proof.fast_count+1,
             backgrounds=tuple(replace(bg, previous=item) for _, bg, item in plan.backgrounds))
+        if proof.permission == "similar_follow":
+            self._detector_full_bridge = (self._detector_proof, self._detector_bank_binding, track,
+                self.identity_bank._similar_follow_states.get((proof.uid, proof.track_id)))
         self._frame_context = dict(plan.context, capture_frame_id=observation.capture,
             capture_timestamp=observation.timestamp, integrated_yaw_deg=observation.yaw)
         current = [(plan.source_index, observation)] + [(i, item) for i, _, item in plan.backgrounds]
@@ -622,6 +708,11 @@ class DeepSortTracker:
             initial_identity_confirmed=False, bank_updated=False, bbox_quality_ok=True,
             bbox_quality_tier="strong", identity_control_rejected=False,
             capture_frame_id=observation.capture, capture_timestamp=observation.timestamp)
+        if proof.permission == "similar_follow":
+            assignment.update(identity_permission="similar_follow", match_source="similar_follow",
+                template_update_quarantined=True, learning_allowed=False,
+                template_learning=dict(status="frozen", reason="similar_detector_continuation"),
+                detector_continuation_permission="similar_follow")
         self._detector_control_assignments = {proof.track_id: assignment}
         self.last_identity_observations = [dict(frame_index=self._frame_index,
             raw_track_id=proof.track_id, uid=proof.uid, detector_bbox=observation.bbox,
@@ -653,6 +744,48 @@ class DeepSortTracker:
                 (bcx/item.width-.5)*self.config.hfov_deg, TRACK_STATE_STABLE, time_since_update=0))
         return records
 
+    def _prepare_detector_full_continuation(self, detections, features, color_features,
+                                           image_width, image_height):
+        """Consume measured fast geometry once, without retimestamping features.
+
+        A skipped full frame must not make the next full appear unobserved for
+        >500ms. Its *new* independent descriptor still has to pass the gallery;
+        the earlier fast measurement only supplies local position continuity.
+        """
+        carried = self._detector_full_bridge
+        self._detector_full_bridge = None
+        if carried is None or len(detections) != 1 or len(self._learning_detections) != 1:
+            return None
+        proof, binding, track, state = carried
+        if proof.permission != "similar_follow" or proof.fast_count < 1 or binding is None:
+            return None
+        observation = capture_observation(detections[0], self._frame_context, image_width, image_height)
+        now = time.monotonic()
+        entry, anchor, assignment, facts = binding
+        bank = self.identity_bank
+        if (observation is None or not 0 <= now-observation.timestamp < MAX_FULL_RESULT_AGE_SEC
+                or not proof.previous.timestamp < observation.timestamp < proof.deadline
+                or observation.capture <= proof.previous.capture
+                or observation.timestamp-proof.previous.timestamp > .5
+                or bank.identities.get(proof.uid) is not entry
+                or entry.last_strong_observation is not anchor
+                or bank.last_assignments.get(proof.track_id) is not assignment
+                or bank._similar_follow_states.get((proof.uid, proof.track_id)) is not state
+                or facts != self._detector_verification_facts(entry, assignment)
+                or not any(t is track for t in self.deepsort.tracker.tracks)
+                or self._detector_identity_block(proof.uid, proof.track_id, observation.timestamp,
+                                                follow_observation=proof.verified)
+                or not self._detector_quality_allowed(observation, proof)
+                or not geometry_matches(proof.previous, observation, self.config.hfov_deg)
+                or not geometry_matches(proof.verified, observation, self.config.hfov_deg, anchor=True)):
+            return None
+        gallery = finite_number(entry.distance(features[0])) if features[0] is not None else None
+        color = color_signature(color_features[0]) if len(color_features) == 1 else None
+        if gallery is None or not 0 <= gallery <= SIMILAR_MAX_GALLERY_DISTANCE or not color_matches(proof.verified.color, color or ()):
+            return None
+        return dict(proof=proof, identity=entry, assignment=assignment, state=state,
+                    capture_frame_id=observation.capture, capture_timestamp=observation.timestamp, now=now)
+
     def note_full_identity_verification(self, records, *, detections, color_features,
                                         frame_context, image_width, image_height, now, active_uid,
                                         raw_candidate_count=None):
@@ -677,6 +810,8 @@ class DeepSortTracker:
             self._clear_detector_continuation("full_detection_binding_unavailable")
             return
         observation = capture_observation(detections[source_index], frame_context, image_width, image_height)
+        follow_only = bool(len(detections) == 1
+                           and self._similar_detector_qualified(uid, record.track_id, observation))
         backgrounds = []
         for index, detection in enumerate(detections):
             if index == source_index:
@@ -716,9 +851,11 @@ class DeepSortTracker:
                 or record.reid_uid != uid or record.time_since_update != 0
                 or record.tracker_state != TRACK_STATE_STABLE
                 or self._detector_identity_block(uid, record.track_id,
-                                                observation.timestamp if observation else 0, backgrounds)
-                or assignment.get("reason") not in {"mapped", "updated_diverse", "skip_update_redundant", "skip_update_distance"}
-                or assignment.get("match_source") != "strong"
+                    observation.timestamp if observation else 0, backgrounds,
+                    follow_observation=observation if follow_only else None)
+                or (not follow_only and assignment.get("reason") not in {
+                    "mapped", "updated_diverse", "skip_update_redundant", "skip_update_distance"})
+                or (not follow_only and assignment.get("match_source") != "strong")
                 or distance is None or not 0 <= distance <= min(.30, self.config.identity_mapped_verify_threshold)
                 or len(evidence) != 1 or evidence[0].get("uid") != uid
                 or evidence[0].get("raw_track_id") != record.track_id
@@ -730,13 +867,15 @@ class DeepSortTracker:
             return
         color = (color_signature(color_features[source_index])
                  if color_features is not None and len(color_features) == len(detections) else None)
-        if (color is None or observation.score < max(self.config.min_confidence, self.config.identity_min_confidence)
-                or not self._bbox_quality(observation.bbox, image_width, image_height)[0]):
+        candidate = DetectorProof(uid, record.track_id, observation, observation, 2,
+            permission="similar_follow", crop_edge_mask=self._detector_edge_mask(observation)) if follow_only else None
+        if color is None or not self._detector_quality_allowed(observation, candidate):
             self._clear_detector_continuation("full_color_or_quality_unavailable")
             return
         observation = replace(observation, color=color)
         continuous = bool(previous is not None and clock < previous.deadline
             and previous.uid == uid and previous.track_id == record.track_id
+            and previous.permission == ("similar_follow" if follow_only else "strong")
             and observation.capture > previous.previous.capture
             and 0 < observation.timestamp-previous.previous.timestamp <= FULL_PROOF_TTL_SEC
             and geometry_matches(previous.previous, observation, self.config.hfov_deg)
@@ -746,9 +885,17 @@ class DeepSortTracker:
                                     or observation.timestamp <= previous.previous.timestamp):
             self._clear_detector_continuation("nonnew_full_capture")
             return
-        count = min(2, previous.full_count+1) if continuous else 1
+        count = 2 if follow_only else min(2, previous.full_count+1) if continuous else 1
+        permission_deadline = None
+        detail = assignment.get("similar_follow") or {}
+        if follow_only and detail.get("crop_continuation") and not detail.get("crop_current_reverified"):
+            # Historical crop acceptance cannot be promoted into a fresh
+            # .6 s permission after its original .75 s bridge has expired.
+            permission_deadline = self.identity_bank._similar_follow_states[(uid, record.track_id)]["last_strong_timestamp"] + .75
         self._detector_proof = DetectorProof(uid, record.track_id, observation, observation, count,
-                                             backgrounds=tuple(backgrounds))
+            backgrounds=tuple(backgrounds), permission="similar_follow" if follow_only else "strong",
+            crop_edge_mask=self._detector_edge_mask(observation) if follow_only else (),
+            permission_deadline=permission_deadline)
         entry = self.identity_bank.identities[uid]
         self._detector_bank_binding = (entry, entry.last_strong_observation, assignment,
                                        self._detector_verification_facts(entry, assignment))
@@ -805,6 +952,17 @@ class DeepSortTracker:
         self.last_identity_observations = []
         startup_tracks_before = {
             int(track.track_id) for track in self.deepsort.tracker.tracks}
+        bridge = self._prepare_detector_full_continuation(
+            detections, features, color_features, image_width, image_height)
+        self._current_detector_position_bridge = bridge
+        provisional_features = self._provisional_association.prepare(
+            self.deepsort.tracker.tracks, self.identity_bank.track_to_uid,
+            self.identity_bank.identities, self._frame_context,
+            max_gap=self.config.identity_similar_follow_max_gap_sec,
+            conflicts=self.identity_bank._mapped_geometry_conflicts,
+            revoked=self.identity_bank._geometry_revoked_uids,
+            detector_position_bridge=bridge,
+        ) if self.config.identity_similar_follow_enable else None
         if not detections:
             self._search_reacquire_eligible_tracks.clear()
             outputs = self.deepsort.update([], [], [], [], image_shape=_image_shape(image_width, image_height))
@@ -847,6 +1005,10 @@ class DeepSortTracker:
             match_validator=lambda track_id, source_index: self._identity_match_allowed(
                 track_id, source_index, image_width, image_height,
             ),
+            provisional_features=provisional_features,
+            capture_context=self._frame_context,
+            low_score_validator=lambda track_id, source_index: self._low_score_match_allowed(
+                track_id, source_index, image_width, image_height),
         )
         self._observe_startup_track_lifecycle(startup_tracks_before)
         timer.mark("association")
@@ -869,7 +1031,8 @@ class DeepSortTracker:
         timer.mark("geometry")
         self._identity_competition = self._frame_identity_competition(
             detections, features, suppressed_indices=suppressed_indices,
-            outputs=outputs, image_width=image_width, image_height=image_height,
+            outputs=[out for out in outputs if not getattr(out, "low_score_continuation", False)],
+            image_width=image_width, image_height=image_height,
         )
         timer.mark("competition")
         self._observe_identity_frame_evidence(
@@ -896,10 +1059,19 @@ class DeepSortTracker:
             )
             for out in outputs
         ]
+        # A weak match supplies candidate-position evidence, not a new control
+        # observation. Previously these detections yielded no formal record;
+        # emitting a fresh UID0 here would newly invalidate a still-live motor
+        # proof. Keep diagnostics/identity observations, but preserve the empty
+        # control boundary and do not recreate it through the detector probe.
+        has_low_score_observation = any(getattr(out, "low_score_continuation", False)
+                                        for out in outputs)
+        records = [record for out, record in zip(outputs, records)
+                   if not getattr(out, "low_score_continuation", False)]
         if association_gallery_before is not None:
             self._restore_follow_only_association_gallery(association_gallery_before)
         timer.mark("records")
-        if not records:
+        if not records and not has_low_score_observation:
             probe = self._search_probe_record(
                 detections,
                 features,
@@ -915,7 +1087,7 @@ class DeepSortTracker:
         return records
 
     def _restore_follow_only_association_gallery(self, before):
-        """Follow-only embeddings remain observations, not association parents."""
+        """Freeze trusted galleries; separately retain bounded association evidence."""
         tracker = self.deepsort.tracker
         for track in tracker.tracks:
             assignment = self.identity_bank.last_assignments.get(int(track.track_id), {})
@@ -925,7 +1097,13 @@ class DeepSortTracker:
             fenced = uid in self.identity_bank._similar_learning_fences
             if (assignment.get("match_source") != "similar_follow"
                     and proof.get("status") not in ("observe", "follow") and not fenced):
-                continue
+                if (uid > 0 and assignment.get("bbox_quality_ok") is True
+                        and not assignment.get("identity_control_rejected")
+                        and proof.get("status") != "reject"
+                        and getattr(track, "time_since_update", 1) == 0):
+                    self._provisional_association.entries.pop(int(track.track_id), None)
+                if int(track.track_id) not in self._provisional_association.entries:
+                    continue
             if int(track.track_id) in before:
                 tracker.metric.samples[int(track.track_id)] = before[int(track.track_id)]
             else:
@@ -937,6 +1115,70 @@ class DeepSortTracker:
             for observation in self.last_identity_observations:
                 if observation.get("raw_track_id") == int(track.track_id):
                     observation["assignment"]["association_gallery_frozen"] = True
+            self._update_provisional_association(track, assignment)
+
+    def _update_provisional_association(self, track, assignment):
+        raw = int(track.track_id)
+        proof = assignment.get("similar_follow") or {}
+        cache = self._provisional_association
+        if (raw in self.identity_bank._mapped_geometry_conflicts
+                or assignment.get("reason") == "identity_center_jump_reject"
+                or assignment.get("search_excluded") is True
+                or (assignment.get("identity_competition") or {}).get("passed") is False
+                or proof.get("reason") in {
+                    "identity_blocked", "competition_unverified", "reliable_partial_conflict",
+                    "full_distance_conflict", "local_geometry_conflict", "invalid_state"}):
+            cache.invalidate(raw, "identity_conflict")
+        observations = [row for row in self.last_identity_observations
+                        if row.get("raw_track_id") == raw]
+        if len(observations) == 1:
+            observation = observations[0]
+            metadata = observation.get("sample_metadata") or {}
+            clock = capture_clock(metadata)
+            uid = assignment.get("uid")
+            state = self.identity_bank._similar_follow_states.get((uid, raw))
+            geometry = assignment.get("reacquire_geometry") or {}
+            current_geometry = geometry.get("current") or {}
+            crop_accepted = bool(
+                proof.get("crop_continuation") is True
+                and proof.get("original_quality_reason") == "edge_touch>2"
+                and clock is not None and state
+                and state.get("uid") == uid and state.get("track_id") == raw
+                and state.get("last_cap") == clock[0] and state.get("last_timestamp") == clock[1]
+                and current_geometry.get("track_id") == raw
+                and capture_clock(current_geometry) == clock
+                and cropped_follow_continuous(metadata, state, geometry))
+            quality_accepted = bool(crop_accepted or (
+                metadata.get("quality_bbox_ok") is True
+                and metadata.get("bbox_quality_tier") == "strong"))
+            if (getattr(track, "time_since_update", 1) == 0
+                    and assignment.get("match_source") == "similar_follow"
+                    and proof.get("status") == "follow" and clock is not None
+                    and clock == capture_clock(self._frame_context)
+                    and proof.get("capture_frame_id") == clock[0]
+                    and metadata.get("is_fresh") is True
+                    and quality_accepted
+                    and assignment.get("bbox_quality_ok") is True
+                    and not assignment.get("identity_control_rejected")
+                    and not assignment.get("identity_recheck_pending")
+                    and assignment.get("search_excluded") is not True
+                    and assignment.get("reacquire_geometry_ok") is not False
+                    and (assignment.get("identity_competition") or {}).get("passed") is not False
+                    and isinstance(uid, int) and not isinstance(uid, bool) and uid > 0
+                    and self.identity_bank.track_to_uid.get(raw) == uid
+                    and uid in self.identity_bank.identities
+                    and raw not in self.identity_bank._mapped_geometry_conflicts
+                    and uid not in self.identity_bank._geometry_revoked_uids):
+                remembered = cache.remember(track, uid, self.identity_bank.identities[uid],
+                                            getattr(track, "last_feature", None), metadata)
+                if remembered and crop_accepted:
+                    # This current policy acceptance only refreshes local
+                    # association evidence; its original strong/crop budget
+                    # and both trusted galleries remain unchanged.
+                    cache.entries[raw].reason = "accepted_crop_follow"
+        assignment["provisional_association"] = cache.diagnostics(raw)
+        for observation in observations:
+            observation["assignment"]["provisional_association"] = cache.diagnostics(raw)
 
     def _frame_identity_competition(self, detections, features, *, suppressed_indices=(),
                                     outputs=(), image_width=None, image_height=None):
@@ -1035,6 +1277,332 @@ class DeepSortTracker:
             )
         return allowed
 
+    def _low_score_match_allowed(self, track_id, source_index, width, height):
+        """A weak detection may associate, but cannot overrule known conflict."""
+        if (source_index is None or not 0 <= int(source_index) < len(self._current_detections)
+                or not self.config.identity_bank_enable):
+            return False
+        detection = self._current_detections[int(source_index)]
+        if (int(detection.class_id) != 0
+                or not self._bbox_quality(detection.bbox, width, height)[0]):
+            return False
+        bank = self.identity_bank
+        uid = int(bank.track_to_uid.get(int(track_id), 0) or self._search_reacquire_uid or 0)
+        if (int(track_id) in bank._mapped_geometry_conflicts
+                or uid in bank._geometry_revoked_uids
+                or (uid > 0 and bank.search_exclusion_for(int(track_id), uid,
+                    frame_index=self._frame_index,
+                    capture_timestamp=self._frame_context.get("capture_timestamp")) is not None)):
+            return False
+        return self._identity_match_allowed(track_id, source_index, width, height)
+
+    def associated_position_contradiction(self, uid, track_id, capture_frame_id, capture_timestamp):
+        """Read reliable negative evidence for one previously observed person.
+
+        Empty formal records can hide a rejected low-score observation. Do not
+        confuse that transport boundary with absence of an identity conflict.
+        Missing features, ordinary UID0/weak quality and expired references
+        are unavailable evidence, not a new contradiction. This method neither
+        changes identity state nor emits motor commands.
+        """
+        if (isinstance(uid, bool) or not isinstance(uid, Integral) or uid <= 0
+                or isinstance(track_id, bool) or not isinstance(track_id, Integral) or track_id <= 0
+                or capture_clock(dict(capture_frame_id=capture_frame_id,
+                                      capture_timestamp=capture_timestamp)) is None):
+            return None
+        bank = self.identity_bank
+        if uid in bank._geometry_revoked_uids:
+            return "uid_geometry_revoked"
+        held = bank._mapped_geometry_conflicts.get(track_id) or {}
+        if held.get("uid") == uid:
+            return "geometry_conflict"
+        if bank.search_exclusion_for(track_id, uid, frame_index=self._frame_index,
+                                     capture_timestamp=capture_timestamp) is not None:
+            return "identity_excluded"
+        for row in self.last_identity_observations:
+            if row.get("raw_track_id") != track_id:
+                continue
+            metadata, assignment = row.get("sample_metadata") or {}, row.get("assignment") or {}
+            if (metadata.get("is_fresh") is not True
+                    or metadata.get("capture_frame_id") != capture_frame_id
+                    or metadata.get("capture_timestamp") != capture_timestamp):
+                continue
+            competition = metadata.get("identity_competition") or assignment.get("identity_competition") or {}
+            if (competition.get("uid") == uid and competition.get("passed") is False
+                    and competition.get("frame_index") == row.get("frame_index") == self._frame_index
+                    and metadata.get("source_detection_index") is not None
+                    and competition.get("source_detection_index") == metadata.get("source_detection_index")
+                    and competition.get("reason") == "reid_margin_insufficient"
+                    and finite_number(competition.get("distance")) is not None
+                    and finite_number(competition.get("competitor_distance")) is not None):
+                return "competition_conflict"
+            if uid not in (assignment.get("mapped_uid"), assignment.get("uid"),
+                           assignment.get("best_uid"), assignment.get("excluded_uid")):
+                continue
+            if assignment.get("search_excluded") is True:
+                return "identity_excluded"
+            geometry = assignment.get("reacquire_geometry") or {}
+            if (assignment.get("search_contradiction_retained") is True
+                    or geometry.get("search_contradiction_retained") is True
+                    or geometry.get("mapped_geometry_blocked") is True
+                    or assignment.get("reason") in ("mapped_geometry_reject", "identity_center_jump_reject")):
+                return "geometry_conflict"
+        return None
+
+    def _position_active_uid(self):
+        # FULL proof creation is disabled during search and clears the fast
+        # lane's UID. The independently locked search UID still owns position.
+        return int(self._detector_active_uid or self._search_reacquire_uid or 0)
+
+    def _observe_follow_only_position_anchor(self, output, metadata, assignment):
+        """Remember accepted FULL follow permission, never a trusted template."""
+        uid, raw = self._position_active_uid(), int(output.track_id)
+        bank = self.identity_bank
+        previous = getattr(self, "_follow_only_position_anchor", None)
+        competition = metadata.get("identity_competition") or {}
+        detail = assignment.get("similar_follow") or {}
+        current_gallery = finite_number(competition.get("distance"))
+        current_confidence = finite_number(metadata.get("detector_confidence"))
+        full_conflict = bool(metadata.get("is_fresh") is True
+            and not metadata.get("low_score_continuation")
+            and metadata.get("quality_bbox_ok") is True
+            and competition.get("uid") == uid and competition.get("frame_index") == self._frame_index
+            and current_confidence is not None and current_confidence >= .50
+            and current_gallery is not None
+            and current_gallery > min(.55, bank.config.similar_follow_retain_threshold))
+        if previous is not None and (uid != previous["uid"]
+                or previous["track_id"] in bank._mapped_geometry_conflicts
+                or uid in bank._geometry_revoked_uids
+                or (raw == previous["track_id"] and (
+                    full_conflict or competition.get("passed") is False or assignment.get("search_excluded")
+                    or detail.get("reason") in ("identity_blocked", "competition_unverified",
+                        "reliable_partial_conflict", "full_distance_conflict", "local_geometry_conflict")))):
+            self._follow_only_position_anchor = None
+            self._follow_only_position_last = None
+        clock = capture_clock(metadata)
+        gallery = finite_number(detail.get("gallery_distance"))
+        state = bank._similar_follow_states.get((uid, raw)) or {}
+        track = next((t for t in self.deepsort.tracker.tracks if t.track_id == raw), None)
+        feature = getattr(output, "feature", None)
+        if (uid <= 0 or raw <= 0 or assignment.get("uid") != uid
+                or assignment.get("reason") not in ("similar_follow_reacquire", "mapped_similar_follow")
+                or assignment.get("identity_permission") != "similar_follow"
+                or detail.get("status") != "follow" or detail.get("learning_allowed") is not False
+                or detail.get("capture_frame_id") != (clock[0] if clock else None)
+                or gallery is None or not 0 <= gallery <= .30
+                or assignment.get("bank_updated") is not False
+                or assignment.get("reacquire_geometry_ok") is not True
+                or any(assignment.get(k) for k in ("identity_control_rejected", "identity_recheck_pending", "search_excluded"))
+                or metadata.get("is_fresh") is not True or metadata.get("low_score_continuation")
+                or metadata.get("quality_bbox_ok") is not True
+                or assignment.get("bbox_quality_ok") is not True
+                or clock is None or clock != capture_clock(self._frame_context)
+                or competition.get("passed") is not True or competition.get("candidate_count") != 1
+                or state.get("active") is not True or state.get("count") != 2 or state.get("position_only")
+                or state.get("uid") != uid or state.get("track_id") != raw
+                or (state.get("last_cap"), state.get("last_timestamp")) != clock
+                or bank.track_to_uid.get(raw) != uid or track is None or feature is None
+                or raw in bank._mapped_geometry_conflicts or uid in bank._geometry_revoked_uids):
+            return
+        entry = bank.identities.get(uid)
+        if entry is None or (previous and (clock[0] <= previous["clock"][0] or clock[1] <= previous["clock"][1])):
+            return
+        self._follow_only_position_anchor = dict(uid=uid, track_id=raw, track=track, entry=entry,
+            clock=clock, metadata=dict(metadata, frame_index=self._frame_index), feature=feature.copy(),
+            permission="similar_follow")
+
+    def _follow_only_probe_position(self, raw, metadata, assignment, feature):
+        """A current unassigned detector box can carry position, not raw/UID."""
+        anchor = getattr(self, "_follow_only_position_anchor", None)
+        bank, uid = self.identity_bank, self._position_active_uid()
+        clock = capture_clock(metadata)
+        if anchor is None or raw != -1 or uid != anchor["uid"] or clock is None:
+            return None
+        owner = anchor["track_id"]
+        competition = metadata.get("identity_competition") or {}
+        if (owner in bank._mapped_geometry_conflicts or raw in bank._mapped_geometry_conflicts
+                or uid in bank._geometry_revoked_uids or uid in bank._reacquire_control_suspects
+                or competition.get("passed") is False or assignment.get("search_excluded")
+                or assignment.get("search_contradiction_retained")):
+            self._follow_only_position_anchor = None
+            return None
+        previous = getattr(self, "_follow_only_position_last", None)
+        distance = finite_number(competition.get("distance"))
+        confidence = finite_number(metadata.get("detector_confidence"))
+        if (bank.track_to_uid.get(owner) != uid or bank.identities.get(uid) is not anchor["entry"]
+                or not any(t is anchor["track"] for t in self.deepsort.tracker.tracks)
+                or assignment.get("uid") != 0 or assignment.get("mapped_uid") != uid
+                or assignment.get("reason") not in ("secondary_evidence_unavailable", "similar_follow_observe",
+                                                      "follow_only_position_probe")
+                or metadata.get("is_fresh") is not True or metadata.get("quality_bbox_ok") is not True
+                or confidence is None or not .50 <= confidence <= 1.
+                or clock != capture_clock(self._frame_context)
+                or clock[0] <= anchor["clock"][0] or not 0 < clock[1]-anchor["clock"][1] < .5
+                or (previous and (clock[0] <= previous[0] or clock[1] <= previous[1]))
+                or competition.get("uid") != uid or competition.get("passed") is not True
+                or competition.get("candidate_count") != 1 or metadata.get("candidate_count") != 1
+                or competition.get("frame_index") != self._frame_index
+                or competition.get("source_detection_index") != metadata.get("source_detection_index")
+                or distance is None or not 0 <= distance <= .30
+                or bank.search_exclusion_for(owner, uid, frame_index=self._frame_index,
+                    capture_timestamp=clock[1]) is not None
+                or bank.search_exclusion_for(raw, uid, frame_index=self._frame_index,
+                    capture_timestamp=clock[1]) is not None):
+            return None
+        import numpy as np
+        if feature is None or feature.shape != anchor["feature"].shape:
+            return None
+        norm = float(np.linalg.norm(feature) * np.linalg.norm(anchor["feature"]))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            return None
+        appearance = 1.-float(np.dot(feature, anchor["feature"]))/norm
+        geometry = bank._handoff_geometry(uid, metadata, self._frame_index,
+            reference_override=bank._handoff_geometry(uid, anchor["metadata"],
+                anchor["metadata"]["frame_index"])["current"])
+        jump = finite_number(geometry.get("yaw_compensated_center_jump_ratio"))
+        area = finite_number(geometry.get("area_similarity"))
+        if (not math.isfinite(appearance) or not -.000001 <= appearance <= .35
+                or geometry.get("ok") is not True or jump is None or jump > .20
+                or area is None or area < .55):
+            return None
+        self._follow_only_position_last = clock
+        return dict(source="follow_only_detector_probe", uid=uid, track_id=raw,
+            reference_track_id=owner, capture_frame_id=clock[0], capture_timestamp=clock[1],
+            bbox=tuple(metadata["detector_bbox"]), reference_capture_frame_id=anchor["clock"][0],
+            reference_capture_timestamp=anchor["clock"][1], expires_at=anchor["clock"][1]+.5,
+            gallery_distance=distance, appearance_distance=max(0., appearance),
+            center_jump_ratio=jump, area_similarity=area, anchor_permission="similar_follow",
+            identity_authorized=False, learning_allowed=False)
+
+    def _low_score_position_evidence(self, output, metadata, assignment):
+        """Expose a measured position, never a new UID or a renewable lease.
+
+        The independent anchor is a full, accepted identity observation, not
+        DeepSORT's latest high-score box (which may have failed identity).
+        Weak frames cannot learn, replace that anchor, or prolong its budget.
+        """
+        bank, raw = self.identity_bank, int(output.track_id)
+        uid = self._position_active_uid()
+        weak = metadata.get("low_score_continuation") is True
+        anchor = getattr(self, "_low_score_position_anchor", None)
+        track = next((item for item in self.deepsort.tracker.tracks if item.track_id == raw), None)
+        if weak:
+            # An older trusted raw must not mask a newer follow-only owner.
+            # Pick a live bound source, never relabel the old raw as current.
+            clock = capture_clock(metadata)
+            candidates = [item for item in (anchor, getattr(self, "_follow_only_position_anchor", None))
+                if item is not None and item["uid"] == uid and item["track_id"] == raw
+                and item["track"] is track and bank.identities.get(uid) is item["entry"]
+                and bank.track_to_uid.get(raw) == uid and clock is not None
+                and clock[0] > item["clock"][0] and 0 < clock[1] - item["clock"][1] <= .5]
+            if candidates:
+                anchor = max(candidates, key=lambda item: item["clock"][1])
+        assigned = assignment.get("uid")
+        competition = metadata.get("identity_competition") or {}
+        # Only the caller's observation copy receives diagnostics. Do not
+        # modify bank.last_assignments or recompute any appearance features.
+        diagnostic = dict(reference_capture_frame_id=anchor["clock"][0] if anchor else None,
+            gallery_distance=finite_number(competition.get("distance")),
+            appearance_distance=None, center_jump_ratio=None, area_similarity=None)
+        if weak:
+            assignment["low_score_position_diagnostics"] = diagnostic
+        def reject(reason):
+            if weak:
+                assignment["low_score_position_reject_reason"] = reason
+            return None
+        if competition.get("passed") is False and anchor is not None and anchor["track_id"] == raw:
+            self._low_score_position_anchor = None
+            self._follow_only_position_anchor = None
+            return reject("competition_failed")
+        if not weak:
+            if anchor is not None and anchor["track_id"] == raw:
+                self._low_score_position_anchor = None
+            if (uid <= 0 or assigned != uid or bank.track_to_uid.get(raw) != uid
+                    or metadata.get("is_fresh") is not True
+                    or metadata.get("quality_bbox_ok") is not True
+                    or assignment.get("bbox_quality_ok") is not True
+                    or assignment.get("bbox_quality_tier") != "strong"
+                    or assignment.get("match_source") == "similar_follow"
+                    or any(assignment.get(key) for key in (
+                        "identity_control_rejected", "identity_recheck_pending",
+                        "search_excluded", "template_update_quarantined", "appearance_pose_retention"))
+                    or assignment.get("reacquire_geometry_ok") is False
+                    or (metadata.get("identity_competition") or {}).get("passed") is not True):
+                return None
+            clock = capture_clock(metadata)
+            feature = getattr(output, "feature", None)
+            entry = bank.identities.get(uid)
+            if (clock is None or clock != capture_clock(self._frame_context)
+                    or feature is None or entry is None or track is None
+                    or (anchor is not None and (clock[0] <= anchor["clock"][0]
+                        or clock[1] <= anchor["clock"][1]))):
+                return None
+            self._low_score_position_anchor = dict(uid=uid, track_id=raw, entry=entry, track=track,
+                clock=clock, metadata=dict(metadata, frame_index=self._frame_index), feature=feature.copy())
+            return None
+        if (anchor is None or anchor["uid"] != uid or anchor["track_id"] != raw
+                or anchor["track"] is not track
+                or bank.identities.get(uid) is not anchor["entry"]
+                or bank.track_to_uid.get(raw) != uid):
+            return reject("trusted_anchor_unavailable")
+        if (assigned != 0
+                or assignment.get("reason") not in ("low_score_observation_only", "similar_follow_observe")
+                or metadata.get("is_fresh") is not True
+                or metadata.get("quality_bbox_ok") is not True
+                or metadata.get("association_reason") != "low_score_existing_track"):
+            return reject("observation_ineligible")
+        if (raw in bank._mapped_geometry_conflicts or uid in bank._geometry_revoked_uids
+                or uid in bank._reacquire_control_suspects
+                or any(raw in pending for pending in (bank.pending_new, bank.pending_handoffs,
+                    bank.pending_late_handoffs, bank.pending_weak_handoffs))
+                or bank.search_exclusion_for(raw, uid, frame_index=self._frame_index,
+                    capture_timestamp=metadata.get("capture_timestamp")) is not None):
+            return reject("identity_review_or_conflict")
+        clock = capture_clock(metadata)
+        follow_only = anchor.get("permission") == "similar_follow"
+        previous = getattr(self, "_follow_only_position_last" if follow_only else "_low_score_position_last", None)
+        if (clock is None or clock != capture_clock(self._frame_context)
+                or clock[0] <= anchor["clock"][0]
+                or not 0 < clock[1] - anchor["clock"][1] <= .5
+                or (previous is not None and (clock[0] <= previous[0] or clock[1] <= previous[1]))):
+            return reject("capture_stale_or_out_of_order")
+        distance = finite_number(competition.get("distance"))
+        if (competition.get("uid") != uid or competition.get("frame_index") != self._frame_index
+                or competition.get("source_detection_index") != metadata.get("source_detection_index")
+                or competition.get("passed") is not True
+                or distance is None or not 0 <= distance <= .35):
+            return reject("competition_unavailable_or_weak")
+        import numpy as np
+        feature = getattr(output, "feature", None)
+        if feature is None or feature.shape != anchor["feature"].shape:
+            return reject("appearance_unavailable")
+        norm = float(np.linalg.norm(feature) * np.linalg.norm(anchor["feature"]))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            return reject("appearance_unavailable")
+        appearance = 1. - float(np.dot(feature, anchor["feature"])) / norm
+        diagnostic["appearance_distance"] = finite_number(appearance)
+        if not math.isfinite(appearance) or not -.000001 <= appearance <= .35:
+            return reject("anchor_appearance_mismatch")
+        geometry = bank._handoff_geometry(uid, metadata, self._frame_index,
+            reference_override=bank._handoff_geometry(uid, anchor["metadata"],
+                anchor["metadata"].get("frame_index", self._frame_index))["current"])
+        jump = finite_number(geometry.get("yaw_compensated_center_jump_ratio"))
+        area = finite_number(geometry.get("area_similarity"))
+        diagnostic.update(center_jump_ratio=jump, area_similarity=area,
+                          geometry_reason=geometry.get("reason"))
+        if geometry.get("ok") is not True or jump is None or jump > .20 or area is None or area < .55:
+            return reject("anchor_geometry_rejected")
+        self._low_score_position_last = clock
+        if follow_only:
+            self._follow_only_position_last = clock
+        return dict(source="low_score_existing_track", uid=uid, track_id=raw,
+            capture_frame_id=clock[0], capture_timestamp=clock[1], bbox=tuple(metadata["detector_bbox"]),
+            reference_capture_frame_id=anchor["clock"][0], reference_capture_timestamp=anchor["clock"][1],
+            expires_at=anchor["clock"][1] + .5, appearance_distance=max(0., appearance),
+            center_jump_ratio=jump, area_similarity=area,
+            anchor_permission="similar_follow" if follow_only else "strong",
+            identity_authorized=False, learning_allowed=False)
+
     def _observe_identity_frame_evidence(
         self, outputs: Sequence[Any], image_width: int, image_height: Optional[int],
         *, duplicate_track_ids: Sequence[int] = (),
@@ -1049,6 +1617,7 @@ class DeepSortTracker:
             source_index = getattr(output, "source_detection_index", None)
             if (
                 int(output.time_since_update) != 0
+                or getattr(output, "low_score_continuation", False)
                 or source_index is None
                 or not 0 <= int(source_index) < len(self._current_detections)
                 or int(output.class_id) != 0
@@ -1101,6 +1670,9 @@ class DeepSortTracker:
             self._clear_detector_continuation("searching")
         normalized_direction = str(direction or "").strip().lower()
         if not searching or uid <= 0 or normalized_direction not in ("left", "right"):
+            if uid <= 0:
+                self._follow_only_position_anchor = None
+                self._follow_only_position_last = None
             self._search_reacquire_uid = 0
             self._search_reacquire_direction = None
             self._search_reacquire_eligible_tracks.clear()
@@ -1122,6 +1694,10 @@ class DeepSortTracker:
 
     def reset(self) -> None:
         self._clear_detector_continuation("reset")
+        self._low_score_position_anchor = None
+        self._low_score_position_last = None
+        self._follow_only_position_anchor = None
+        self._follow_only_position_last = None
         self._detector_active_uid = 0
         self.deepsort.reset()
         self.identity_bank.reset()
@@ -1138,6 +1714,7 @@ class DeepSortTracker:
         self._frame_context = {}
         self._current_detections = ()
         self.last_identity_observations = []
+        self._provisional_association.entries.clear()
 
     def debug_state(self) -> List[dict]:
         samples = self.deepsort.tracker.metric.samples
@@ -1164,6 +1741,7 @@ class DeepSortTracker:
                     "confidence": float(track.confidence),
                     "pending_features": int(len(track.features)),
                     "gallery_features": int(len(samples.get(int(track.track_id), []))),
+                    "provisional_association": self._provisional_association.diagnostics(int(track.track_id)),
                     "reid_uid": int(self.identity_bank.track_to_uid.get(int(track.track_id), 0)),
                     "bbox": [x1, y1, x2, y2],
                 }
@@ -1290,6 +1868,26 @@ class DeepSortTracker:
         sample_metadata.pop("initial_color_feature", None)
         sample_metadata.pop("initial_color_source", None)
         sample_metadata["is_fresh"] = output_is_fresh
+        # Association proof is current detector evidence, not identity proof.
+        # Do not accept these flags from caller-provided frame context.
+        sample_metadata["low_score_continuation"] = bool(
+            output_is_fresh and getattr(output, "low_score_continuation", False))
+        if sample_metadata["low_score_continuation"]:
+            sample_metadata.update(association_reason="low_score_existing_track",
+                association_confidence_limit=float(self.config.min_confidence),
+                association_previous_capture_frame_id=getattr(
+                    output, "association_previous_capture_frame_id", None),
+                association_previous_capture_timestamp=getattr(
+                    output, "association_previous_capture_timestamp", None))
+            logger.info("deepsort_low_score_continuation capture_frame_id=%s raw_track_id=%s "
+                "source_detection_index=%s score=%.3f reference_capture=%s "
+                "association_only=True identity_authorized=False gallery_update=False",
+                self._frame_context.get("capture_frame_id"), output_track_id, source_index,
+                float(output.confidence), sample_metadata["association_previous_capture_frame_id"])
+        else:
+            for field in ("association_reason", "association_previous_capture_frame_id",
+                          "association_previous_capture_timestamp", "association_confidence_limit"):
+                sample_metadata.pop(field, None)
         sample_metadata["template_learning_risk"] = _template_learning_risk(
             self._current_detections, source_index, is_fresh=output_is_fresh,
             all_detections=getattr(self, "_learning_detections", None),
@@ -1405,8 +2003,25 @@ class DeepSortTracker:
             sample_metadata=sample_metadata,
             preferred_uid=self._search_reacquire_uid,
             preferred_candidate_ok=preferred_candidate_ok,
+            detector_position_bridge=getattr(self, "_current_detector_position_bridge", None),
         )
         if output_is_fresh and detector_bbox is not None:
+            assignment = dict(self.identity_bank.last_assignments.get(output_track_id, {}))
+            self._observe_follow_only_position_anchor(output, sample_metadata, assignment)
+            position = self._low_score_position_evidence(output, sample_metadata, assignment)
+            if position is not None:
+                assignment["low_score_position_evidence"] = position
+            if sample_metadata.get("low_score_continuation") is True:
+                diagnostic = assignment.get("low_score_position_diagnostics") or {}
+                logger.info("low_score_position_evidence capture_frame_id=%s raw_track_id=%s "
+                    "accepted=%s reason=%s reference_capture=%s gallery_distance=%s "
+                    "anchor_distance=%s center_jump=%s expires_at=%s "
+                    "identity_authorized=False learning_allowed=False",
+                    sample_metadata.get("capture_frame_id"), output_track_id, position is not None,
+                    assignment.get("low_score_position_reject_reason", "accepted"),
+                    diagnostic.get("reference_capture_frame_id"), diagnostic.get("gallery_distance"),
+                    diagnostic.get("appearance_distance"), diagnostic.get("center_jump_ratio"),
+                    position.get("expires_at") if position is not None else None)
             self.last_identity_observations.append({
                 "frame_index": int(self._frame_index),
                 "raw_track_id": output_track_id,
@@ -1414,7 +2029,7 @@ class DeepSortTracker:
                 "detector_bbox": detector_bbox,
                 "display_bbox": (float(x1), float(y1), float(x2), float(y2)),
                 "sample_metadata": sample_metadata,
-                "assignment": dict(self.identity_bank.last_assignments.get(output_track_id, {})),
+                "assignment": assignment,
             })
         return TrackRecord(
             track_id=int(output.track_id),
@@ -1455,6 +2070,62 @@ class DeepSortTracker:
             return float(current.score)
         return float(current.score) - max(competitors)
 
+    def _normal_follow_position_probe(self, detections, features, *, image_width, image_height):
+        """Use a current unassigned crop after search release, without assign().
+
+        Association may temporarily have no output even after a completed
+        follow-only confirmation. Search direction is no longer meaningful;
+        only the independently bound finite position anchor can admit this
+        observation. No IdentityBank mutation or artificial search is needed.
+        """
+        anchor = getattr(self, "_follow_only_position_anchor", None)
+        if (anchor is None or self._detector_active_uid != anchor["uid"]
+                or self._search_reacquire_direction or image_width <= 0
+                or image_height is None or image_height <= 0):
+            return None
+        people = [i for i, detection in enumerate(detections) if int(detection.class_id) == 0]
+        if len(people) != 1:
+            return None
+        index = people[0]
+        detection, descriptor = detections[index], features[index]
+        confidence = finite_number(detection.score)
+        box = tuple(float(value) for value in detection.bbox)
+        quality, reason = self._bbox_quality(box, image_width, image_height)
+        if confidence is None or not .50 <= confidence <= 1. or descriptor is None or not quality:
+            return None
+        raw, uid = self._search_probe_track_id, anchor["uid"]
+        # is_fresh=False here avoids changing raw-track direction history.
+        # The returned metadata explicitly describes the new detector crop.
+        metadata = self._identity_sample_metadata(track_id=raw, bbox=box,
+            confidence=confidence, image_width=image_width, image_height=image_height,
+            bbox_quality_tier="strong", bbox_quality_reason=reason, is_fresh=False)
+        metadata.update(self._frame_context)
+        metadata.update(self._detector_sample_metadata(box, image_width, image_height,
+                                                       self.config.identity_edge_margin_ratio))
+        metadata.update(is_fresh=True, source_detection_index=index, candidate_count=1,
+            candidate_score_gap=confidence, quality_bbox_source="detector", quality_bbox=list(box),
+            quality_bbox_ok=True, quality_bbox_reason=reason, search_reacquire_context_active=False,
+            search_observation_only=False, low_score_continuation=False,
+            identity_competition=self._frame_identity_competition(detections, features).get(index, {}))
+        assignment = dict(uid=0, mapped_uid=uid, best_uid=uid,
+            reason="follow_only_position_probe", bank_updated=False, identity_permission="position_only")
+        proof = self._follow_only_probe_position(raw, metadata, assignment, descriptor)
+        if proof is None:
+            return None
+        assignment["follow_only_position_evidence"] = proof
+        self.last_identity_observations.append(dict(frame_index=self._frame_index,
+            raw_track_id=raw, uid=0, detector_bbox=box, display_bbox=box,
+            sample_metadata=metadata, assignment=assignment))
+        logger.info("follow_only_position_probe capture_frame_id=%s raw=%s reference_raw=%s "
+            "uid=0 reference_uid=%s reference_capture=%s expires_at=%s "
+            "bank_updated=False identity_renewed=False search_started=False",
+            proof["capture_frame_id"], raw, anchor["track_id"], uid,
+            proof["reference_capture_frame_id"], proof["expires_at"])
+        x1, y1, x2, y2 = box
+        return TrackRecord(track_id=raw, reid_uid=0, x1=x1, y1=y1, x2=x2, y2=y2,
+            class_id=int(detection.class_id), score=confidence, cx=(x1+x2)*.5, cy=(y1+y2)*.5,
+            area=(x2-x1)*(y2-y1), angle_deg=0., tracker_state=TRACK_STATE_STABLE, time_since_update=0)
+
     def _search_probe_record(
         self,
         detections: Sequence[Detection],
@@ -1467,7 +2138,8 @@ class DeepSortTracker:
     ) -> Optional[TrackRecord]:
         """Use one detector box as locked-UID evidence during a tracker gap."""
         if self._search_reacquire_uid <= 0 or not self._search_reacquire_direction:
-            return None
+            return self._normal_follow_position_probe(detections, features,
+                image_width=image_width, image_height=image_height)
         # No formal assignments run on this path. Recompute here as this
         # entry point is also called independently by diagnostic/test callers.
         probe_competition = self._frame_identity_competition(detections, features)
@@ -1685,7 +2357,11 @@ class DeepSortTracker:
             preferred_uid=int(self._search_reacquire_uid),
             preferred_candidate_ok=True,
         )
-        assignment = self.identity_bank.last_assignments.get(self._search_probe_track_id, {})
+        assignment = dict(self.identity_bank.last_assignments.get(self._search_probe_track_id, {}))
+        position = self._follow_only_probe_position(self._search_probe_track_id, sample_metadata,
+                                                   assignment, features[detection_index])
+        if position is not None:
+            assignment["follow_only_position_evidence"] = position
         self.last_identity_observations.append({
             "frame_index": int(self._frame_index),
             "raw_track_id": int(self._search_probe_track_id),

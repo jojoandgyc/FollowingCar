@@ -12,6 +12,8 @@ import math
 from numbers import Real
 from typing import Optional
 
+from .camera_geometry import yaw_image_shift_ratio
+
 
 @dataclass(frozen=True)
 class SimilarFollowDecision:
@@ -45,6 +47,13 @@ def _valid_state(state, uid, track):
     origin_cap = _identifier(state.get('origin_cap'))
     origin_timestamp = _number(state.get('origin_timestamp'))
     count = _number(state.get('count'))
+    if state.get('position_only'):
+        qualified_cap = _identifier(state.get('last_qualified_cap'))
+        qualified_stamp = _number(state.get('last_qualified_timestamp'))
+        if (qualified_cap is None or qualified_stamp is None or cap is None or timestamp is None
+                or qualified_cap > cap or qualified_stamp > timestamp
+                or not isinstance(state.get('position_previous_observation'), dict)):
+            return False
     return bool(
         _identifier(state.get('uid')) == uid
         and _identifier(state.get('track_id')) == track
@@ -65,7 +74,8 @@ def _valid_state(state, uid, track):
 def evaluate_similar_follow(
     *, uid, track_id, current, geometry, competition_ok, blocked,
     full_distance, direction_compatible, partial_conflict=False, state=None,
-    entry_limit=.50, retain_limit=.55, max_gap=.50,
+    entry_limit=.50, retain_limit=.55, max_gap=.50, handoff_from_track_id=None,
+    handoff_gallery_distance=None,
 ) -> SimilarFollowDecision:
     """Observe once, then follow using two fresh locally continuous captures.
 
@@ -77,6 +87,10 @@ def evaluate_similar_follow(
     then cross to the other side without becoming a new reverse-side entrant.
     Current full-gallery support is still required on every accepted capture;
     neither old scores nor candidate features may become their own reference.
+    ``handoff_from_track_id`` accepts only a caller-vetted recent unique owner;
+    the new raw track must pass entry appearance and current local geometry.
+    A current independent gallery distance <= .30 allows up to .25 local
+    displacement on this handoff only; ordinary continuation stays at .20.
 
     A duplicate or out-of-order capture returns ``ignore`` with an independent
     copy of the previous state, never ``follow``. All other failures return
@@ -98,10 +112,14 @@ def evaluate_similar_follow(
     if _identifier(current.get('track_id')) != track:
         return reject('track_changed')
     if state is not None:
-        if not _valid_state(state, identity, track):
+        previous_track = track if handoff_from_track_id is None else _identifier(handoff_from_track_id)
+        if (previous_track is None or not _valid_state(state, identity, previous_track)
+                or (previous_track != track and not state['active'])):
             return reject('invalid_state')
         if capture <= state['last_cap'] or timestamp <= state['last_timestamp']:
             return SimilarFollowDecision('ignore', 'nonnew_capture', deepcopy(state))
+        if state.get('position_only') and timestamp - state['last_qualified_timestamp'] > .75:
+            return reject('qualified_observation_gap')
 
     limits = tuple(_number(value) for value in
                    (full_distance, entry_limit, retain_limit, max_gap))
@@ -126,7 +144,7 @@ def evaluate_similar_follow(
             or current.get('preferred_search_low_confidence')):
         return reject('observation_unverified')
     active = state is not None and state['active']
-    if distance > (retention if active else entry):
+    if distance > (retention if active and handoff_from_track_id is None else entry):
         return reject('full_distance_conflict')
 
     if state is None:
@@ -140,9 +158,12 @@ def evaluate_similar_follow(
         if not isinstance(geometry, dict):
             return reject('missing_local_geometry')
         jump = _number(geometry.get('yaw_compensated_center_jump_ratio'))
-        area = _number(geometry.get('area_similarity'))
+        area = _number(geometry.get('crop_continuity_area_similarity', geometry.get('area_similarity')))
+        independent = _number(handoff_gallery_distance)
+        jump_limit = (.25 if handoff_from_track_id is not None
+                      and independent is not None and 0 <= independent <= .30 else .20)
         if (geometry.get('ok') is not True or jump is None
-                or not 0 <= jump <= .20 or area is None or not .55 <= area <= 1.):
+                or not 0 <= jump <= jump_limit or area is None or not .55 <= area <= 1.):
             return reject('local_geometry_conflict')
         count = min(2, state['count'] + 1)
         origin_cap, origin_timestamp = state['origin_cap'], state['origin_timestamp']
@@ -151,9 +172,255 @@ def evaluate_similar_follow(
                       entry_direction_compatible=True,
                       origin_cap=origin_cap, origin_timestamp=origin_timestamp,
                       last_cap=capture, last_timestamp=timestamp,
+                      last_qualified_cap=capture, last_qualified_timestamp=timestamp,
                       full_distance=distance, observation=deepcopy(current))
     return SimilarFollowDecision(
         'follow' if count == 2 else 'observe',
         'similar_candidate_continuous' if count == 2 else 'similar_candidate_observed',
         next_state,
     )
+
+
+def observe_low_score_position(*, uid, track_id, current, state, geometry,
+                               competition_ok, blocked, full_distance):
+    """Retain an actual matched box, never another identity confirmation.
+
+    Low detections cannot start this state, increment its confirmation count,
+    roll the qualified-observation deadline, or authorize following. Association
+    provenance must point to this candidate's last qualified physical capture.
+    """
+    if not _valid_state(state, _identifier(uid), _identifier(track_id)):
+        return None
+    cap, stamp = _identifier(current.get('capture_frame_id')), _number(current.get('capture_timestamp'))
+    full, confidence = _number(full_distance), _number(current.get('detector_confidence'))
+    confidence_limit = _number(current.get('association_confidence_limit', .50))
+    qualified_cap = state.get('last_qualified_cap', state['last_cap'])
+    qualified_stamp = state.get('last_qualified_timestamp', state['last_timestamp'])
+    jump = _number((geometry or {}).get('yaw_compensated_center_jump_ratio'))
+    area = _number((geometry or {}).get('area_similarity'))
+    if (cap is None or stamp is None or cap <= state['last_cap'] or stamp <= state['last_timestamp']
+            or current.get('track_id') != track_id or current.get('is_fresh') is not True
+            or current.get('low_score_continuation') is not True
+            or current.get('association_reason') != 'low_score_existing_track'
+            or current.get('association_previous_capture_frame_id') != qualified_cap
+            or current.get('association_previous_capture_timestamp') != qualified_stamp
+            or not 0 < stamp-qualified_stamp <= .5 or stamp-state['last_timestamp'] > .5
+            or confidence_limit is None or not .25 < confidence_limit <= 1.
+            or confidence is None or not .25 <= confidence < confidence_limit
+            or full is None or not 0 <= full <= .50
+            or competition_ok is not True or blocked is not False
+            or not geometry or geometry.get('ok') is not True
+            or jump is None or not 0 <= jump <= .20
+            or area is None or not .55 <= area <= 1.):
+        return None
+    result = deepcopy(state)
+    result.update(position_only=True,
+                  position_previous_observation=deepcopy(state['observation']),
+                  last_qualified_cap=qualified_cap, last_qualified_timestamp=qualified_stamp,
+                  last_cap=cap, last_timestamp=stamp, observation=deepcopy(current))
+    return result
+
+
+def candidate_motion_geometry(current, state, geometry, *, camera_hfov_deg):
+    """Check a real new strong box against two real associated observations.
+
+    Used only after a bounded low-score observation, with known camera yaw.
+    The result is follow-only evidence, never a replacement trusted anchor.
+    No extrapolated box or timestamp is ever committed as an observation.
+    """
+    if (not isinstance(state, dict) or not state.get('position_only') or not geometry
+            or not _valid_state(state, _identifier(state.get('uid')), _identifier(state.get('track_id')))):
+        return None
+    first, second = state.get('position_previous_observation'), state.get('observation')
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return None
+    rows = []
+    for observation in (first, second, current):
+        row = [_number(observation.get(key)) for key in
+               ('capture_timestamp', 'detector_center_x_ratio', 'integrated_yaw_deg', 'detector_area_ratio')]
+        if any(value is None for value in row) or not 0 <= row[1] <= 1 or row[3] <= 0:
+            return None
+        if observation.get('is_fresh') is not True or observation.get('track_id') != state['track_id']:
+            return None
+        rows.append(row)
+    (t0, x0, y0, a0), (t1, x1, y1, a1), (t2, x2, y2, a2) = rows
+    if (not .05 <= t1-t0 <= .5 or not 0 < t2-t1 <= .35
+            or t2-state['last_qualified_timestamp'] > .75
+            or second.get('low_score_continuation') is not True
+            or current.get('quality_bbox_ok') is not True
+            or current.get('bbox_quality_tier') != 'strong'
+            or current.get('low_score_continuation')
+            or min(a0, a1, a2)/max(a0, a1, a2) < .55):
+        return None
+    v = (x1-x0-yaw_image_shift_ratio(y0, y1, camera_hfov_deg))/(t1-t0)
+    predicted = x1 + v*(t2-t1) + yaw_image_shift_ratio(y1, y2, camera_hfov_deg)
+    residual = abs(x2-predicted)
+    # Reuse the normal local .20 residual test; only the reference position
+    # changes. The short horizon and measured speed bound prevent arbitrary
+    # extrapolation, without introducing another tighter threshold to chatter.
+    if not math.isfinite(v) or abs(v) > 1.0 or not math.isfinite(residual) or residual > .20:
+        return None
+    return dict(geometry, ok=True, reason='candidate_motion_continuous',
+                candidate_motion_prediction=dict(reference_caps=[first['capture_frame_id'], second['capture_frame_id']],
+                    predicted_center_x_ratio=predicted, residual=residual,
+                    measured_center_jump=geometry.get('yaw_compensated_center_jump_ratio')),
+                yaw_compensated_center_jump_ratio=residual)
+
+
+def formal_detection_continuous(current, state, geometry, *, confidence, gallery_distance):
+    """Recheck a formal .50+ detector result against an accepted candidate.
+
+    Detector admission (.50) and template quality (.60) are different rights.
+    This cannot initialize/rebind a candidate or use its own follow references
+    as appearance proof. Both the last qualified capture and this new capture
+    need independent gallery support. Low-score position observations keep the
+    original qualified timestamp and cannot extend its bounded .75 s bridge.
+    The caller still checks minimum area, competition and hard contradictions.
+    """
+    track = _identifier(current.get('track_id'))
+    if (not _valid_state(state, _identifier((state or {}).get('uid')), track)
+            or not state['active'] or current.get('is_fresh') is not True
+            or current.get('quality_bbox_ok') is not True
+            or current.get('bbox_quality_tier') != 'strong'
+            or any(current.get(key) for key in ('low_score_continuation',
+                'search_observation_only', 'observation_only', 'preferred_search_low_confidence'))
+            or current.get('candidate_count') != 1):
+        return False
+    cap, stamp = _identifier(current.get('capture_frame_id')), _number(current.get('capture_timestamp'))
+    score, detector_score = _number(confidence), _number(current.get('detector_confidence'))
+    previous_gallery, current_gallery = _number(state.get('gallery_distance')), _number(gallery_distance)
+    qualified_stamp = _number(state.get('last_qualified_timestamp', state.get('last_timestamp')))
+    jump = _number((geometry or {}).get('yaw_compensated_center_jump_ratio'))
+    area = _number((geometry or {}).get('area_similarity'))
+    return bool(cap is not None and cap > state['last_cap'] and stamp is not None
+        and 0 < stamp-state['last_timestamp'] <= .50
+        and qualified_stamp is not None and 0 < stamp-qualified_stamp <= .75
+        and score is not None and .50 <= score <= 1.
+        and detector_score is not None and .50 <= detector_score <= 1.
+        and previous_gallery is not None and 0 <= previous_gallery <= .30
+        and current_gallery is not None and 0 <= current_gallery <= .30
+        and geometry and geometry.get('ok') is True
+        and jump is not None and 0 <= jump <= .20
+        and area is not None and .55 <= area <= 1.)
+
+
+def cropped_follow_continuous(current, state, geometry):
+    """A recent accepted candidate may retain a substantial three-edge crop.
+
+    This does not make the crop a trusted template. Only the exact edge-count
+    failure is eligible, with current local geometry and at most .75 s since
+    the last normally qualified capture (not a rolling motor/identity lease).
+    """
+    if not state or not state.get('active') or not isinstance(geometry, dict):
+        return False
+    reasons = [str(current.get(k) or '').removeprefix('detector_crop:')
+               for k in ('quality_bbox_reason', 'bbox_quality_reason')]
+    if not any(reasons) or any(r and r != 'edge_touch>2' for r in reasons):
+        return False
+    if geometry.get('ok') is not True:
+        return False
+    timestamp = _number(current.get('capture_timestamp'))
+    origin = _number(state.get('last_strong_timestamp', state.get('last_timestamp')))
+    width, height = (_number(current.get(k)) for k in ('image_width', 'image_height'))
+    box = current.get('detector_bbox')
+    if (timestamp is None or origin is None or not 0 < timestamp-origin <= .75
+            or width is None or height is None or min(width, height) <= 0
+            or not isinstance(box, (list, tuple)) or len(box) != 4):
+        return False
+    points = [_number(v) for v in box]
+    if any(v is None for v in points):
+        return False
+    x1, y1, x2, y2 = points
+    return bool(0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height
+                and x2-x1 >= max(80., .12*width) and y2-y1 >= .5*height
+                and (x2-x1)*(y2-y1)/(width*height) >= .12
+                and not (x1 <= .02*width and x2 >= .98*width))
+
+
+def crop_reverification_eligible(current, state, geometry):
+    """A new, substantial same-side crop may be independently rechecked.
+
+    This is not the .75 s historical crop bridge. Each admitted capture must
+    carry new detector evidence, strict local geometry and (at the caller)
+    current independent-gallery appearance and competition checks. Missing
+    frames cannot roll this .35 s observation-gap limit. Neither a raw-ID
+    handoff nor a position-only/low-score observation can enter this path.
+    """
+    uid, track = _identifier((state or {}).get('uid')), _identifier(current.get('track_id'))
+    if (not _valid_state(state, uid, track) or not state['active']
+            or state.get('position_only') or current.get('is_fresh') is not True
+            or current.get('low_score_continuation') is True
+            or any(current.get(key) for key in ('search_observation_only', 'observation_only',
+                                                'preferred_search_low_confidence'))):
+        return False
+    cap, stamp = _identifier(current.get('capture_frame_id')), _number(current.get('capture_timestamp'))
+    score = _number(current.get('detector_confidence'))
+    if (cap is None or cap <= state['last_cap'] or stamp is None
+            or not 0 < stamp-state['last_timestamp'] <= .35
+            or score is None or not .75 <= score <= 1.):
+        return False
+    previous = state['observation']
+    reasons = [str(row.get(key) or '').removeprefix('detector_crop:')
+               for row in (previous, current)
+               for key in ('quality_bbox_reason', 'bbox_quality_reason')]
+    if (not any(reasons[:2]) or not any(reasons[2:])
+            or any(reason and reason != 'edge_touch>2' for reason in reasons)):
+        return False
+    jump = _number((geometry or {}).get('yaw_compensated_center_jump_ratio'))
+    area = _number((geometry or {}).get('area_similarity'))
+    if (not geometry or geometry.get('ok') is not True or jump is None
+            or not 0 <= jump <= .10 or area is None or not .70 <= area <= 1.):
+        return False
+    width, height = (_number(current.get(key)) for key in ('image_width', 'image_height'))
+    if (width is None or height is None or min(width, height) <= 0
+            or _number(previous.get('image_width')) != width
+            or _number(previous.get('image_height')) != height):
+        return False
+    sides = []
+    for row in (previous, current):
+        box = row.get('detector_bbox')
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            return False
+        values = [_number(value) for value in box]
+        if any(value is None for value in values):
+            return False
+        x1, y1, x2, y2 = values
+        left, right = x1 <= .02*width, x2 >= .98*width
+        if (not 0 <= x1 < x2 <= width or not 0 <= y1 < y2 <= height
+                or left == right or x2-x1 < max(80., .12*width)
+                or y2-y1 < .5*height or (x2-x1)*(y2-y1)/(width*height) < .12):
+            return False
+        sides.append(left)
+    return sides[0] == sides[1]
+
+
+def cropped_visibility_geometry(current, state, geometry):
+    """Do not interpret same-edge visibility loss as a shrinking person.
+
+    Both observations must be full-height same-side crops of the already
+    accepted candidate. Existing position/absolute-size/crop-age checks still
+    apply; only the visible-area comparison uses the unchanged vertical span.
+    """
+    if not cropped_follow_continuous(current, state, geometry):
+        return geometry
+    previous = state.get('observation') or {}
+    boxes = [observation.get('detector_bbox') for observation in (previous, current)]
+    width, height = _number(current.get('image_width')), _number(current.get('image_height'))
+    if any(not isinstance(box, (list, tuple)) or len(box) != 4 for box in boxes):
+        return geometry
+    values = [[_number(v) for v in box] for box in boxes]
+    if any(v is None for box in values for v in box):
+        return geometry
+    (px1, py1, px2, py2), (x1, y1, x2, y2) = values
+    left = px1 <= .02*width and x1 <= .02*width
+    right = px2 >= .98*width and x2 >= .98*width
+    if (left == right or min(px2-px1, x2-x1, py2-py1, y2-y1) <= 0
+            or max(py1, y1) > .02*height or min(py2, y2) < .98*height
+            or x2-x1 > px2-px1):
+        return geometry
+    height_similarity = min(py2-py1, y2-y1)/max(py2-py1, y2-y1)
+    if height_similarity < .90:
+        return geometry
+    return dict(geometry, crop_continuity_area_similarity=height_similarity,
+                crop_visible_area_similarity=geometry.get('area_similarity'),
+                crop_visibility_reason='same_edge_height_continuous')

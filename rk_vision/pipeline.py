@@ -179,6 +179,12 @@ class RKNNVisionConfig:
     # Only stable, already verified bindings may use detector-only geometry.
     # The board config opts in; legacy callers keep the full pipeline.
     detector_continuation_enable: bool = False
+    # Diagnostic only, fed at processed-frame cadence; no camera-loop hook.
+    lk_shadow_enable: bool = False
+    lk_shadow_width: int = 320
+    lk_shadow_correction_interval_sec: float = 0.30
+    lk_shadow_max_gap_sec: float = 0.25
+    lk_shadow_max_seed_age_sec: float = 0.75
     person_class_id: int = 0
     conf_threshold: float = 0.25
     search_diagnostic_conf_threshold: float = 0.10
@@ -340,6 +346,13 @@ class RKNNVisionConfig:
             reid_enable=os.environ.get("VISION_REID_ENABLE", "1").strip() != "0",
             detector_continuation_enable=os.environ.get(
                 "Y8_DETECTOR_CONTINUATION_ENABLE", "0").strip().lower() in {"1", "true", "yes"},
+            lk_shadow_enable=os.environ.get(
+                "Y8_LK_SHADOW_ENABLE", "0").strip().lower() in {"1", "true", "yes", "on"},
+            lk_shadow_width=int(os.environ.get("Y8_LK_SHADOW_WIDTH", "320")),
+            lk_shadow_correction_interval_sec=float(os.environ.get(
+                "Y8_LK_SHADOW_CORRECTION_INTERVAL_SEC", "0.30")),
+            lk_shadow_max_gap_sec=float(os.environ.get("Y8_LK_SHADOW_MAX_GAP_SEC", "0.25")),
+            lk_shadow_max_seed_age_sec=float(os.environ.get("Y8_LK_SHADOW_MAX_SEED_AGE_SEC", "0.75")),
             person_class_id=int(os.environ.get("PERSON_CLASS_ID", "0")),
             conf_threshold=float(os.environ.get("CONFIDENCE_THRESHOLD", "0.25")),
             search_diagnostic_conf_threshold=float(
@@ -860,6 +873,13 @@ class RKNNVisionPipeline:
         self._frame_context: dict = {}
         self._detector_continuation_active_uid = None
         self._detector_continuation_allowed = False
+        self._lk_shadow_worker = None
+        self._lk_shadow_closed = False
+        self._lk_shadow_failed = False
+        self._lk_shadow_last_seed = None
+        self._lk_shadow_logged_capture = None
+        self.last_lk_shadow_result = None
+        self.last_lk_shadow_diagnostic = None
         self.last_identity_processing = {"mode": "full", "reason": "startup"}
         self._reid_diagnostics = None
         if self.config.reid_diagnostics_enable and self.config.reid_diagnostics_dir:
@@ -1040,6 +1060,7 @@ class RKNNVisionPipeline:
             "predicted_reid_verify": 0.0,
             "total": _elapsed_ms(frame_start, detect_end),
         }
+        self._submit_lk_shadow(arr, fmt, (), allow_seed=False)
         if self.logger is not None:
             self.logger.debug(
                 "rknn detector-only recovery frame processed "
@@ -1177,6 +1198,7 @@ class RKNNVisionPipeline:
         if not detector_only and getattr(bank, "_assign_timing_frame", None) == getattr(self.tracker, "_frame_index", -1):
             for key, value in getattr(bank, "last_assign_timing_ms", {}).items():
                 self.last_timing_ms["identity_" + key] = value
+        self._submit_lk_shadow(arr, fmt, records)
         if self.logger is not None:
             if getattr(self.config, "detector_continuation_enable", False):
                 processing = self.last_identity_processing
@@ -1187,13 +1209,15 @@ class RKNNVisionPipeline:
                 self.logger.info(
                     "identity_processing capture_frame_id=%s mode=%s reason=%s "
                     "verified_capture=%s identity_valid_until=%s fast_check_ms=%.2f "
-                    "reid_ms=%.2f total_ms=%.2f next_proof_reason=%s known_background_count=%d",
+                    "reid_ms=%.2f total_ms=%.2f next_proof_reason=%s known_background_count=%d "
+                    "continuation_permission=%s",
                     self._frame_context.get("capture_frame_id"), processing["mode"],
                     processing["reason"], assignment.get("identity_verified_capture"),
                     assignment.get("identity_valid_until"), fast_check_ms,
                     self.last_timing_ms["reid_total"], self.last_timing_ms["total"],
                     getattr(self.tracker, "last_detector_continuation_reason", "unavailable"),
                     len(getattr(getattr(self.tracker, "_detector_proof", None), "backgrounds", ())),
+                    processing.get("permission", "full"),
                 )
             self.logger.debug(
                 "rknn vision frame processed width=%d height=%d detections=%d persons=%d tracks=%d",
@@ -1204,6 +1228,112 @@ class RKNNVisionPipeline:
                 len(records),
             )
         return records
+
+    def _lk_shadow_seed(self, records, capture_id, timestamp):
+        """Resolve a detector crop on this exact image, without changing identity."""
+        from .lk_shadow import LKShadowSeed
+
+        active_uid = getattr(self, "_detector_continuation_active_uid", None)
+        current = [r for r in records if int(r.reid_uid) > 0
+                   and r.time_since_update == 0 and r.class_id == self.config.person_class_id
+                   and (active_uid is None or int(r.reid_uid) == int(active_uid))]
+        if len(current) != 1:
+            return None
+        record = current[0]
+        uid, raw = int(record.reid_uid), int(record.track_id)
+        observations = []
+        for observation in getattr(self.tracker, "last_identity_observations", ()):
+            metadata = observation.get("sample_metadata") or {}
+            assignment = observation.get("assignment") or {}
+            if (observation.get("uid") == uid and observation.get("raw_track_id") == raw
+                    and metadata.get("capture_frame_id") == capture_id
+                    and metadata.get("capture_timestamp") == timestamp
+                    and metadata.get("is_fresh") is True
+                    and assignment.get("uid") == uid
+                    and not assignment.get("identity_control_rejected")
+                    and not assignment.get("search_excluded")
+                    and not assignment.get("search_contradiction_retained")
+                    and assignment.get("bbox_quality_ok") is not False
+                    and assignment.get("reacquire_geometry_ok") is not False
+                    and (assignment.get("identity_competition") or {}).get("passed") is not False
+                    and observation.get("detector_bbox") is not None):
+                observations.append(observation)
+        if len(observations) != 1:
+            return None
+        previous = getattr(self, "_lk_shadow_last_seed", None)
+        if (previous is not None and previous[:2] == (uid, raw)
+                and timestamp - previous[2] < self.config.lk_shadow_correction_interval_sec):
+            return None
+        return LKShadowSeed(uid, raw, capture_id, timestamp, observations[0]["detector_bbox"])
+
+    def _submit_lk_shadow(self, arr, frame_format, records, *, allow_seed=True):
+        """Submit once after real processing; never replace a TrackRecord.
+
+        This first trial runs only at process_frame/probe cadence. It does not
+        see intervening camera captures or replay delayed YOLO keyframes, and
+        makes no camera-FPS claim. Corrections stay on their own raw images.
+        """
+        if (not getattr(self.config, "lk_shadow_enable", False)
+                or getattr(self, "_lk_shadow_closed", False)
+                or getattr(self, "_lk_shadow_failed", False)):
+            return
+        start = time.perf_counter()
+        try:
+            context = self._frame_context
+            cap, timestamp = context.get("capture_frame_id"), context.get("capture_timestamp")
+            if (isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0
+                    or isinstance(timestamp, bool) or timestamp is None
+                    or not math.isfinite(timestamp) or timestamp <= 0):
+                self.last_lk_shadow_diagnostic = {"status": "not_submitted", "reason": "invalid_capture_context"}
+                return
+            from .lk_shadow import LKShadowConfig, LKShadowWorker
+            worker = getattr(self, "_lk_shadow_worker", None)
+            if worker is None:
+                worker = LKShadowWorker(LKShadowConfig(
+                    width=self.config.lk_shadow_width,
+                    max_gap_sec=self.config.lk_shadow_max_gap_sec,
+                    max_seed_age_sec=self.config.lk_shadow_max_seed_age_sec))
+                self._lk_shadow_worker = worker
+            # Poll already-computed immutable diagnostics; never wait on flow.
+            result = worker.latest_result()
+            if result is not None:
+                self.last_lk_shadow_result = result
+                if result.capture_id != getattr(self, "_lk_shadow_logged_capture", None):
+                    self._lk_shadow_logged_capture = result.capture_id
+                    if self.logger is not None:
+                        import json
+                        from dataclasses import asdict
+                        payload = asdict(result)
+                        payload.update(observed_at_capture_id=cap,
+                            observed_capture_age_ms=(timestamp - result.capture_timestamp) * 1000.,
+                            cadence="processed_frames_only", identity_authority=False,
+                            motion_authority=False, worker=worker.stats())
+                        self.logger.info("lk_shadow_result %s", json.dumps(payload, allow_nan=False))
+            seed = self._lk_shadow_seed(records, cap, timestamp) if allow_seed else None
+            submitted = worker.submit(arr, cap, timestamp, seed=seed, frame_format=frame_format)
+            if submitted and seed is not None:
+                self._lk_shadow_last_seed = (seed.uid, seed.raw_track_id, seed.capture_timestamp)
+            self.last_lk_shadow_diagnostic = {
+                "status": "submitted" if submitted else "not_submitted",
+                "capture_id": cap, "capture_timestamp": timestamp,
+                "seed_capture_id": seed.capture_id if seed else None,
+                "cadence": "processed_frames_only", "worker": worker.stats(),
+            }
+        except Exception as exc:
+            # Optional diagnostics must not become a vision failure/motor stop.
+            self._lk_shadow_failed = True
+            self.last_lk_shadow_diagnostic = {"status": "disabled_after_error", "reason": type(exc).__name__}
+            try:
+                if self.logger is not None:
+                    self.logger.warning("lk_shadow_disabled reason=%s", type(exc).__name__)
+            except Exception:
+                pass
+        finally:
+            submit_ms = _elapsed_ms(start, time.perf_counter())
+            self.last_timing_ms["lk_shadow_submit"] = submit_ms
+            # Only this synchronous cost belongs to pipeline total. Worker
+            # compute is reported by result.wall_ms, never as model inference.
+            self.last_timing_ms["total"] = self.last_timing_ms.get("total", 0.) + submit_ms
 
     def set_detector_continuation_context(self, *, active_uid, allowed: bool) -> None:
         self._detector_continuation_active_uid = active_uid
@@ -1236,6 +1366,7 @@ class RKNNVisionPipeline:
         self.last_identity_processing = {
             "mode": "detector_continuation" if records is not None else "full",
             "reason": getattr(self.tracker, "last_detector_continuation_reason", "unavailable"),
+            "permission": plan.proof.permission if records is not None else "full",
         }
         return records
 
@@ -1518,6 +1649,25 @@ class RKNNVisionPipeline:
         self.reid.load()
 
     def close(self) -> None:
+        self._lk_shadow_closed = True
+        worker = getattr(self, "_lk_shadow_worker", None)
+        if worker is not None:
+            try:
+                stopped = worker.close()
+                if not stopped and self.logger is not None:
+                    self.logger.warning("lk_shadow_close worker_still_finishing=true")
+                if self.logger is not None:
+                    import json
+                    self.logger.info("lk_shadow_summary %s", json.dumps(dict(
+                        cadence="processed_frames_only", identity_authority=False,
+                        motion_authority=False, complete=stopped, worker=worker.stats()),
+                        allow_nan=False))
+            except Exception as exc:
+                try:
+                    if self.logger is not None:
+                        self.logger.warning("lk_shadow_close reason=%s", type(exc).__name__)
+                except Exception:
+                    pass
         if self._reid_diagnostics is not None:
             self._reid_diagnostics.close()
             if self.logger is not None:

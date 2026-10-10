@@ -25,8 +25,7 @@ def confirmed_tracker(route, *, two_tracks=False):
         NearestNeighborDistanceMetric("cosine", 0.3, 15),
         n_init=2,
         max_age=5,
-        # An appearance test must succeed without the IoU rescue path.
-        max_bbox_age=0 if route == "appearance" else 2,
+        max_bbox_age=2,
     )
     tracker._next_id = 41
     detections = [detection()]
@@ -36,6 +35,10 @@ def confirmed_tracker(route, *, two_tracks=False):
     tracker.predict()
     tracker.update(detections)
     assert all(track.is_confirmed() for track in tracker.tracks)
+    # Disable IoU only after initialization, so max_bbox_age is respected
+    # consistently by both candidate selection and its cost function.
+    if route == "appearance":
+        tracker.max_bbox_age = 0
     return tracker
 
 

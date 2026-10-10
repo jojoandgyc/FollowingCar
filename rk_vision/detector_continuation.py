@@ -23,6 +23,15 @@ MAX_DETECTION_GAP_SEC = .21
 MAX_DETECTION_AGE_SEC = .18
 MAX_FAST_FRAMES = 2
 MAX_COLOR_DISTANCE = .04
+# A separately qualified follow-only lane can skip one full check at the
+# board's ~200 ms capture cadence. Its fixed lease and learning permissions
+# are unchanged; strict identity verification keeps its original policy.
+SIMILAR_FULL_RECHECK_INTERVAL_SEC = .25
+SIMILAR_MAX_DETECTION_GAP_SEC = .25
+# Cropped full re-verification has a shorter .35 s observation-gap budget.
+# Do not skip a .2 s frame only to make the next full check .4 s late.
+SIMILAR_CROP_RECHECK_INTERVAL_SEC = .175
+SIMILAR_MAX_GALLERY_DISTANCE = .30
 
 
 @dataclass(frozen=True)
@@ -55,10 +64,14 @@ class DetectorProof:
     full_count: int
     fast_count: int = 0
     backgrounds: tuple = ()
+    permission: str = "strong"
+    crop_edge_mask: tuple = ()
+    permission_deadline: float = None
 
     @property
     def deadline(self):
-        return self.verified.timestamp + FULL_PROOF_TTL_SEC
+        full_deadline = self.verified.timestamp + FULL_PROOF_TTL_SEC
+        return full_deadline if self.permission_deadline is None else min(full_deadline, self.permission_deadline)
 
 
 @dataclass(frozen=True)
@@ -168,13 +181,18 @@ def continuation_reason(proof, observation, now, hfov):
         return "nonnew_capture"
     if now >= observation.timestamp + MAX_DETECTION_AGE_SEC:
         return "detection_stale"
-    if observation.timestamp > proof.previous.timestamp + MAX_DETECTION_GAP_SEC:
+    similar = proof.permission == "similar_follow"
+    gap = SIMILAR_MAX_DETECTION_GAP_SEC if similar else MAX_DETECTION_GAP_SEC
+    interval = SIMILAR_FULL_RECHECK_INTERVAL_SEC if similar else FULL_RECHECK_INTERVAL_SEC
+    if similar and sum(proof.crop_edge_mask) == 3:
+        interval = min(interval, SIMILAR_CROP_RECHECK_INTERVAL_SEC)
+    if observation.timestamp > proof.previous.timestamp + gap:
         return "detection_gap"
     if proof.full_count < 2:
         return "full_verification_streak"
     if proof.fast_count >= MAX_FAST_FRAMES:
         return "fast_budget_exhausted"
-    if observation.timestamp >= proof.verified.timestamp+FULL_RECHECK_INTERVAL_SEC:
+    if observation.timestamp >= proof.verified.timestamp+interval:
         return "full_recheck_due"
     if not geometry_matches(proof.previous, observation, hfov):
         return "adjacent_geometry"

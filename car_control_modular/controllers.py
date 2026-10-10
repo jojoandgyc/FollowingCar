@@ -34,7 +34,9 @@ from .steering_pid import (
     VisualSteeringPidConfig,
     VisualSteeringPidResult,
 )
-from .target_direction_history import TargetDirectionHistory
+from .target_direction_history import TargetDirectionDecision, TargetDirectionHistory
+from .historical_direction_backfill import associate_direction_chain
+from .low_quality_lateral import LimitedYawSource
 from .sample_braking import SampleBrakingAssessment, sample_feedback_time_valid
 from .depth_authority_timing import MAX_FORWARD_DEPTH_TTL_SEC
 from .depth_continuation import RELATIVE_CONTINUATION_REVERSE_TAIL_RPM
@@ -69,6 +71,16 @@ class _CurrentLateralCandidate:
     aimline_gap_ratio: float
     aimline_intersects: bool
     evidence: LateralCandidateEvidence
+
+
+@dataclass(frozen=True)
+class _AssociatedPositionDirection:
+    """Short-lived target-associated geometry, never a new identity proof."""
+    source: LimitedYawSource
+    direction: str
+    confidence: float
+    expires_at: float
+    loss_capture_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -546,6 +558,8 @@ class FollowSafetyController:
         self._lost_hint_confidence = 0.0
         self._lost_hint_source = "none"
         self._historical_direction_hint = None
+        self._historical_direction_applied_capture_id = 0
+        self._limited_yaw_direction: Optional[_AssociatedPositionDirection] = None
         self._direction_loss_capture_id: Optional[int] = None
         self._direction_latest_visible_capture_id = 0
         self._candidate_geometry_anchor_bbox: Optional[Tuple[float, float, float, float]] = None
@@ -986,6 +1000,120 @@ class FollowSafetyController:
         if self.cfg.direction_history_enable:
             self._target_direction_history.record_unknown(capture_frame_id, timestamp, reason)
 
+    def clear_limited_yaw_direction(self, reason: str = "clear") -> None:
+        evidence = self._limited_yaw_direction
+        if evidence is not None:
+            logger.info("associated_position_direction_clear reason=%s capture=%s uid=%s",
+                        reason, evidence.source.capture, evidence.source.uid)
+        self._limited_yaw_direction = None
+
+    def note_limited_yaw_direction(
+        self, source: LimitedYawSource, *, frame_width: int, confidence: float,
+        expires_at: float, now: Optional[float] = None,
+    ) -> bool:
+        """Accept already-qualified same-UID position without renewing identity.
+
+        The caller binds current independent appearance/competition evidence
+        to ``source.identity_publication`` and freezes ``expires_at`` at the
+        last full verification. Detector-only backfill never calls this API.
+        This stores no trusted-visible vote, closes no loss episode, and emits
+        no action. Only later direction arbitration may consume the position.
+        """
+        if (not self.cfg.direction_history_enable or not isinstance(source, LimitedYawSource)
+                or source.identity_publication is None or not self._has_seen_person
+                or source.uid != self.active_target_id):
+            return False
+        try:
+            checked_at = time.monotonic() if now is None else float(now)
+            stamp, deadline, score = float(source.timestamp), float(expires_at), float(confidence)
+            uid, raw, cap = int(source.uid), int(source.track_id), int(source.capture)
+            width = float(frame_width)
+            x1, y1, x2, y2 = (float(v) for v in source.bbox)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (not all(math.isfinite(v) for v in
+                    (checked_at, stamp, deadline, score, width, x1, y1, x2, y2))
+                or uid <= 0 or raw <= 0 or cap <= 0 or width <= 0
+                or not 0 < stamp <= checked_at < deadline
+                or not 0 <= x1 < x2 <= width or y1 < 0 or y2 <= y1
+                or not 0 <= score <= 1
+                or stamp <= self._target_direction_history.not_before_timestamp):
+            return False
+        latest = self._target_direction_history.latest_visible_evidence()
+        if latest is not None and (cap <= latest.capture_frame_id or stamp <= latest.timestamp):
+            return False
+        previous = self._limited_yaw_direction
+        # A stream of weak detections cannot keep the underlying identity
+        # alive. A new formal observation explicitly clears this fence.
+        if previous is not None:
+            if (previous.source.uid != uid or previous.source.track_id != raw
+                    or cap <= previous.source.capture or stamp <= previous.source.timestamp):
+                return False
+            if (previous.loss_capture_id is not None
+                    and previous.loss_capture_id != self._direction_loss_capture_id):
+                return False
+            deadline = min(deadline, previous.expires_at)
+        deadline = min(deadline, stamp + .50)
+        if checked_at >= deadline:
+            return False
+        side = "left" if (x1+x2)/(2.0*width) < .5 else "right"
+        self._limited_yaw_direction = _AssociatedPositionDirection(
+            source, side, score, deadline, self._direction_loss_capture_id)
+        logger.info("associated_position_direction capture=%s uid=%s raw_track=%s side=%s "
+                    "expires_at=%.6f identity_renewed=False trusted_history_updated=False motion_authorized=False",
+                    cap, uid, raw, side, deadline)
+        return True
+
+    def _with_associated_direction(self, decision: TargetDirectionDecision) -> TargetDirectionDecision:
+        decision = self._with_limited_yaw_direction(decision)
+        hint = self._historical_hint_for_current_target()
+        chain = None if hint is None else hint.get("association")
+        latest = self._target_direction_history.latest_visible_evidence()
+        if (chain is None or latest is None
+                or chain.uid != self.active_target_id
+                or chain.loss_capture_frame_id != self._direction_loss_capture_id
+                or latest.capture_frame_id != chain.anchor_capture_frame_id
+                or latest.timestamp != chain.anchor_timestamp
+                or tuple(latest.bbox or ()) != chain.anchor_bbox
+                or chain.first_timestamp <= self._target_direction_history.not_before_timestamp
+                or (decision.last_visible_capture_frame_id is not None
+                    and decision.last_visible_capture_frame_id >= chain.captures[-1])):
+            return decision
+        return TargetDirectionDecision(chain.direction, hint["confidence"],
+            "associated_historical_position", decision.missing_frames,
+            chain.captures[-1], len(chain.captures))
+
+    def _with_limited_yaw_direction(self, decision: TargetDirectionDecision) -> TargetDirectionDecision:
+        evidence = self._limited_yaw_direction
+        if evidence is None:
+            return decision
+        source = evidence.source
+        now = time.monotonic()
+        latest = self._target_direction_history.latest_visible_evidence()
+        if (source.uid != self.active_target_id or not math.isfinite(now)
+                or source.timestamp > now or self.search_state == "timed_out"
+                or source.timestamp <= self._target_direction_history.not_before_timestamp
+                or (latest is not None and (source.capture <= latest.capture_frame_id
+                                           or source.timestamp <= latest.timestamp))):
+            return decision
+        # The half-second deadline admits current geometry; it is not the
+        # lifetime of the historical fact that the target crossed left. Once
+        # admitted, retain that side for THIS loss/finite search only, just as
+        # trusted history does. No motor/identity reader consumes this cache.
+        loss_id = self._direction_loss_capture_id
+        if evidence.loss_capture_id is not None and evidence.loss_capture_id != loss_id:
+            return decision
+        if evidence.loss_capture_id is None and loss_id is not None:
+            self._limited_yaw_direction = replace(evidence, loss_capture_id=loss_id)
+        if (decision.last_visible_capture_frame_id is not None
+                and source.capture <= decision.last_visible_capture_frame_id):
+            return decision
+        return TargetDirectionDecision(evidence.direction, evidence.confidence,
+            "associated_low_score_position", decision.missing_frames, source.capture, 1)
+
+    def _latest_lateral_direction_side(self) -> TargetDirectionDecision:
+        return self._with_associated_direction(self._target_direction_history.latest_reliable_side())
+
     def clear_historical_direction_hint(self, reason: str = "clear") -> None:
         if self._historical_direction_hint is not None:
             logger.info(
@@ -995,6 +1123,7 @@ class FollowSafetyController:
                 self._direction_latest_visible_capture_id,
             )
         self._historical_direction_hint = None
+        self._historical_direction_applied_capture_id = 0
 
     def _historical_hint_rejection(self, hint: dict) -> Optional[str]:
         if self.active_target_id is not None and int(hint.get("active_target_id", -1)) != int(self.active_target_id):
@@ -1029,12 +1158,15 @@ class FollowSafetyController:
         loss_capture_frame_id: int,
         evidence_timestamp: float,
         reason: str = "historical_direction_evidence",
+        association_candidates=None,
     ) -> bool:
         """Store a non-target-owned hint for this specific loss episode.
 
         This method deliberately does not modify ``search_direction`` or emit
-        an action.  The normal controller state machine consumes the hint only
-        when its capture timeline has no trusted side. ``evidence_timestamp``
+        an action. Generic hints remain fallback-only. A complete formal
+        detector chain bound to the current trusted anchor may additionally
+        update lateral direction, never UID/Depth/template authority.
+        ``evidence_timestamp``
         is the oldest contributing capture's monotonic timestamp, so queueing
         or resubmission cannot renew the lifetime of the evidence chain.
         """
@@ -1073,7 +1205,27 @@ class FollowSafetyController:
             "reason": str(reason),
             "loss_capture_frame_id": int(loss_capture_frame_id),
             "evidence_timestamp": float(evidence_timestamp),
+            "association_reason": "metadata_not_supplied",
         }
+        if association_candidates is not None:
+            chain = associate_direction_chain(association_candidates,
+                anchor=self._target_direction_history.latest_visible_evidence(),
+                uid=self.active_target_id, loss_capture_frame_id=loss_capture_frame_id,
+                selected_capture_frame_ids=ids, now=time.monotonic(),
+                max_age_sec=self.cfg.historical_direction_backfill_max_age_sec,
+                max_capture_gap=self.cfg.historical_direction_backfill_max_capture_gap,
+                max_center_jump_ratio=self.cfg.historical_direction_backfill_max_center_jump_ratio,
+                min_area_similarity=self.cfg.historical_direction_backfill_min_area_similarity,
+                camera_hfov_deg=self.cfg.visible_steering_pid_camera_hfov_deg)
+            if chain is None:
+                hint["association_reason"] = "incomplete_or_unqualified_anchor_chain"
+            elif chain.direction != side:
+                hint["association_reason"] = "chain_direction_mismatch"
+            elif chain.first_timestamp != hint["evidence_timestamp"]:
+                hint["association_reason"] = "chain_timestamp_mismatch"
+            else:
+                hint["association"] = chain
+                hint["association_reason"] = "anchor_associated_position"
         rejection = self._historical_hint_rejection(hint)
         if rejection is not None:
             logger.info("historical_direction_hint_rejected reason=%s loss_capture=%s current_loss=%s evidence_last=%s latest_visible=%s",
@@ -1082,13 +1234,15 @@ class FollowSafetyController:
             return False
         self._historical_direction_hint = hint
         logger.info(
-            "historical_direction_hint_ready direction=%s active_uid=%d captures=%s confidence=%.2f reason=%s loss_capture=%d evidence_timestamp=%.6f",
+            "historical_direction_hint_ready direction=%s active_uid=%d captures=%s confidence=%.2f reason=%s loss_capture=%d evidence_timestamp=%.6f associated_position=%s association_reason=%s",
             side,
             int(active_target_id),
             ",".join(str(value) for value in ids),
             float(self._historical_direction_hint["confidence"]),
             str(reason),
             int(loss_capture_frame_id), float(evidence_timestamp),
+            hint.get("association") is not None,
+            hint["association_reason"],
         )
         return True
 
@@ -1341,6 +1495,9 @@ class FollowSafetyController:
             # detector-only candidates cannot close a loss episode. Mapped
             # low-quality crops already qualify for direction geometry here.
             if int(frame.capture_frame_id) > self._direction_latest_visible_capture_id:
+                limited = self._limited_yaw_direction
+                if limited is not None and int(frame.capture_frame_id) >= limited.source.capture:
+                    self.clear_limited_yaw_direction("newer_target_visible")
                 self._direction_latest_visible_capture_id = int(frame.capture_frame_id)
                 self._direction_loss_capture_id = None
                 self.clear_historical_direction_hint("newer_target_visible")
@@ -1878,12 +2035,14 @@ class FollowSafetyController:
         self.lost_confirm_frames = 0
         self._search_observation_hold = False
         self.clear_historical_direction_hint("confirmed_target")
+        self.clear_limited_yaw_direction("confirmed_target")
         self._direction_loss_capture_id = None
         self._reset_stale_direction_recovery("strong_reid")
         self._reset_search_timeout()
 
     def clear_active_target(self, reason: str = "manual") -> None:
         old_target_id = self.active_target_id
+        self.clear_limited_yaw_direction("active_target_cleared")
         self.clear_post_park_recenter("active_target_cleared")
         self._capture_steering_evidence = None
         self.last_capture_steering_observation = None
@@ -5713,6 +5872,7 @@ class FollowSafetyController:
             return None
         first_stop = self.search_state != "timed_out"
         self.search_state = "timed_out"
+        self.clear_limited_yaw_direction("search_timeout")
         self.search_direction = None
         if first_stop:
             logger.info(
@@ -5743,6 +5903,7 @@ class FollowSafetyController:
             return None
         first_stop = self.search_state != "timed_out"
         self.search_state = "timed_out"
+        self.clear_limited_yaw_direction("search_completed")
         self.search_direction = None
         if first_stop:
             logger.info(
@@ -6168,11 +6329,12 @@ class FollowSafetyController:
             decision = self._target_direction_history.resolve(
                 required_missing_frames=max(1, int(self.cfg.lost_confirm_frames)),
             )
+            decision = self._with_associated_direction(decision)
             if (
                 decision.direction not in ("left", "right")
                 and (search_entry or self.lost_confirm_frames >= max(1, int(self.cfg.lost_confirm_frames)))
             ):
-                decision = self._target_direction_history.latest_reliable_side()
+                decision = self._latest_lateral_direction_side()
             if decision.direction in ("left", "right"):
                 self._lost_exit_direction = decision.direction
                 self._lost_hint_confidence = float(decision.confidence)
@@ -6323,8 +6485,9 @@ class FollowSafetyController:
             history_decision = self._target_direction_history.resolve(
                 required_missing_frames=required_missing,
             )
+            history_decision = self._with_associated_direction(history_decision)
             if history_decision.direction not in ("left", "right"):
-                history_decision = self._target_direction_history.latest_reliable_side()
+                history_decision = self._latest_lateral_direction_side()
         direction = (
             None
             if history_decision is None
@@ -6391,11 +6554,12 @@ class FollowSafetyController:
             history_decision = self._target_direction_history.resolve(
                 required_missing_frames=max(1, int(self.cfg.lost_confirm_frames)),
             )
+            history_decision = self._with_associated_direction(history_decision)
             if (
                 history_decision.direction not in ("left", "right")
                 and self.lost_confirm_frames >= max(1, int(self.cfg.lost_confirm_frames))
             ):
-                history_decision = self._target_direction_history.latest_reliable_side()
+                history_decision = self._latest_lateral_direction_side()
             if history_decision.direction in ("left", "right"):
                 self._lost_exit_direction = history_decision.direction
                 self._lost_hint_confidence = float(history_decision.confidence)
@@ -6760,7 +6924,7 @@ class FollowSafetyController:
         if position == "center" or bool(candidate.active_target_match):
             return current
 
-        latest_side = self._target_direction_history.latest_reliable_side()
+        latest_side = self._latest_lateral_direction_side()
         previous_direction = (
             self.search_direction
             if self.search_direction in ("left", "right")
@@ -6928,7 +7092,7 @@ class FollowSafetyController:
             # processing gap is handled earlier and remains zero-yaw because
             # it has no fresh evidence.
             current = self._current_lateral_candidate(frame)
-            latest_side = self._target_direction_history.latest_reliable_side()
+            latest_side = self._latest_lateral_direction_side()
             if current is not None and current.position in ("left", "right"):
                 direction = current.position
                 candidate = current.evidence
@@ -6940,6 +7104,8 @@ class FollowSafetyController:
                 evidence_capture_frame_id = latest_side.last_visible_capture_frame_id
                 confidence = float(latest_side.confidence)
                 evidence_source = "history"
+                if latest_side.reason == "associated_historical_position":
+                    self._lost_hint_source = latest_side.reason
             hold_action = self._lost_search_rotate_action(
                 direction,
                 "lost_%s_hold_%s" % (evidence_source, direction),
@@ -9062,11 +9228,30 @@ class FollowSafetyController:
         return None if self._action_block_reason(candidate, frame) is not None else candidate
 
     def _ensure_search_state(self, frame: SensorFrame) -> None:
-        if self.search_state in ("searching", "timed_out"):
+        if self.search_state == "timed_out":
+            return
+        if self.search_state == "searching":
+            # A late independent chain may correct THIS loss's old side once.
+            # Preserve search age/coverage and let the normal writer combine
+            # the next yaw; no STOP, extra wait or motion lease is created.
+            decision = self._latest_lateral_direction_side()
+            if (decision.reason == "associated_historical_position"
+                    and not self._lost_hint_source.startswith("search_candidate_last_")
+                    and decision.last_visible_capture_frame_id > self._historical_direction_applied_capture_id):
+                previous = self.search_direction
+                self.search_direction = self._lost_exit_direction = decision.direction
+                self._lost_hint_confidence = decision.confidence
+                self._lost_hint_source = decision.reason
+                self._historical_direction_applied_capture_id = decision.last_visible_capture_frame_id
+                logger.info("search_associated_direction_update capture=%s evidence_capture=%s "
+                            "previous=%s direction=%s search_timer_reset=False motion_authorized=False",
+                            frame.capture_frame_id, decision.last_visible_capture_frame_id,
+                            previous, decision.direction)
             return
         if self.cfg.direction_history_enable and (
             self._lost_exit_direction not in ("left", "right")
-            or self._lost_hint_source == "historical_direction_evidence"
+            or self._lost_hint_source in ("historical_direction_evidence", "associated_low_score_position", "associated_historical_position")
+            or self._latest_lateral_direction_side().reason in ("associated_low_score_position", "associated_historical_position")
         ):
             # Revalidate fallback evidence at the actual search transition.
             # Do not overwrite a confirmed candidate's authorized direction or
@@ -9833,6 +10018,7 @@ class FollowSafetyController:
                     # the loss-confirmation window. Stop and terminate the
                     # runtime; do not enter search rotation.
                     self.search_state = "timed_out"
+                    self.clear_limited_yaw_direction("target_lost_exit")
                     self.search_direction = None
                     self._reset_search_timeout()
                     return ControlDecision(

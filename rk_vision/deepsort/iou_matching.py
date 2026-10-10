@@ -30,6 +30,8 @@ def iou_cost(
     detections: Sequence,
     track_indices: Optional[Sequence[int]] = None,
     detection_indices: Optional[Sequence[int]] = None,
+    *,
+    max_bbox_age: int = 1,
 ):
     np = _np()
     if track_indices is None:
@@ -40,7 +42,7 @@ def iou_cost(
     cost_matrix = np.zeros((len(track_indices), len(detection_indices)), dtype="float32")
     for row, track_idx in enumerate(track_indices):
         track = tracks[track_idx]
-        if track.time_since_update > 1:
+        if track.time_since_update > max_bbox_age:
             cost_matrix[row, :] = linear_assignment.INFTY_COST
             continue
         bbox = track.to_tlwh()

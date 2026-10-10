@@ -134,7 +134,7 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     # Paired mode shares the existing distance PI / motor tuning below; do not
     # create a second P-only speed policy or a hidden 40 RPM ceiling here.
     for option in ("stop_margin_m", "restart_margin_m",
-                   "yaw_max_delta_rpm", "yaw_full_error_ratio", "pivot_max_rpm", "center_deadband_ratio",
+                   "yaw_max_delta_rpm", "yaw_full_error_ratio", "yaw_damping_sec", "pivot_max_rpm", "center_deadband_ratio",
                    "depth_ttl_sec", "visual_ttl_sec", "write_period_sec", "stop_refresh_sec"):
         _set_env_if_unset(parser, "short_follow", option, "SHORT_FOLLOW_" + option.upper())
 
@@ -443,6 +443,10 @@ def load_config_to_env(config_path: Optional[str]) -> Optional[LoadedConfig]:
     _set_env_if_present(parser, "vision", "engine", "VISION_ENGINE")
     _set_bool_env_if_present(parser, "vision", "reid_enable", "VISION_REID_ENABLE")
     _set_bool_env_if_present(parser, "vision", "detector_continuation_enable", "Y8_DETECTOR_CONTINUATION_ENABLE")
+    # Explicit process settings take priority for this opt-in diagnostic trial.
+    _set_env_if_unset(parser, "lk_shadow", "enabled", "Y8_LK_SHADOW_ENABLE")
+    for option in ("width", "correction_interval_sec", "max_gap_sec", "max_seed_age_sec"):
+        _set_env_if_unset(parser, "lk_shadow", option, "Y8_LK_SHADOW_" + option.upper())
     _set_env_if_unset(parser, "vision", "depth_visibility_max_age_sec", "VISUAL_DEPTH_VISIBILITY_MAX_AGE_SEC")
     _set_env_if_present(parser, "vision", "reid_model_path", "VISION_REID_MODEL_PATH")
     _set_env_if_present(parser, "vision", "sample_workdir", "VISION_SAMPLE_WORKDIR")

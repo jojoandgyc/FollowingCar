@@ -8,6 +8,7 @@ from .nn_matching import NearestNeighborDistanceMetric
 from .preprocessing import non_max_suppression
 from .track import TrackState
 from .tracker import MatchValidator, Tracker
+from .low_score import capture_anchor
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,8 @@ class DeepSortConfig:
     nn_budget: int = 15
     max_bbox_age: int = 2
     feature_update_interval: int = 1
+    low_score_min_confidence: float = 0.25
+    camera_hfov_deg: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,9 @@ class DeepSortOutput:
     age: int = 0
     feature: Optional[Any] = None
     source_detection_index: Optional[int] = None
+    low_score_continuation: bool = False
+    association_previous_capture_frame_id: Optional[int] = None
+    association_previous_capture_timestamp: Optional[float] = None
 
 
 class DeepSort:
@@ -63,6 +69,9 @@ class DeepSort:
         *,
         image_shape: Optional[Tuple[int, int]] = None,
         match_validator: Optional[MatchValidator] = None,
+        provisional_features=None,
+        capture_context=None,
+        low_score_validator=None,
     ) -> List[DeepSortOutput]:
         store_feature = self._should_store_feature()
         detections = self._make_detections(bbox_xywh, confidences, classes, features, store_feature=store_feature)
@@ -74,7 +83,18 @@ class DeepSort:
             detections = [detections[i] for i in keep]
 
         self.tracker.predict()
-        self.tracker.update(detections, match_validator=match_validator)
+        self.tracker.update(detections, match_validator=match_validator,
+                            provisional_features=provisional_features,
+                            low_score_validator=low_score_validator,
+                            capture_context=capture_context, image_shape=image_shape,
+                            camera_hfov_deg=self.config.camera_hfov_deg)
+        # Only a real high-score match can establish/renew the finite bridge.
+        # Weak observations never learn features or extend this deadline.
+        by_source = {d.source_detection_index: d for d in detections}
+        for track in self.tracker.tracks:
+            if track.time_since_update == 0 and not track.low_score_continuation:
+                detection = by_source.get(track.source_detection_index)
+                track.low_score_anchor = capture_anchor(detection, capture_context)
         self._frame_index += 1
 
         outputs: List[DeepSortOutput] = []
@@ -105,6 +125,11 @@ class DeepSort:
                     source_detection_index=(
                         track.source_detection_index if track.time_since_update == 0 else None
                     ),
+                    low_score_continuation=bool(track.time_since_update == 0 and track.low_score_continuation),
+                    association_previous_capture_frame_id=(track.low_score_anchor or {}).get("capture_frame_id")
+                        if track.low_score_continuation else None,
+                    association_previous_capture_timestamp=(track.low_score_anchor or {}).get("capture_timestamp")
+                        if track.low_score_continuation else None,
                 )
             )
         return outputs
@@ -133,12 +158,13 @@ class DeepSort:
         for source_index, (box, confidence, class_id, feature) in enumerate(
             zip(bbox_np, confidences, classes, features)
         ):
-            if float(confidence) < self.config.min_confidence:
+            if not np.isfinite(confidence) or float(confidence) < min(
+                    self.config.min_confidence, self.config.low_score_min_confidence):
                 continue
             tlwh = box.copy()
             tlwh[0] = box[0] - box[2] / 2.0
             tlwh[1] = box[1] - box[3] / 2.0
-            if tlwh[2] <= 0.0 or tlwh[3] <= 0.0:
+            if not np.isfinite(tlwh).all() or tlwh[2] <= 0.0 or tlwh[3] <= 0.0:
                 continue
             detections.append(
                 Detection(
@@ -146,8 +172,9 @@ class DeepSort:
                     float(confidence),
                     int(class_id),
                     feature,
-                    store_feature=store_feature,
+                    store_feature=store_feature and float(confidence) >= self.config.min_confidence,
                     source_detection_index=source_index,
+                    low_score_continuation=float(confidence) < self.config.min_confidence,
                 )
             )
         return detections

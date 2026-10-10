@@ -123,8 +123,10 @@ def test_live_competitor_blocks_even_when_current_detection_is_unique(clock):
 
 
 @pytest.mark.parametrize('interruption', ['color', 'full', 'ambiguous', 'missing', 'replay'])
-def test_interrupted_rebind_requires_two_new_frames_again(clock, interruption):
+@pytest.mark.parametrize('max_bbox_age', [1, 2])
+def test_interrupted_rebind_requires_two_new_frames_again(clock, interruption, max_bbox_age):
     t, cap = retired(clock, max_age=1)
+    t.deepsort.tracker.max_bbox_age = max_bbox_age
     update(t, clock, cap)
     assert update(t, clock, cap + 1) == [(2, 0)]
     changes = {
@@ -138,9 +140,10 @@ def test_interrupted_rebind_requires_two_new_frames_again(clock, interruption):
     update(t, clock, cap + 2, **changes)
     assert not t.identity_bank.identities
     # A tentative competing track from the ambiguous frame disappears here.
-    if interruption == 'missing':
-        # At max_age=1 the gap can also retire the replacement. Its successor
-        # still needs n_init plus two observations against the original owner.
+    if interruption == 'missing' and max_bbox_age == 1:
+        # An explicitly one-frame IoU window retires the replacement here.
+        # With the configured two-frame window it may keep raw2, but must
+        # still accumulate two new enrollment observations after the gap.
         assert update(t, clock, cap + 3) == []
         assert update(t, clock, cap + 4) == [(3, 0)]
         assert update(t, clock, cap + 5) == [(3, 1)]

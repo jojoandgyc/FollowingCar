@@ -22,7 +22,9 @@ class NearYawParkRequest:
 class ParkSettlingEvidence:
     """Post-write encoder evidence, never a timer-based motion permission."""
 
-    MIN_HOLD_SEC = .500
+    # Upper bound on an ordinary parking-current hold, NOT a minimum dwell
+    # and never motion permission. Fresh quiet feedback may release it sooner.
+    MAX_CURRENT_HOLD_SEC = .500
 
     def __init__(self, request, sent_at, *, require_current_release=False):
         self.request = request
@@ -69,20 +71,42 @@ class ParkSettlingEvidence:
         if self.fault:
             self.reason = self.fault
             return False
-        if not self.minimum_hold_complete(now):
+        if not self._post_stop_clock_valid(now):
             return False
         if self.require_current_release and self.current_released_at is None:
             self.reason = "await_current_release"
             return False
         return True
 
-    def minimum_hold_complete(self, now):
-        # Count from completed stop I/O, not request/camera time. Do not
-        # sleep in the executor: emergency handling must remain immediate.
-        if not math.isfinite(now) or now < self.sent_at + self.MIN_HOLD_SEC:
-            self.reason = f"minimum_normal_hold_{self.MIN_HOLD_SEC * 1000:.0f}ms"
+    def _post_stop_clock_valid(self, now):
+        if (isinstance(now, bool) or not isinstance(now, (int, float))
+                or not math.isfinite(now) or not math.isfinite(self.sent_at)
+                or now < self.sent_at):
+            self.reason = "invalid_post_stop_clock"
             return False
         return True
+
+    def current_release_ready(self, feedback, now):
+        """End ordinary parking current when feedback settles, without dwell.
+
+        Two new post-STOP samples and the existing minimum sample span are
+        still required for early release. If feedback never settles, bound
+        the current hold as before; that timeout does NOT unlock the software
+        motion hold. FREE completion, post-release feedback and fresh control
+        evidence remain separate requirements at the caller.
+        """
+        if self.fault:
+            self.reason = self.fault
+            return False
+        if not self._post_stop_clock_valid(now) or self.current_released_at is not None:
+            return False
+        if self.observe(feedback, now):
+            self.reason = "quiet_feedback_current_release"
+            return True
+        if now >= self.sent_at + self.MAX_CURRENT_HOLD_SEC:
+            self.reason = "current_hold_timeout_no_motion_authority"
+            return True
+        return False
 
     def observe(self, feedback, now):
         if self.fault:

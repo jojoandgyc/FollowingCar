@@ -28,6 +28,8 @@ LOADED_CONFIG = preload_config_from_argv()
 from car_control_modular.astra_depth import AstraDepthConfig, AstraDepthRuntime
 from car_control_modular.mssd_motor import MssdMotorBackend, MssdMotorConfig
 from minimal_follow.reid_v2 import (
+    ByteTrack,
+    ByteTrackConfig,
     ReidCandidate,
     ReidConfig,
     ReidDecision,
@@ -109,6 +111,11 @@ class RuntimeConfig:
     reid_full_match_threshold: float
     reid_torso_match_threshold: float
     reid_confirm_hits: int
+    bytetrack_high_confidence: float
+    bytetrack_low_confidence: float
+    bytetrack_match_iou: float
+    bytetrack_max_lost_frames: int
+    bytetrack_min_confirmed_hits: int
     motor_target_min_interval_sec: float
     motor_enabled: bool
     front_ir_enabled: bool
@@ -147,6 +154,11 @@ class RuntimeConfig:
             reid_full_match_threshold=_float_env("MINIMAL_REID_FULL_THRESHOLD", 0.70),
             reid_torso_match_threshold=_float_env("MINIMAL_REID_TORSO_THRESHOLD", 0.76),
             reid_confirm_hits=max(1, _int_env("MINIMAL_REID_CONFIRM_HITS", 2)),
+            bytetrack_high_confidence=_float_env("MINIMAL_BYTETRACK_HIGH_CONFIDENCE", 0.55),
+            bytetrack_low_confidence=_float_env("MINIMAL_BYTETRACK_LOW_CONFIDENCE", 0.25),
+            bytetrack_match_iou=_float_env("MINIMAL_BYTETRACK_MATCH_IOU", 0.25),
+            bytetrack_max_lost_frames=max(0, _int_env("MINIMAL_BYTETRACK_MAX_LOST_FRAMES", 15)),
+            bytetrack_min_confirmed_hits=max(1, _int_env("MINIMAL_BYTETRACK_MIN_CONFIRMED_HITS", 2)),
             motor_target_min_interval_sec=max(0.02, _float_env(
                 "MINIMAL_MOTOR_TARGET_MIN_INTERVAL_SEC",
                 _float_env("MOTOR_RS485_TARGET_MIN_INTERVAL_SEC", 0.05),
@@ -172,6 +184,13 @@ class MinimalFollowRuntime:
         self.motor: Optional[MssdMotorBackend] = None
         self.ir_started = False
         self.reid_worker: Optional[ReidWorker] = None
+        self.person_tracker = ByteTrack(ByteTrackConfig(
+            high_confidence=config.bytetrack_high_confidence,
+            low_confidence=config.bytetrack_low_confidence,
+            match_iou=config.bytetrack_match_iou,
+            max_lost_frames=config.bytetrack_max_lost_frames,
+            min_confirmed_hits=config.bytetrack_min_confirmed_hits,
+        ))
 
         model_value = os.environ.get(
             "VISION_MODEL_PATH", "models/yolo11n_int8_person_val2017.rknn"
@@ -317,7 +336,10 @@ class MinimalFollowRuntime:
             normalize=os.environ.get("RKNN_REID_NORMALIZE", "imagenet").strip(),
             target=os.environ.get("RKNN_TARGET", "rk3588").strip(),
             core_mask=os.environ.get("MINIMAL_REID_RKNN_CORE_MASK", os.environ.get("RKNN_CORE_MASK", "auto")).strip(),
-            backend=os.environ.get("RKNN_BACKEND", "auto").strip(),
+            # ReID may be benchmarked separately from YOLO.  ``auto`` uses
+            # RKNN for the supplied .rknn model; ``onnxruntime`` is valid only
+            # after VISION_REID_MODEL_PATH is pointed at an ONNX OSNet file.
+            backend=os.environ.get("MINIMAL_REID_BACKEND", os.environ.get("RKNN_BACKEND", "auto")).strip(),
             artifact_dir=(
                 os.path.join(os.environ["FOLLOW_LOG_DIR"], "reid_v2")
                 if os.environ.get("FOLLOW_LOG_DIR") else ""
@@ -325,9 +347,12 @@ class MinimalFollowRuntime:
         ), logger=LOG)
         self.reid_worker.start()
         LOG.info(
-            "minimal ReID v2 ready model=%s enroll_every=%.2fs reacquire_every=%.2fs confirm=%d",
-            model_path, cfg.reid_enroll_interval_sec,
-            cfg.reid_reacquire_interval_sec, cfg.reid_confirm_hits,
+            "minimal ReID v2 ready model=%s backend=%s enroll_every=%.2fs reacquire_every=%.2fs confirm=%d "
+            "bytetrack(high=%.2f low=%.2f iou=%.2f lost=%d confirm_hits=%d)",
+            model_path, os.environ.get("MINIMAL_REID_BACKEND", os.environ.get("RKNN_BACKEND", "auto")),
+            cfg.reid_enroll_interval_sec, cfg.reid_reacquire_interval_sec, cfg.reid_confirm_hits,
+            cfg.bytetrack_high_confidence, cfg.bytetrack_low_confidence, cfg.bytetrack_match_iou,
+            cfg.bytetrack_max_lost_frames, cfg.bytetrack_min_confirmed_hits,
         )
         return ReidPolicy(policy_config, self.reid_worker)
 
@@ -552,6 +577,7 @@ class MinimalFollowRuntime:
             "reid_torso_templates": appearance_decision.torso_templates,
             "reid_profile_frozen": appearance_decision.profile_frozen,
             "reid_enrollment_status": appearance_decision.enrollment_status,
+            "reid_target_track_id": appearance_decision.target_track_id,
             "reid_view_templates": appearance_decision.view_templates,
             "reid_probe_candidates": appearance_decision.probe_candidates,
             "reid_probe_attempts": appearance_decision.probe_attempts,
@@ -585,7 +611,8 @@ class MinimalFollowRuntime:
             detections = self.detector.detect(frame, "BGR")
             detect_ms = (time.perf_counter() - detect_started_at) * 1000.0
             select_started_at = time.perf_counter()
-            candidates = self._person_candidates(detections, self.config.confidence_threshold)
+            raw_candidates = self._person_candidates(detections, self.config.confidence_threshold)
+            candidates = self.person_tracker.update(raw_candidates)
             select_ms = (time.perf_counter() - select_started_at) * 1000.0
             ir_started_at = time.perf_counter()
             front_blocked = self._front_ir_triggered()

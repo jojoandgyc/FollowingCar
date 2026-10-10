@@ -53,7 +53,7 @@ class ReidArtifactWriter:
             return None
 
     def write_features(
-        self, *, frame_id: int, purpose: str, bbox, quality: float, submitted_at: float,
+        self, *, frame_id: int, purpose: str, track_id: int, bbox, quality: float, submitted_at: float,
         completed_at: float, full_feature: Any, torso_feature: Any, timings_ms: dict,
         crop_path: Optional[str], error: Optional[str],
     ) -> Optional[str]:
@@ -65,6 +65,7 @@ class ReidArtifactWriter:
             payload = {
                 "frame_id": int(frame_id),
                 "purpose": str(purpose),
+                "track_id": int(track_id),
                 "bbox": [float(value) for value in bbox],
                 "quality": float(quality),
                 "submitted_at_monotonic_s": float(submitted_at),

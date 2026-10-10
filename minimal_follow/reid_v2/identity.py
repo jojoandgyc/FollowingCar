@@ -76,6 +76,7 @@ class ReidDecision:
     view_templates: Optional[dict] = None
     profile_frozen: bool = False
     enrollment_status: str = "idle"
+    target_track_id: Optional[int] = None
 
 
 class ReidPolicy:
@@ -103,6 +104,10 @@ class ReidPolicy:
         self._profile_frozen = False
         self._enrollment_status = "idle"
         self._enrollment_owner_bbox: Optional[BBox] = None
+        # This is deliberately separate from the detector's raw order.  Once
+        # initialized, normal following may only use this ByteTrack ID.  A
+        # different ID must pass asynchronous ReID confirmation in SEARCHING.
+        self._target_track_id: Optional[int] = None
 
     def _enrollment_view(self, feature) -> str:
         """Assign samples to an ordered four-view capture session.
@@ -169,6 +174,9 @@ class ReidPolicy:
         if self._profile_frozen:
             self._enrollment_status = "profile_frozen"
             return False
+        if self._target_track_id is not None and candidate.track_id != self._target_track_id:
+            self._enrollment_status = "target_track_rejected"
+            return False
         if self._enrollment_owner_bbox is not None:
             continuous = (
                 iou(self._enrollment_owner_bbox, candidate.bbox) >= self.config.enrollment_owner_min_iou
@@ -223,7 +231,11 @@ class ReidPolicy:
             interval = (self.config.bootstrap_interval_sec if self.config.bootstrap_enabled and not self._profile_frozen
                         else self.config.enroll_interval_sec)
         submitted = self.worker.submit(
-            ReidRequest(frame_id, now, purpose, candidate.bbox, quality, crop, frame_width, allow_full), min_interval_sec=interval,
+            ReidRequest(
+                frame_id=frame_id, submitted_at=now, purpose=purpose, bbox=candidate.bbox,
+                quality=quality, crop=crop, frame_width=frame_width, allow_full=allow_full,
+                track_id=candidate.track_id,
+            ), min_interval_sec=interval,
         )
         if purpose == "enroll":
             self._enrollment_status = "submitted" if submitted else "rate_limited"
@@ -251,13 +263,13 @@ class ReidPolicy:
             # torso feature is still valid evidence for a bootstrap view.
             view_feature = result.full_feature if result.full_feature is not None else result.torso_feature
             source = "full" if result.full_feature is not None else "torso"
+            view = self._enrollment_view(view_feature)
             if self.profile.is_duplicate(
-                view_feature, source=source, similarity=self.config.enrollment_duplicate_similarity,
+                view_feature, source=source, similarity=self.config.enrollment_duplicate_similarity, view=view,
             ):
                 self._enrollment_status = "duplicate_rejected"
                 self._latest_match = None
                 return
-            view = self._enrollment_view(view_feature)
             full_added = self.profile.add(result.full_feature, source="full", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
             torso_added = self.profile.add(result.torso_feature, source="torso", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
             # Advance only after a distinct view has been stored. This avoids
@@ -294,8 +306,13 @@ class ReidPolicy:
             None if match is None else match.source,
             age_ms, self._last_worker_timing, self.profile.full_count, self.profile.torso_count,
             self._probe_candidates, self._probe_attempts, self.profile.combined_view_counts(), self._profile_frozen,
-            self._enrollment_status,
+            self._enrollment_status, self._target_track_id,
         )
+
+    def _candidate_with_target_track(self, candidates: list[ReidCandidate]) -> Optional[ReidCandidate]:
+        if self._target_track_id is None:
+            return None
+        return next((item for item in candidates if item.track_id == self._target_track_id), None)
 
     def _same_result_candidate(self, evidence_bbox: BBox, candidate: ReidCandidate, frame_width: int) -> bool:
         if iou(evidence_bbox, candidate.bbox) >= 0.15:
@@ -380,6 +397,16 @@ class ReidPolicy:
                 self._stable_frames = 0
                 self._last_bbox = None
                 return self._decision(False, None, state="INIT", reason="no_candidate")
+            if self._target_track_id is None:
+                self._target_track_id = associated.track_id
+            elif associated.track_id != self._target_track_id:
+                # Do not replace an unfinished initial enrollment with a
+                # person who merely became geometrically more convenient.
+                associated = self._candidate_with_target_track(candidates)
+                if associated is None:
+                    self._stable_frames = 0
+                    self._last_bbox = None
+                    return self._decision(False, None, state="ENROLLING", reason="initial_track_missing")
             self._last_bbox = associated.bbox
             self._stable_frames += 1
             if self._stable_frames >= self.config.stable_frames:
@@ -391,15 +418,16 @@ class ReidPolicy:
                     self.state = "ENROLLING"
             return self._decision(True, associated, state=self.state, reason="initial_target")
 
-        if self.state == "LOCKED" and associated is not None:
-            self._last_bbox = associated.bbox
+        locked_candidate = self._candidate_with_target_track(candidates)
+        if self.state == "LOCKED" and locked_candidate is not None:
+            self._last_bbox = locked_candidate.bbox
             # Keep collecting a small number of views after lock. Otherwise a
             # target enrolled only front-facing would be very hard to recover
             # after the vehicle rotates during a loss episode.
             if not self._profile_frozen:
-                self._submit(frame=frame, candidate=associated, frame_id=frame_id, now=now, purpose="enroll",
+                self._submit(frame=frame, candidate=locked_candidate, frame_id=frame_id, now=now, purpose="enroll",
                              frame_width=frame_width, frame_height=frame_height, candidates=candidates)
-            return self._decision(True, associated, state="LOCKED", reason="geometry_associated")
+            return self._decision(True, locked_candidate, state="LOCKED", reason="track_associated")
 
         # No continuous target: probe every detected person in turn. A large
         # bystander gets at most one confirmation window before the next
@@ -411,6 +439,8 @@ class ReidPolicy:
         if confirmed is not None:
             self.state = "LOCKED"
             self._last_bbox = confirmed.bbox
+            self._target_track_id = confirmed.track_id
+            self._enrollment_owner_bbox = confirmed.bbox
             return self._decision(True, confirmed, state="LOCKED", reason="reid_confirmed", match=match, age_ms=age_ms)
         candidate = self._probe_candidate(candidates, frame_width)
         if candidate is None:

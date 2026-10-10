@@ -135,12 +135,22 @@ class TargetProfile:
         usable = [score for score in scores if score is not None]
         return max(usable) if usable else None
 
-    def is_duplicate(self, feature: Optional[Iterable[float]], *, source: str, similarity: float) -> bool:
-        """Whether a sample is too similar to any existing sample of its type."""
+    def is_duplicate(self, feature: Optional[Iterable[float]], *, source: str, similarity: float,
+                     view: Optional[str] = None) -> bool:
+        """Whether a sample duplicates an existing template in the same view.
+
+        A global duplicate check looks tempting, but it suppresses useful
+        side/back evidence: OSNet descriptors of one person from different
+        directions are often still quite similar.  De-duplication therefore
+        applies to a named orientation slot only.  The global gallery size is
+        still bounded by :meth:`_insert`.
+        """
         query = normalize(feature)
         if query is None:
             return False
         templates = self.full if source == "full" else self.torso
+        if view in self.VIEW_ORDER:
+            templates = [item for item in templates if item.view == view]
         limit = max(-1.0, min(1.0, float(similarity)))
         return any((cosine(query, item.feature) or -1.0) >= limit for item in templates)
 

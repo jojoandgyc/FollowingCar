@@ -37,6 +37,7 @@ class ReidRequest:
     crop: Any
     frame_width: int = 640
     allow_full: bool = True
+    track_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class ReidResult:
     frame_width: int = 640
     crop_path: Optional[str] = None
     feature_path: Optional[str] = None
+    track_id: int = 0
 
 
 class ReidWorker:
@@ -138,7 +140,7 @@ class ReidWorker:
                     torso = extractor.last_partial_features[0] if extractor.last_partial_features else None
                     completed_at = time.monotonic()
                     feature_path = self._artifacts.write_features(
-                        frame_id=request.frame_id, purpose=request.purpose, bbox=request.bbox,
+                        frame_id=request.frame_id, purpose=request.purpose, track_id=request.track_id, bbox=request.bbox,
                         quality=request.quality, submitted_at=request.submitted_at, completed_at=completed_at,
                         full_feature=full, torso_feature=torso, timings_ms=dict(extractor.last_timing_ms),
                         crop_path=crop_path, error=None,
@@ -146,7 +148,7 @@ class ReidWorker:
                     result = ReidResult(
                         request.frame_id, request.submitted_at, completed_at, request.purpose,
                         request.bbox, request.quality, full, torso, dict(extractor.last_timing_ms), None,
-                        request.frame_width, crop_path, feature_path,
+                        request.frame_width, crop_path, feature_path, request.track_id,
                     )
                     self.logger.info(
                         "reid_v2_artifact frame=%s purpose=%s crop=%s feature=%s full=%s torso=%s",
@@ -156,7 +158,7 @@ class ReidWorker:
                 except Exception as exc:
                     completed_at = time.monotonic()
                     feature_path = self._artifacts.write_features(
-                        frame_id=request.frame_id, purpose=request.purpose, bbox=request.bbox,
+                        frame_id=request.frame_id, purpose=request.purpose, track_id=request.track_id, bbox=request.bbox,
                         quality=request.quality, submitted_at=request.submitted_at, completed_at=completed_at,
                         full_feature=None, torso_feature=None, timings_ms={}, crop_path=crop_path,
                         error=f"{type(exc).__name__}: {exc}",
@@ -164,7 +166,7 @@ class ReidWorker:
                     result = ReidResult(
                         request.frame_id, request.submitted_at, completed_at, request.purpose,
                         request.bbox, request.quality, None, None, {}, f"{type(exc).__name__}: {exc}",
-                        request.frame_width, crop_path, feature_path,
+                        request.frame_width, crop_path, feature_path, request.track_id,
                     )
                 self._results.put(result)
         except Exception as exc:

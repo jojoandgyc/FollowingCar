@@ -59,11 +59,25 @@ def test_profile_keeps_one_or_more_templates_for_each_enrollment_view():
     assert profile.view_counts() == {"front": 1, "left": 1, "right": 1, "back": 1}
 
 
-def test_profile_rejects_a_near_duplicate_even_if_it_would_use_another_view_slot():
+def test_profile_deduplicates_within_a_view_but_keeps_a_new_orientation():
     profile = TargetProfile(max_full=8, max_torso=8, duplicate_similarity=.97)
     assert profile.add((1.0, 0.0), source="full", quality=.9, captured_at=1.0, view_bin=1, view="front")
-    assert profile.is_duplicate((.99, .01), source="full", similarity=.97)
-    assert not profile.is_duplicate((0.0, 1.0), source="full", similarity=.97)
+    assert profile.is_duplicate((.99, .01), source="full", similarity=.97, view="front")
+    assert not profile.is_duplicate((.99, .01), source="full", similarity=.97, view="left")
+
+
+def test_locked_target_never_switches_to_a_different_bytetrack_id_without_reid():
+    worker = _Worker()
+    policy = ReidPolicy(ReidConfig(stable_frames=1, min_full_templates=1, min_torso_templates=1), worker)
+    frame = _Frame()
+    target = _candidate()
+    policy.observe(frame=frame, candidates=[target], frame_id=1, now=1.0, frame_width=640, frame_height=480)
+    worker.results.append(ReidResult(1, 1.0, 1.01, "enroll", target.bbox, .9, (1.0, 0.0), None, {}))
+    locked = policy.observe(frame=frame, candidates=[target], frame_id=2, now=1.1, frame_width=640, frame_height=480)
+    assert locked.accepted and locked.target_track_id == 1
+    stranger = ReidCandidate((105.0, 85.0, 265.0, 405.0), 2, 51200.0, .99)
+    searching = policy.observe(frame=frame, candidates=[stranger], frame_id=3, now=1.2, frame_width=640, frame_height=480)
+    assert not searching.accepted and searching.state == "SEARCHING"
 
 
 def test_reacquire_requires_repeated_fresh_reid_evidence():

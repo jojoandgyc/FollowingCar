@@ -27,9 +27,6 @@ class LostPersonSearchConfig:
     target_motion_memory_sec: float = 3.0
     target_motion_min_pixels: float = 12.0
     fallback_direction: str = "left"
-    directed_search_sec: float = 2.0
-    sweep_half_cycle_sec: float = 3.0
-    sweep_cycles_before_spin: int = 2
     timeout_sec: float = 1.5
     turn_percent: int = 8
 
@@ -44,7 +41,7 @@ class LostPersonSearchStatus:
 
 
 class LostPersonSearchPolicy:
-    """Search from steering history, target-side history, then a fallback.
+    """Rotate in the last known target direction until recovered or timed out.
 
     A newly lost target first produces one STOP frame.  This gives the motor a
     bounded zero/STOP transition before one wheel reverses for an in-place
@@ -137,29 +134,6 @@ class LostPersonSearchPolicy:
             elapsed_ms = max(0.0, now - self._search_started_at) * 1000.0
         return LostPersonSearchStatus(self._state, direction, direction_source, self._lost_frames, elapsed_ms)
 
-    @staticmethod
-    def _opposite(direction: str) -> str:
-        return "right" if direction == "left" else "left"
-
-    def _search_direction_for_elapsed(self, now: float, initial_direction: str) -> tuple[str, str]:
-        """First look where the target left, then repeatedly scan both sides."""
-        if self._search_started_at is None:
-            return initial_direction, "directed"
-        elapsed = max(0.0, now - self._search_started_at)
-        directed = max(0.0, float(self.config.directed_search_sec))
-        if elapsed < directed:
-            return initial_direction, "directed"
-        half_cycle = max(0.1, float(self.config.sweep_half_cycle_sec))
-        phase = int((elapsed - directed) / half_cycle)
-        # A cycle is one left plus one right scan. Once these bounded sweeps
-        # have covered both sides, keep turning in the initial direction to
-        # complete a wider in-place scan instead of oscillating forever.
-        sweep_half_cycles = max(0, int(self.config.sweep_cycles_before_spin)) * 2
-        if phase >= sweep_half_cycles:
-            return initial_direction, "continuous_spin"
-        direction = self._opposite(initial_direction) if phase % 2 == 0 else initial_direction
-        return direction, f"sweep_{phase + 1}"
-
     def visible(self, now: float) -> LostPersonSearchStatus:
         if not self._valid_now(now):
             raise ValueError("now must be a finite monotonic timestamp")
@@ -207,8 +181,10 @@ class LostPersonSearchPolicy:
             self._state = "search_timeout"
             return MinimalFollowCommand.stop("search_timeout"), self._status(now, self._search_direction, direction_source)
 
-        direction, phase = self._search_direction_for_elapsed(now, self._search_direction or initial_direction)
-        self._state = "searching_" + phase
+        # The loss direction is fixed for the entire episode. Do not sweep or
+        # reverse: a target leaving on the left is searched only to the left.
+        direction = self._search_direction or initial_direction
+        self._state = "searching_directional"
         if direction == "left":
             command = MinimalFollowCommand.rotate_left(self.config.turn_percent)
         else:

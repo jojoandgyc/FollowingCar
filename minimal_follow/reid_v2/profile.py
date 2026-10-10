@@ -33,6 +33,9 @@ class Template:
     quality: float
     captured_at: float
     view_bin: int
+    # This is an enrollment-view slot (front/left/right/back), not a camera
+    # position.  It lets the gallery retain a useful distribution of poses.
+    view: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -45,10 +48,14 @@ class Match:
 class TargetProfile:
     """A bounded gallery for one target; no global vector database is needed."""
 
-    def __init__(self, *, max_full: int, max_torso: int, duplicate_similarity: float = 0.992) -> None:
+    VIEW_ORDER = ("front", "left", "right", "back")
+
+    def __init__(self, *, max_full: int, max_torso: int, duplicate_similarity: float = 0.992,
+                 max_templates_per_view: int = 2) -> None:
         self.max_full = max(1, int(max_full))
         self.max_torso = max(1, int(max_torso))
         self.duplicate_similarity = max(0.0, min(1.0, float(duplicate_similarity)))
+        self.max_templates_per_view = max(1, int(max_templates_per_view))
         self.full: list[Template] = []
         self.torso: list[Template] = []
 
@@ -63,27 +70,60 @@ class TargetProfile:
     def ready(self, *, min_full: int, min_torso: int) -> bool:
         return len(self.full) >= max(1, int(min_full)) or len(self.torso) >= max(1, int(min_torso))
 
-    @staticmethod
-    def _insert(templates: list[Template], template: Template, limit: int, duplicate_similarity: float) -> bool:
-        if any((cosine(template.feature, previous.feature) or -1.0) >= duplicate_similarity for previous in templates):
+    def _insert(self, templates: list[Template], template: Template, limit: int, duplicate_similarity: float) -> bool:
+        # Only de-duplicate within a view. Front and back can legitimately be
+        # very close in OSNet space, but dropping either loses recovery range.
+        same_view = [previous for previous in templates if previous.view == template.view]
+        if any((cosine(template.feature, previous.feature) or -1.0) >= duplicate_similarity for previous in same_view):
             return False
         templates.append(template)
-        # Retain the clearest exemplars if the gallery is full. The view bin is
-        # metadata for future diagnostics, not an implicit identity decision.
-        templates.sort(key=lambda item: (item.quality, item.captured_at), reverse=True)
-        del templates[limit:]
+        # Legacy/explicitly-disabled view capture uses ``unknown`` and keeps
+        # the original global-gallery behaviour. Only named orientation slots
+        # receive a per-view quota.
+        if template.view in self.VIEW_ORDER:
+            same_view = sorted((item for item in templates if item.view == template.view),
+                               key=lambda item: (item.quality, item.captured_at), reverse=True)
+            retained = set(id(item) for item in same_view[:self.max_templates_per_view])
+            templates[:] = [item for item in templates if item.view != template.view or id(item) in retained]
+        # Prefer removing a redundant view sample before removing the only
+        # exemplar of any collected orientation.
+        while len(templates) > limit:
+            counts = {view: sum(item.view == view for item in templates) for view in self.VIEW_ORDER}
+            removable = [item for item in templates if item.view not in self.VIEW_ORDER or counts.get(item.view, 0) > 1]
+            victim = min(removable or templates, key=lambda item: (item.quality, item.captured_at))
+            templates.remove(victim)
         return True
 
-    def add(self, feature: Optional[Iterable[float]], *, source: str, quality: float, captured_at: float, view_bin: int) -> bool:
+    def add(self, feature: Optional[Iterable[float]], *, source: str, quality: float, captured_at: float,
+            view_bin: int, view: str = "unknown") -> bool:
         normalized = normalize(feature)
         if normalized is None:
             return False
-        template = Template(normalized, max(0.0, float(quality)), float(captured_at), int(view_bin))
+        view = str(view).strip().lower()
+        if view not in self.VIEW_ORDER:
+            view = "unknown"
+        template = Template(normalized, max(0.0, float(quality)), float(captured_at), int(view_bin), view)
         if source == "full":
             return self._insert(self.full, template, self.max_full, self.duplicate_similarity)
         if source == "torso":
             return self._insert(self.torso, template, self.max_torso, self.duplicate_similarity)
         raise ValueError(f"unsupported feature source: {source!r}")
+
+    def view_count(self, view: str, *, source: str = "full") -> int:
+        templates = self.full if source == "full" else self.torso
+        return sum(item.view == view for item in templates)
+
+    def view_counts(self, *, source: str = "full") -> dict[str, int]:
+        return {view: self.view_count(view, source=source) for view in self.VIEW_ORDER}
+
+    def best_view_similarity(self, feature: Optional[Iterable[float]], view: str, *, source: str = "full") -> Optional[float]:
+        query = normalize(feature)
+        if query is None:
+            return None
+        templates = self.full if source == "full" else self.torso
+        scores = [cosine(query, item.feature) for item in templates if item.view == view]
+        usable = [score for score in scores if score is not None]
+        return max(usable) if usable else None
 
     @staticmethod
     def _robust_score(feature: Optional[Iterable[float]], templates: Sequence[Template]) -> tuple[Optional[float], int]:

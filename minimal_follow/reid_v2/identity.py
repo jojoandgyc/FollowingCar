@@ -34,6 +34,9 @@ class ReidConfig:
     min_height_px: float = 120.0
     min_area_px: float = 8000.0
     edge_margin_ratio: float = 0.015
+    view_capture_enabled: bool = True
+    view_change_threshold: float = 0.90
+    max_templates_per_view: int = 2
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class ReidDecision:
     torso_templates: int = 0
     probe_candidates: int = 0
     probe_attempts: int = 0
+    view_templates: Optional[dict] = None
 
 
 class ReidPolicy:
@@ -58,7 +62,10 @@ class ReidPolicy:
     def __init__(self, config: ReidConfig, worker: Optional[ReidWorker]) -> None:
         self.config = config
         self.worker = worker
-        self.profile = TargetProfile(max_full=config.max_full_templates, max_torso=config.max_torso_templates)
+        self.profile = TargetProfile(
+            max_full=config.max_full_templates, max_torso=config.max_torso_templates,
+            max_templates_per_view=config.max_templates_per_view,
+        )
         self.state = "INIT"
         self._last_bbox: Optional[BBox] = None
         self._stable_frames = 0
@@ -69,6 +76,29 @@ class ReidPolicy:
         self._probe_attempts = 0
         self._probe_hits = 0
         self._probe_candidates = 0
+        self._enroll_view_index = 0
+
+    def _enrollment_view(self, feature) -> str:
+        """Assign samples to an ordered four-view capture session.
+
+        OSNet is an identity extractor, not a body-orientation classifier.  We
+        therefore use it only to detect a sufficiently new visual view.  The
+        labels are reliable when the initial user-facing capture is performed
+        in the documented order: front, left, right, back.  Regardless of the
+        label, matching always compares every retained template.
+        """
+        if not self.config.view_capture_enabled:
+            return "unknown"
+        order = TargetProfile.VIEW_ORDER
+        while self._enroll_view_index < len(order):
+            active = order[self._enroll_view_index]
+            similarity = self.profile.best_view_similarity(feature, active)
+            if similarity is None or similarity >= self.config.view_change_threshold:
+                return active
+            self._enroll_view_index += 1
+        scores = [(self.profile.best_view_similarity(feature, view), view) for view in order]
+        usable = [item for item in scores if item[0] is not None]
+        return max(usable, key=lambda item: item[0])[1] if usable else order[-1]
 
     @staticmethod
     def _view_bin(bbox: BBox, frame_width: int) -> int:
@@ -129,8 +159,17 @@ class ReidPolicy:
             return
         if result.purpose == "enroll":
             view_bin = self._view_bin(result.bbox, result.frame_width)
-            full_added = self.profile.add(result.full_feature, source="full", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin)
-            torso_added = self.profile.add(result.torso_feature, source="torso", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin)
+            view = self._enrollment_view(result.full_feature)
+            full_added = self.profile.add(result.full_feature, source="full", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
+            torso_added = self.profile.add(result.torso_feature, source="torso", quality=result.quality, captured_at=result.completed_at, view_bin=view_bin, view=view)
+            # Advance only after a distinct view has been stored. This avoids
+            # rapidly consuming all four slots when the target is standing.
+            if full_added and self._enroll_view_index < len(TargetProfile.VIEW_ORDER) - 1:
+                active = TargetProfile.VIEW_ORDER[self._enroll_view_index]
+                if view == active and self.profile.view_count(view) >= self.profile.max_templates_per_view:
+                    # Keep collecting the current view until a visual change;
+                    # the next result will remain here if it is still similar.
+                    pass
             self._latest_match = None
             return
         age = max(0.0, now - result.submitted_at)
@@ -147,7 +186,7 @@ class ReidPolicy:
             None if match is None else match.score,
             None if match is None else match.source,
             age_ms, self._last_worker_timing, self.profile.full_count, self.profile.torso_count,
-            self._probe_candidates, self._probe_attempts,
+            self._probe_candidates, self._probe_attempts, self.profile.view_counts(),
         )
 
     def _same_result_candidate(self, evidence_bbox: BBox, candidate: ReidCandidate, frame_width: int) -> bool:

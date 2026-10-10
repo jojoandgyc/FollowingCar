@@ -69,6 +69,19 @@ def test_visual_target_side_is_used_when_there_was_no_steering_command():
     assert status.direction == "left"
 
 
+def test_target_motion_has_priority_over_vehicle_steering_and_target_side():
+    policy = _policy(target_motion_min_pixels=8.0)
+    policy.record_executed_follow_command(MinimalFollowCommand(6, 10, reason="steer_left"), 60.0)
+    policy.record_visible_target((300.0, 80.0, 420.0, 400.0), 640, 60.0)
+    # The person then moved right before disappearing. This should win over
+    # both a prior left steering command and a still-left visual position.
+    policy.record_visible_target((315.0, 80.0, 435.0, 400.0), 640, 60.1)
+    policy.target_missing(now=60.15, front_obstacle=False)
+    command, status = policy.target_missing(now=60.20, front_obstacle=False)
+    assert command.reason == "search_rotate_right"
+    assert status.direction_source == "target_motion"
+
+
 def test_search_reverses_after_directed_phase_and_then_sweeps():
     policy = _policy(directed_search_sec=0.2, sweep_half_cycle_sec=0.3)
     policy.record_executed_follow_command(MinimalFollowCommand(6, 10, reason="steer_left"), 50.0)

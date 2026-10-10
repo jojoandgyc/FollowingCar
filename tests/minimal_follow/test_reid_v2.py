@@ -50,6 +50,15 @@ def test_profile_uses_top_three_mean_not_a_single_accidental_hit():
     assert match.score is not None and .70 < match.score < .75
 
 
+def test_profile_keeps_one_or_more_templates_for_each_enrollment_view():
+    profile = TargetProfile(max_full=8, max_torso=8, duplicate_similarity=1.0, max_templates_per_view=2)
+    assert profile.add((1.0, 0.0), source="full", quality=.9, captured_at=1.0, view_bin=1, view="front")
+    assert profile.add((0.0, 1.0), source="full", quality=.9, captured_at=2.0, view_bin=1, view="left")
+    assert profile.add((-1.0, 0.0), source="full", quality=.9, captured_at=3.0, view_bin=1, view="right")
+    assert profile.add((0.0, -1.0), source="full", quality=.9, captured_at=4.0, view_bin=1, view="back")
+    assert profile.view_counts() == {"front": 1, "left": 1, "right": 1, "back": 1}
+
+
 def test_reacquire_requires_repeated_fresh_reid_evidence():
     worker = _Worker()
     policy = ReidPolicy(ReidConfig(

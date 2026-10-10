@@ -96,6 +96,8 @@ class RuntimeConfig:
     search_lost_confirm_frames: int
     search_turn_memory_sec: float
     search_target_memory_sec: float
+    search_target_motion_memory_sec: float
+    search_target_motion_min_pixels: float
     search_fallback_direction: str
     search_directed_sec: float
     search_sweep_half_cycle_sec: float
@@ -135,6 +137,8 @@ class RuntimeConfig:
             search_lost_confirm_frames=max(1, _int_env("MINIMAL_SEARCH_LOST_CONFIRM_FRAMES", 1)),
             search_turn_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TURN_MEMORY_SEC", 1.0)),
             search_target_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TARGET_MEMORY_SEC", 3.0)),
+            search_target_motion_memory_sec=max(0.0, _float_env("MINIMAL_SEARCH_TARGET_MOTION_MEMORY_SEC", 3.0)),
+            search_target_motion_min_pixels=max(1.0, _float_env("MINIMAL_SEARCH_TARGET_MOTION_MIN_PIXELS", 12.0)),
             search_fallback_direction=os.environ.get("MINIMAL_SEARCH_FALLBACK_DIRECTION", "left").strip().lower(),
             search_directed_sec=max(0.0, _float_env("MINIMAL_SEARCH_DIRECTED_SEC", 2.0)),
             search_sweep_half_cycle_sec=max(0.1, _float_env("MINIMAL_SEARCH_SWEEP_HALF_CYCLE_SEC", 3.0)),
@@ -240,6 +244,8 @@ class MinimalFollowRuntime:
                 lost_confirm_frames=config.search_lost_confirm_frames,
                 turn_memory_sec=config.search_turn_memory_sec,
                 target_direction_memory_sec=config.search_target_memory_sec,
+                target_motion_memory_sec=config.search_target_motion_memory_sec,
+                target_motion_min_pixels=config.search_target_motion_min_pixels,
                 fallback_direction=config.search_fallback_direction,
                 directed_search_sec=config.search_directed_sec,
                 sweep_half_cycle_sec=config.search_sweep_half_cycle_sec,
@@ -278,6 +284,9 @@ class MinimalFollowRuntime:
             min_torso_templates=max(1, _int_env("MINIMAL_REID_MIN_TORSO_TEMPLATES", 2)),
             max_full_templates=max(1, _int_env("MINIMAL_REID_MAX_FULL_TEMPLATES", 8)),
             max_torso_templates=max(1, _int_env("MINIMAL_REID_MAX_TORSO_TEMPLATES", 4)),
+            view_capture_enabled=_bool_env("MINIMAL_REID_VIEW_CAPTURE_ENABLE", True),
+            view_change_threshold=_float_env("MINIMAL_REID_VIEW_CHANGE_THRESHOLD", 0.90),
+            max_templates_per_view=max(1, _int_env("MINIMAL_REID_MAX_TEMPLATES_PER_VIEW", 2)),
             min_iou=_float_env("MINIMAL_REID_ASSOC_MIN_IOU", 0.12),
             max_center_distance_ratio=_float_env("MINIMAL_REID_ASSOC_MAX_CENTER_RATIO", 0.16),
             min_confidence=_float_env("MINIMAL_REID_MIN_CONFIDENCE", 0.65),
@@ -517,6 +526,7 @@ class MinimalFollowRuntime:
             "right_percent": int(command.right_percent),
             "search_state": search_status.state,
             "search_direction": search_status.direction,
+            "search_direction_source": search_status.direction_source,
             "lost_frames": int(search_status.lost_frames),
             "search_elapsed_ms": (
                 None if search_status.search_elapsed_ms is None
@@ -538,6 +548,7 @@ class MinimalFollowRuntime:
             "reid_result_age_ms": appearance_decision.result_age_ms,
             "reid_full_templates": appearance_decision.full_templates,
             "reid_torso_templates": appearance_decision.torso_templates,
+            "reid_view_templates": appearance_decision.view_templates,
             "reid_probe_candidates": appearance_decision.probe_candidates,
             "reid_probe_attempts": appearance_decision.probe_attempts,
             "reid_worker_preprocess_ms": _appearance_timing_value("preprocess"),
